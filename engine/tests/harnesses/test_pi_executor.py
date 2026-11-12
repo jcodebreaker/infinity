@@ -84,6 +84,9 @@ def _run(coro):
 # Helper fakes
 # ---------------------------------------------------------------------------
 
+# Pi ends a turn's agent loop with ``agent_settled``, after any retry or queued steer.
+_AGENT_SETTLED = json.dumps({"type": "agent_settled"})
+
 
 class _FakeStreamReader:
     """Simulates asyncio.StreamReader with pre-loaded lines."""
@@ -1852,8 +1855,8 @@ class TestBuildEnvAndDir(unittest.TestCase):
             self.assertTrue(settings_path.is_file())
             with open(settings_path) as f:
                 settings = json.load(f)
-            # One model request may take the whole stdout idle budget.
-            self.assertEqual(settings["retry"]["provider"], {"timeoutMs": 120_000})
+            # No fetch timeout: pi bounds a request by its own HTTP idle timeout.
+            self.assertNotIn("provider", settings["retry"])
         finally:
             import shutil
 
@@ -2166,6 +2169,7 @@ class TestRunTurn(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2233,6 +2237,7 @@ class TestRunTurn(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2354,12 +2359,14 @@ class TestRunTurn(unittest.TestCase):
             # A live reader task: pi is running, just silent.
             fake_rpc._read_task = asyncio.create_task(asyncio.sleep(30))
 
+            # Pi answers the prompt command at once, then the tool call runs silently.
+            fake_rpc._line_queue.put_nowait(json.dumps({"type": "response", "success": True}))
+
             async def feed_after_delay():
                 # Stay silent across several idle-timeout windows (the
                 # patched budget is 0.05s), then deliver the turn.
                 await asyncio.sleep(0.3)
                 for line in (
-                    json.dumps({"type": "response", "success": True}),
                     json.dumps(
                         {
                             "type": "message_update",
@@ -2370,6 +2377,7 @@ class TestRunTurn(unittest.TestCase):
                         }
                     ),
                     json.dumps({"type": "agent_end", "messages": []}),
+                    _AGENT_SETTLED,
                 ):
                     fake_rpc._line_queue.put_nowait(line)
 
@@ -2473,6 +2481,7 @@ class TestRunTurn(unittest.TestCase):
                         ],
                     }
                 ),
+                _AGENT_SETTLED,
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2520,6 +2529,7 @@ class TestRunTurn(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2546,9 +2556,9 @@ class TestRunTurn(unittest.TestCase):
         _run(_test())
 
     def test_message_end_with_error_stop_reason(self):
-        """An errored call pi retries itself (``agent_end.willRetry``) stays in
-        the turn; the turn fails with the last attempt's own message only once
-        pi gives up."""
+        """An errored call pi retries itself stays in the turn (the retry's
+        ``agent_start`` clears the error); the turn fails with the last
+        attempt's own message only once pi settles."""
 
         async def _test():
             executor = self._make_executor()
@@ -2572,9 +2582,11 @@ class TestRunTurn(unittest.TestCase):
                 json.dumps({"type": "message_end", "message": timed_out}),
                 json.dumps({"type": "agent_end", "messages": [timed_out], "willRetry": True}),
                 json.dumps({"type": "auto_retry_start", "attempt": 1, "delayMs": 2000}),
+                json.dumps({"type": "agent_start"}),
                 json.dumps({"type": "message_end", "message": errored}),
                 # Pi's agent loop always emits agent_end after an errored call.
                 json.dumps({"type": "agent_end", "messages": [errored], "willRetry": False}),
+                _AGENT_SETTLED,
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2656,7 +2668,7 @@ class TestRunTurn(unittest.TestCase):
     def test_post_tool_error_drains_agent_end_before_failing(self):
         """A message_end error after a successful tool call fails the turn
         with pi's error message, but only after consuming the trailing
-        ``agent_end`` — leaving it queued would make the next turn on the
+        ``agent_end`` and ``agent_settled`` — leaving them queued would make the next turn on the
         same RPC session read the stale terminal event as its own end.
         """
 
@@ -2697,6 +2709,7 @@ class TestRunTurn(unittest.TestCase):
                 # Pi always emits agent_end after the errored LLM call ends
                 # the agent loop; it carries the errored message.
                 json.dumps({"type": "agent_end", "messages": [errored_assistant]}),
+                _AGENT_SETTLED,
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2724,7 +2737,7 @@ class TestRunTurn(unittest.TestCase):
             self.assertEqual([e.message for e in errors], [parse_error])
             self.assertFalse(any(isinstance(e, TurnComplete) for e in events))
             self.assertFalse(any(isinstance(e, TextChunk) for e in events))
-            # The trailing agent_end was consumed: nothing stale is left for
+            # The trailing agent_end and agent_settled were consumed: nothing stale is left for
             # the next turn on this RPC session.
             self.assertTrue(fake_rpc._line_queue.empty())
 
@@ -2797,6 +2810,7 @@ async def test_pi_native_tool_results_survive_adapter_and_persistence(is_error: 
     ]
     executor = _executor_with_scripted_rpc(
         [json.dumps(e) for e in [*starts, *ends, {"type": "agent_end", "messages": []}]]
+        + [_AGENT_SETTLED]
     )
     adapter = ExecutorAdapter(lambda: executor, harness_label="Pi")
     queue = asyncio.Queue()
@@ -2854,6 +2868,7 @@ async def test_pi_bridge_correlates_out_of_order_tcp_and_stdout(callback_first: 
     ]
     executor = _executor_with_scripted_rpc(
         [json.dumps(e) for e in [*starts, *ends, {"type": "agent_end", "messages": []}]]
+        + [_AGENT_SETTLED]
     )
     adapter = ExecutorAdapter(lambda: executor, harness_label="Pi")
     queue = asyncio.Queue()
@@ -2949,7 +2964,7 @@ async def test_pi_ignores_tool_events_without_correlation_id(call_id) -> None:
             json.dumps({"type": kind, "toolCallId": call_id, "toolName": "read"})
             for kind in ("tool_execution_start", "tool_execution_end")
         ]
-        + [json.dumps({"type": "agent_end", "messages": []})]
+        + [json.dumps({"type": "agent_end", "messages": []}), _AGENT_SETTLED]
     )
     events = [e async for e in executor.run_turn([{"role": "user", "content": "read"}], [], "")]
     assert not any(isinstance(e, (ToolCallRequest, ToolCallComplete)) for e in events)
@@ -3025,6 +3040,7 @@ def test_pi_thinking_deltas_stream_as_reasoning_chunks() -> None:
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
         )
 
@@ -3089,6 +3105,7 @@ def test_pi_thinking_and_text_delta_ordering_preserved() -> None:
                 _update({"type": "thinking_delta", "contentIndex": 2, "delta": "revise"}),
                 _update({"type": "text_delta", "contentIndex": 3, "delta": " step two"}),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
         )
 
@@ -3152,6 +3169,7 @@ def test_pi_streams_tool_call_start_and_argument_deltas() -> None:
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
         )
 
@@ -3354,6 +3372,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
         )
         tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
@@ -3377,6 +3396,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
         )
         tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
@@ -3399,6 +3419,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
         )
         tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
@@ -3425,6 +3446,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
         )
         tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
@@ -3447,6 +3469,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
         )
         tool_completes = [e for e in events if isinstance(e, ToolCallComplete)]
@@ -3471,6 +3494,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                 json.dumps({"type": "response", "success": True}),
                 self._tool_end("w1", is_error=True, result="Path /tmp is outside the workspace"),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
         )
         self.assertFalse([e for e in events if isinstance(e, TurnComplete)])
@@ -3493,6 +3517,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
         )
         self.assertIsInstance(events[-1], TurnComplete)
@@ -3506,6 +3531,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                 self._tool_end("w1", is_error=True, result="denied"),
                 self._tool_end("w2", is_error=False, result="ok"),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
         )
         self.assertIsInstance(events[-1], TurnComplete)
@@ -4040,6 +4066,7 @@ def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ],
             stderr_lines=[],
         )
@@ -4133,6 +4160,7 @@ def test_run_turn_spawn_env_has_no_host_secrets(monkeypatch) -> None:
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ],
             stderr_lines=[],
         )
@@ -4192,6 +4220,7 @@ def test_run_turn_spawn_env_honors_spec_env_passthrough(monkeypatch) -> None:
             stdout_lines=[
                 json.dumps({"type": "response", "success": True}),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ],
             stderr_lines=[],
         )
@@ -4323,6 +4352,7 @@ def test_run_turn_bridge_extension_carries_live_server_token(monkeypatch) -> Non
             stdout_lines=[
                 json.dumps({"type": "response", "success": True}),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ],
             stderr_lines=[],
         )
@@ -4439,6 +4469,7 @@ def test_pi_usage_captured_from_message_end() -> None:
                 ),
                 json.dumps({"type": "message_end", "message": _pi_assistant_message_with_usage()}),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
         )
 
@@ -4500,6 +4531,7 @@ def test_pi_usage_fallback_from_agent_end() -> None:
                         ],
                     }
                 ),
+                _AGENT_SETTLED,
             ]
         )
 
@@ -4548,6 +4580,7 @@ def test_pi_usage_model_falls_back_to_configured_model() -> None:
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ],
             model="databricks-claude-sonnet-4-6",
         )
@@ -4618,6 +4651,7 @@ def test_pi_usage_sums_across_multiple_message_end() -> None:
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
         )
 
@@ -4669,6 +4703,7 @@ def test_pi_turn_without_usage_leaves_usage_none() -> None:
                 # message_end with no usage object, then a usage-less agent_end.
                 json.dumps({"type": "message_end", "message": {"stopReason": "stop"}}),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
         )
 
@@ -4767,6 +4802,7 @@ def test_run_turn_spawns_pi_with_thinking_flag(monkeypatch) -> None:
                 _levels_response(["off", "low", "medium", "high", "xhigh", "max"]),
                 json.dumps({"type": "response", "command": "prompt", "success": True}),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
         )
 
@@ -4810,6 +4846,7 @@ def test_a_conversation_starts_pi_on_its_session_file(monkeypatch, tmp_path) -> 
             stdout_lines=[
                 json.dumps({"type": "response", "command": "prompt", "success": True}),
                 json.dumps({"type": "agent_end", "messages": []}),
+                _AGENT_SETTLED,
             ]
         )
         return captured["process"]
@@ -4845,6 +4882,7 @@ def test_midsession_effort_change_sets_thinking_level_before_prompt() -> None:
             _levels_response(["off", "low", "medium", "high", "xhigh", "max"]),
             json.dumps({"type": "response", "command": "prompt", "success": True}),
             json.dumps({"type": "agent_end", "messages": []}),
+            _AGENT_SETTLED,
         ],
         applied_thinking="low",
     )
@@ -4879,6 +4917,7 @@ def test_unsupported_thinking_level_clamps_with_warning(caplog) -> None:
             _levels_response(["off", "low", "high"]),
             json.dumps({"type": "response", "command": "prompt", "success": True}),
             json.dumps({"type": "agent_end", "messages": []}),
+            _AGENT_SETTLED,
         ],
         applied_thinking=None,
     )
@@ -4913,6 +4952,7 @@ def test_midsession_effort_clear_leaves_level_untouched() -> None:
         [
             json.dumps({"type": "response", "command": "prompt", "success": True}),
             json.dumps({"type": "agent_end", "messages": []}),
+            _AGENT_SETTLED,
         ],
         applied_thinking="high",
     )
@@ -4985,6 +5025,7 @@ def test_run_turn_prompt_command_includes_streaming_behavior():
             }
         ),
         json.dumps({"type": "agent_end", "messages": []}),
+        _AGENT_SETTLED,
     ]:
         fake_rpc._line_queue.put_nowait(line)
 
@@ -5122,6 +5163,7 @@ class TestPiSteering(unittest.TestCase):
             pi.push(self._user_message("redo the deck"))  # the prompt itself
             pi.push(self._user_message("make it blue"))  # delivered after a tool call
             pi.push({"type": "agent_end", "messages": []})
+            pi.push({"type": "agent_settled"})
             await asyncio.wait_for(task, 5)
 
             self.assertEqual(self._outcomes(events), [("inj_1", True)])
@@ -5138,6 +5180,7 @@ class TestPiSteering(unittest.TestCase):
 
             await executor.steer_session_message("s", "make it blue", steer_id="late")
             pi.push({"type": "agent_end", "messages": []})
+            pi.push({"type": "agent_settled"})
             await asyncio.wait_for(task, 5)
 
             self.assertEqual(pi.commands[-1]["type"], "clear_queue")
@@ -5159,6 +5202,7 @@ class TestPiSteering(unittest.TestCase):
             await executor.steer_session_message("s", "two", steer_id="two")
             pi.push(self._user_message("Fix the deck as described in the fix skill"))
             pi.push({"type": "agent_end", "messages": []})
+            pi.push({"type": "agent_settled"})
             await asyncio.wait_for(task, 5)
 
             self.assertEqual(self._outcomes(events), [("one", True), ("two", False)])
@@ -5183,6 +5227,7 @@ class TestPiSteering(unittest.TestCase):
                 }
             )
             pi.push({"type": "agent_end", "messages": []})
+            pi.push({"type": "agent_settled"})
             await asyncio.wait_for(task, 5)
 
             self.assertEqual(self._outcomes(events), [("x", False)])
@@ -5199,6 +5244,7 @@ class TestPiSteering(unittest.TestCase):
             )
             task, _ = await self._turn(executor, pi)
             pi.push({"type": "agent_end", "messages": []})
+            pi.push({"type": "agent_settled"})
             await asyncio.wait_for(task, 5)
 
             self.assertEqual(
@@ -5238,6 +5284,7 @@ class TestPiSteering(unittest.TestCase):
 
             await executor.steer_session_message("s", "make it blue", steer_id="q")
             pi.push({"type": "agent_end", "messages": []})
+            pi.push({"type": "agent_settled"})
             await asyncio.wait_for(task, 5)
 
             self.assertEqual(self._outcomes(events), [("q", False)])
