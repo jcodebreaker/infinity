@@ -144,12 +144,19 @@ async def test_handler_exports_and_saves_new_artifact(
 async def test_handler_second_export_is_a_new_version(
     store, server, tmp_path, monkeypatch
 ) -> None:
-    monkeypatch.setenv(HELPER_ENV, str(_helper(tmp_path, _OK_HELPER)))
+    # The fake export carries the deck, so an edited deck exports to different bytes.
+    carries = _OK_HELPER.replace('printf "FAKE-%s" "$F"', '{ printf "FAKE-%s" "$F"; cat "$H"; }')
+    monkeypatch.setenv(HELPER_ENV, str(_helper(tmp_path, carries)))
     deck = _save(store, "q3.deck.html")
     args = {"artifact_id": deck.id, "format": "pptx"}
-    json.loads(await handle_deck_tool(_ctx(server), args))
+    first = json.loads(await handle_deck_tool(_ctx(server), args))
+    edited = _save(store, "q3.deck.html", data=_HTML.replace(b"x</section>", b"y</section>"))
+    args = {"artifact_id": edited.id, "format": "pptx"}
     second = json.loads(await handle_deck_tool(_ctx(server), args))
-    assert second["version"] == 2
+    assert second["version"] == 2 and second["group_id"] == first["group_id"]
+    # The same deck again is identical bytes: no new version.
+    again = json.loads(await handle_deck_tool(_ctx(server), args))
+    assert again["version"] == 2 and again.get("unchanged") is True
 
 
 @pytest.mark.asyncio

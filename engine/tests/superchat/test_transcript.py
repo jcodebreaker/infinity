@@ -582,13 +582,16 @@ def _tool(call_id: str, name: str, output: str) -> list[NewConversationItem]:
 
 
 def cards(messages: list[dict[str, Any]]) -> list[tuple[str, int | None]]:
-    """The file cards of transcript *messages* in order, as ``(artifact_id, version)``."""
-    return [
-        (b["artifact_id"], b.get("version"))
-        for m in messages
-        for b in m["blocks"]
-        if b["type"] == "file" and b.get("by") != "user"
-    ]
+    """The file cards of transcript *messages* in order, as ``(artifact_id, version)``: the
+    engine's ``file`` blocks and the Assistant's ``render_card`` file cards."""
+    shown: list[tuple[str, int | None]] = []
+    for block in (b for m in messages for b in m["blocks"]):
+        if block["type"] == "file" and block.get("by") != "user":
+            shown.append((block["artifact_id"], block.get("version")))
+        elif block["type"] == "card" and block["card"]["card"] == "file":
+            data = block["card"]["data"]
+            shown.append((data["artifactId"], data.get("version")))
+    return shown
 
 
 def _file_card(saved: Any) -> str:
@@ -652,10 +655,11 @@ async def test_pages_walk_back_and_draw_each_rounds_cards_at_any_page_size(
 ) -> None:
     """The recorded Rounds, replayed into one Conversation, page back to their first message at
     9, 40, 100 and 500 items a page. A Round's file cards are every file of its view, the
-    Assistant's and its Helper's, in order on the Round's last reply, one per file at its latest
-    version, and a page's size never moves a card. A file card the Assistant drew for a file of
-    its Round is dropped; one for a file outside it stays. Every message carries the Round it is
-    in (``round_id``, the id of the message that opened it), whatever the page size."""
+    Assistant's and its Helper's, one per file at its latest version, where the Round last showed
+    it (on its last reply when it never did), and a page's size never moves or repeats a card. A
+    card the Round showed again later is dropped; one for a file outside it stays. Every message
+    carries the Round it is in (``round_id``, the id of the message that opened it), whatever the
+    page size."""
     rounds = SqlAlchemyRoundStore(db_uri)
     blobs = LocalArtifactStore(str(tmp_path / "blobs"))
     artifacts = SqlAlchemyArtifactStore(db_uri, lambda: blobs)
@@ -703,27 +707,21 @@ async def test_pages_walk_back_and_draw_each_rounds_cards_at_any_page_size(
     recorded = [(f["artifact_id"], f["version"]) for rid in opened for f in views[rid]]
     assistants = [f for rid in opened for f in views[rid] if f["helper_id"] is None]
     assert (len(assistants), len(recorded)) == (5, 11)
-    assert cards(whole) == recorded
-    current, per_round = None, {}
+    per_round: dict[str | None, list[tuple[str, int | None]]] = {}
     for message in whole:
-        if message["role"] == "user":
-            current = message["id"]
-        elif cards([message]):
-            assert message["blocks"][0]["type"] == "text"  # after the reply's words
-            per_round.setdefault(current, []).extend(cards([message]))
-    assert per_round == {
-        rid: [(f["artifact_id"], f["version"]) for f in views[rid]] for rid in opened if views[rid]
-    }
+        per_round.setdefault(message["round_id"], []).extend(cards([message]))
     (deck,) = views[jazz]
-    assert per_round[jazz] == [(deck["artifact_id"], 2)]
-    shown = [
-        b["card"]["data"]["artifactId"]
-        for m in whole
-        if m["round_id"] == jazz
-        for b in m["blocks"]
-        if b["type"] == "card" and b["card"]["card"] == "file"
-    ]
-    assert shown == [older]
+    assert {rid: shown for rid, shown in per_round.items() if shown} == {
+        **{
+            rid: [(f["artifact_id"], f["version"]) for f in views[rid]]
+            for rid in opened
+            if views[rid]
+        },
+        jazz: [(deck["artifact_id"], 2), (older, 1)],
+    }
+    # The jazz Round last showed its deck with a file card: both save calls' cards are dropped.
+    drawn = [b["type"] for m in whole if m["round_id"] == jazz for b in m["blocks"]]
+    assert drawn.count("file") == 0 and drawn.count("card") == 2
     with pytest.raises(OmnigentError, match="not found"):
         await client.get("/v1/sessions/ad563e906854634c49e1a6fd2fbb31d4/transcript")
 

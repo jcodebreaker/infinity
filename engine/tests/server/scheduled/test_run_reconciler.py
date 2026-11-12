@@ -35,11 +35,15 @@ class _RunRow:
 
 
 class _FakeScheduledTaskStore:
-    """Fake store exposing only ``update_run`` (what the backstop calls)."""
+    """Fake store exposing ``update_run`` and ``get`` (what the backstop calls)."""
 
     def __init__(self, runs: list[_RunRow]) -> None:
         self._runs = {r.id: r for r in runs}
         self.update_calls: list[str] = []
+
+    def get(self, task_id: str) -> None:
+        """No task rows: the run-result hook is not under test here."""
+        del task_id
 
     def update_run(
         self,

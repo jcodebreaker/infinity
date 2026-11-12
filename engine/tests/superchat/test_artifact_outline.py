@@ -28,10 +28,12 @@ def _names(labels: dict[str, str]) -> set[str]:
     return {tool.name() for tool in _tools(labels, ToolManagerCtx())}
 
 
-def test_offered_to_the_conversation_only() -> None:
+def test_offered_wherever_files_are_read() -> None:
+    """A file is read by element everywhere, never by the shell (ADR 0031)."""
     assert "artifact_outline" in _names(CHAT)
-    assert "artifact_outline" not in _names({**CHAT, SUBAGENT_LABEL_KEY: "worker"})
-    assert "artifact_outline" not in _names({**CHAT, ARTIFACT_CHAT_LABEL_KEY: ARTIFACT_ID})
+    assert "artifact_outline" in _names({**CHAT, SUBAGENT_LABEL_KEY: "worker"})
+    assert "artifact_outline" in _names({**CHAT, ARTIFACT_CHAT_LABEL_KEY: ARTIFACT_ID})
+    assert _names({}) == set()
 
 
 def test_outline_is_a_read_never_counted() -> None:

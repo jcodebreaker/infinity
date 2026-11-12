@@ -2002,11 +2002,12 @@ async def test_executor_adapter_forwards_context_mode_to_config(
     """``request.context_mode`` (the runner's forwarded ``omnigent.context.
     mode`` label) reaches ``ExecutorConfig.extra`` so the claude-sdk
     executor can tell a superside-chat turn apart from a plain one, and a
-    Conversation turn sent the tools the runner builds for it asks for a
-    checklist while a Helper's does not."""
+    Conversation turn sent the tools the runner builds for it reaches the
+    executor with the checklist tool while a Helper's does not."""
     import omnigent.superchat.features  # noqa: F401  (registers the feature tools)
     from omnigent.context.labels import SUBAGENT_LABEL_KEY
     from omnigent.harnesses.executor import (
+        CHECKLIST_TOOL,
         ExecutorConfig,
         Message,
         ToolSpec,
@@ -2030,7 +2031,7 @@ async def test_executor_adapter_forwards_context_mode_to_config(
         ):
             assert config is not None
             captured["extra"] = dict(config.extra)
-            captured["checklist"] = config.checklist
+            captured["checklist"] = any(t["name"] == CHECKLIST_TOOL for t in tools)
             yield TurnComplete(response="ok")
 
     labels = {"omnigent.context.mode": "superside-chat"}
@@ -2078,7 +2079,6 @@ async def test_executor_adapter_omits_context_mode_when_unset() -> None:
         ):
             assert config is not None
             captured["extra"] = dict(config.extra)
-            captured["checklist"] = config.checklist
             yield TurnComplete(response="ok")
 
     adapter = ExecutorAdapter(executor_factory=lambda: _CaptureExecutor())
@@ -2090,7 +2090,6 @@ async def test_executor_adapter_omits_context_mode_when_unset() -> None:
     request = CreateResponseRequest(model="my_coding_agent", input="hi")
     await adapter.run_turn(request, ctx)
     assert "context_mode" not in captured["extra"]
-    assert captured["checklist"] is False
 
 
 @pytest.mark.asyncio

@@ -152,6 +152,8 @@ async def test_a_rounds_writes_reach_the_stream_as_one_coalesced_summary(
             "round_id": rid,
             "status": "running",
             "started_at": 1.0,
+            "settled_at": None,
+            "delivered_at": None,
             "live": "x",
             "helpers": 0,
             "files": 0,

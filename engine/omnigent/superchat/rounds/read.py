@@ -229,6 +229,7 @@ def attach_round_files(
     *,
     newer_round_id: str | None,
     artifacts: SqlAlchemyArtifactStore | None = None,
+    conv_store: ConversationStore | None = None,
 ) -> None:
     """Draw each recorded Round's file cards from its view, in place on transcript *messages*.
 
@@ -246,6 +247,8 @@ def attach_round_files(
     :param newer_round_id: The Round of the oldest item of the page after this one; ``None`` on
         the newest page.
     :param artifacts: Where a card's title and size are read; without it a card has neither.
+    :param conv_store: Where a Round cut by the page is read past it, so what it showed on the
+        other page counts and a page's size never moves or repeats a card.
     """
     views = _Views(store, conversation_id)
     rounds: list[tuple[str | None, list[dict[str, Any]]]] = []
@@ -281,7 +284,11 @@ def attach_round_files(
             if block:
                 cards[f["artifact_id"]] = block
         ids = {k: f["artifact_id"] for f in view["files"] for k in (f["artifact_id"], f["name"])}
-        # Where the Round last showed each file: (message, block index).
+        goes_on = index == len(rounds) - 1 and newer_round_id == round_id
+        before, after = set(), set()
+        if conv_store is not None and (goes_on or (index == 0 and mine[0]["id"] != round_id)):
+            before, after = _shown_off_page(conv_store, conversation_id, round_id, mine, ids)
+        # Where the Round last showed each file on this page: (message, block index).
         last: dict[str, tuple[int, int]] = {}
         for at, message in enumerate(mine):
             for place, block in enumerate(message["blocks"]):
@@ -295,10 +302,10 @@ def attach_round_files(
                 if shown is None:
                     if not _is_card(block):
                         kept.append(block)
-                elif shown in cards and last[shown] == (at, place):
+                elif shown in cards and shown not in after and last[shown] == (at, place):
                     kept.append(cards[shown] if _is_card(block) else block)
             message["blocks"] = kept
-        if index == len(rounds) - 1 and newer_round_id == round_id:
+        if goes_on:
             continue
         replies = [m for m in mine if m["role"] == "assistant"]
         closing = next(
@@ -306,8 +313,35 @@ def attach_round_files(
             replies[-1] if replies else None,
         )
         if closing is not None:
-            closing["blocks"].extend(cards[f] for f in cards if f not in last)
+            closing["blocks"].extend(cards[f] for f in cards if f not in last and f not in before)
     messages[:] = [m for m in messages if m["blocks"]]
+
+
+def _shown_off_page(
+    conv_store: ConversationStore,
+    conversation_id: str,
+    round_id: str,
+    mine: Sequence[Mapping[str, Any]],
+    ids: Mapping[str, str],
+) -> tuple[set[str], set[str]]:
+    """The files a Round cut by the page showed before and after *mine*, its messages on the page.
+
+    Read from the Round's items (:func:`_round_items`); a message's id is the item it was drawn
+    from, so it is placed the same whatever the page.
+    """
+    items = _round_items(conv_store, conversation_id, round_id)
+    at = {item.id: n for n, item in enumerate(items)}
+    here = [at[m["id"]] for m in mine if m["id"] in at]
+    if not here:
+        return set(), set()
+    before: set[str] = set()
+    after: set[str] = set()
+    for message in project_items([item.to_api_dict() for item in items]):
+        n = at.get(message["id"])
+        side = None if n is None else before if n < min(here) else after if n > max(here) else None
+        if side is not None:
+            side.update(f for b in message["blocks"] if (f := _shown_file(b, ids)) is not None)
+    return before, after
 
 
 def _round_items(conv_store: ConversationStore, conversation_id: str, round_id: str) -> list[Any]:

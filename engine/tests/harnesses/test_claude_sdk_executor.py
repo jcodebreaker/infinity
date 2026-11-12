@@ -1729,7 +1729,7 @@ class TestSupersideChatEngineOptions(unittest.TestCase):
 
         return _FakeSDK
 
-    def _run_turn_with_context_mode(self, context_mode: str | None, checklist: bool = False):
+    def _run_turn_with_context_mode(self, context_mode: str | None):
         from omnigent.harnesses.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.harnesses.executor import ExecutorConfig
 
@@ -1748,7 +1748,7 @@ class TestSupersideChatEngineOptions(unittest.TestCase):
                         [{"role": "user", "content": "hello"}],
                         [],
                         "system prompt",
-                        config=ExecutorConfig(extra=extra, checklist=checklist),
+                        config=ExecutorConfig(extra=extra),
                     )
                 ]
             self.assertEqual(len(events), 1)
@@ -1790,12 +1790,15 @@ class TestSupersideChatEngineOptions(unittest.TestCase):
         self.assertIn("Agent", options.disallowed_tools)
         self.assertIn("Task", options.disallowed_tools)
 
-    def test_checklist_opts_the_cli_into_its_native_task_tools(self):
+    def test_the_cli_task_tools_stay_disallowed_beside_the_checklist_tool(self):
+        # The model keeps its checklist with Omnigent's ``checklist`` tool: one list, one tool.
         task_tools = ["TaskCreate", "TaskUpdate", "TaskList", "TaskGet"]
-        options = self._run_turn_with_context_mode("superside-chat", checklist=True)
-        self.assertEqual(options.env.get("CLAUDE_CODE_ENABLE_TODO_TOOLS"), "1")
-        self.assertEqual(options.tools, ["Skill", "ToolSearch", *task_tools])
-        self.assertEqual(options.allowed_tools, task_tools)
+        options = self._run_turn_with_context_mode("superside-chat")
+        self.assertNotIn("CLAUDE_CODE_ENABLE_TODO_TOOLS", options.env)
+        self.assertEqual(options.tools, ["Skill", "ToolSearch"])
+        self.assertEqual(options.allowed_tools, [])
+        for tool in task_tools:
+            self.assertIn(tool, options.disallowed_tools)
 
     def test_unset_context_mode_leaves_engine_features_untouched(self):
         options = self._run_turn_with_context_mode(None)
@@ -1804,7 +1807,9 @@ class TestSupersideChatEngineOptions(unittest.TestCase):
         self.assertNotIn("DISABLE_AUTO_COMPACT", options.env)
         self.assertNotIn("CLAUDE_CODE_DISABLE_AUTO_MEMORY", options.env)
         self.assertEqual(options.env.get("ENABLE_TOOL_SEARCH"), "true")
-        self.assertEqual(options.disallowed_tools, [])
+        self.assertEqual(
+            options.disallowed_tools, ["TaskCreate", "TaskUpdate", "TaskList", "TaskGet"]
+        )
         self.assertNotEqual(getattr(options, "setting_sources", "unset-sentinel"), [])
 
     def test_rollover_context_mode_leaves_engine_features_untouched(self):
@@ -1813,7 +1818,8 @@ class TestSupersideChatEngineOptions(unittest.TestCase):
         options = self._run_turn_with_context_mode("rollover")
         self.assertNotIn("DISABLE_AUTO_COMPACT", options.env)
         self.assertNotIn("CLAUDE_CODE_DISABLE_AUTO_MEMORY", options.env)
-        self.assertEqual(options.disallowed_tools, [])
+        self.assertNotIn("Agent", options.disallowed_tools)
+        self.assertNotIn("Task", options.disallowed_tools)
 
 
 # ---------------------------------------------------------------------------
@@ -5908,21 +5914,21 @@ class TestPrelaunch(unittest.TestCase):
             self._run([(self._EMPTY, "prompt"), (self._HISTORY, "new prompt")])
         self.assertIn("differs from the first turn in instructions", self._launches(logs)[-1])
 
-    def test_a_warm_cli_without_the_checklist_is_relaunched_when_it_turns_on(self):
+    def test_a_warm_cli_is_relaunched_when_the_turns_mode_changes(self):
         from omnigent.harnesses.executor import ExecutorConfig
 
+        chat = ExecutorConfig(extra={"context_mode": "superside-chat"})
         with self.assertLogs(self._LOGGER, level="INFO") as logs:
             clients, prompts = self._run(
                 [
                     (self._HISTORY, "prompt"),
-                    (self._NEXT, "prompt", ExecutorConfig(checklist=True)),
-                    (self._NEXT, "prompt", ExecutorConfig(checklist=True)),
+                    (self._NEXT, "prompt", chat),
+                    (self._NEXT, "prompt", chat),
                 ]
             )
-        self.assertEqual(len(clients), 2, "the flag relaunches once, then the CLI stays warm")
-        self.assertEqual(clients[1].env.get("CLAUDE_CODE_ENABLE_TODO_TOOLS"), "1")
-        self.assertIn("TaskCreate", clients[1].tools)
-        self.assertNotIn("CLAUDE_CODE_ENABLE_TODO_TOOLS", clients[0].env)
+        self.assertEqual(len(clients), 2, "the mode relaunches once, then the CLI stays warm")
+        self.assertEqual(clients[1].env.get("DISABLE_AUTO_COMPACT"), "1")
+        self.assertNotIn("DISABLE_AUTO_COMPACT", clients[0].env)
         self.assertIn("first question", str(prompts[1]), "the new CLI gets the whole history")
         self.assertIn("the turn's mode changed", self._launches(logs)[-1])
 
