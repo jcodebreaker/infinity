@@ -104,7 +104,8 @@ CREATE TABLE IF NOT EXISTS turns (
     project TEXT NOT NULL DEFAULT '',
     person_text TEXT NOT NULL DEFAULT '',
     last_item_id TEXT NOT NULL DEFAULT '',
-    at REAL NOT NULL DEFAULT 0
+    at REAL NOT NULL DEFAULT 0,
+    marks TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS turns_main ON turns (main_id);
 CREATE TABLE IF NOT EXISTS refs (
@@ -259,6 +260,8 @@ class TurnPassage:
     :param last_item_id: The turn's last item (a runtime notice's turn after it counts as its
         own), so a checkpoint anchor finds the turn it ends.
     :param at: When the turn started (epoch seconds; 0 unknown): orders a chat's turns.
+    :param marks: The items inside the turn a user message follows (a steer, hidden context, a
+        notice): where a view start can fall mid-turn, so it still finds its turn.
     """
 
     chat_id: str
@@ -272,6 +275,7 @@ class TurnPassage:
     refs: Mapping[str, Sequence[str]] = field(default_factory=dict)
     last_item_id: str = ""
     at: float = 0.0
+    marks: tuple[str, ...] = ()
 
 
 _TURN_FIELDS = ("chat_id", "turn_item_id", "date", "origin", "project", "person_text")
@@ -338,6 +342,8 @@ class KnowledgeDb:
             conn.execute("ALTER TABLE turns ADD COLUMN last_item_id TEXT NOT NULL DEFAULT ''")
         if "at" not in turns:
             conn.execute("ALTER TABLE turns ADD COLUMN at REAL NOT NULL DEFAULT 0")
+        if "marks" not in turns:
+            conn.execute("ALTER TABLE turns ADD COLUMN marks TEXT NOT NULL DEFAULT ''")
 
     # ------------------------------------------------------------------ plumbing
 
@@ -534,7 +540,7 @@ class KnowledgeDb:
         """Store turn passages, keyword-searchable at once; idempotent on ``turn_item_id``.
 
         A turn already stored with the same text is left as it is (an empty project, and its
-        last item and start, are filled in); one whose text changed (stored before its reply
+        last item, start and marks, are filled in); one whose text changed (stored before its reply
         was) is replaced. The chat's row goes back to ``text_ready`` so the background pass
         embeds what is new. *cursor* is a ``(meta key, value)`` saved in the same transaction
         (backfill progress).
@@ -547,15 +553,17 @@ class KnowledgeDb:
         with self._tx() as conn:
             for p in passages:
                 old = conn.execute(
-                    "SELECT t.chunk_id, c.text, t.project, t.last_item_id, t.at FROM turns t "
-                    "JOIN chunks c ON c.id = t.chunk_id WHERE t.turn_item_id = ?",
+                    "SELECT t.chunk_id, c.text, t.project, t.last_item_id, t.at, t.marks "
+                    "FROM turns t JOIN chunks c ON c.id = t.chunk_id WHERE t.turn_item_id = ?",
                     (p.turn_item_id,),
                 ).fetchone()
+                marks = " ".join(p.marks)
                 if old is not None and old[1] == p.text:
-                    if p.last_item_id and (old[3], old[4]) != (p.last_item_id, p.at):
+                    if p.last_item_id and tuple(old[3:6]) != (p.last_item_id, p.at, marks):
                         conn.execute(
-                            "UPDATE turns SET last_item_id = ?, at = ? WHERE chunk_id = ?",
-                            (p.last_item_id, p.at, old[0]),
+                            "UPDATE turns SET last_item_id = ?, at = ?, marks = ? "
+                            "WHERE chunk_id = ?",
+                            (p.last_item_id, p.at, marks, old[0]),
                         )
                     if p.project and not old[2]:
                         conn.execute(
@@ -585,8 +593,8 @@ class KnowledgeDb:
                 project = p.project or (old[2] if old is not None else "")
                 conn.execute(
                     "INSERT INTO turns (chunk_id, turn_item_id, chat_id, main_id, date, origin, "
-                    "project, person_text, last_item_id, at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "project, person_text, last_item_id, at, marks) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         chunk_id,
                         p.turn_item_id,
@@ -598,6 +606,7 @@ class KnowledgeDb:
                         p.person_text,
                         p.last_item_id,
                         p.at,
+                        marks,
                     ),
                 )
                 self._write_refs(
@@ -643,12 +652,14 @@ class KnowledgeDb:
         return {r[0]: r[1] for r in rows}
 
     def turn_ending(self, chat_id: str, item_id: str) -> int | None:
-        """The chunk id of *chat_id*'s stored turn that starts or ends at *item_id*, if any."""
+        """The chunk id of *chat_id*'s stored turn that starts or ends at *item_id*, or holds it
+        as a mark (a view start mid-turn), if any."""
         with self._connection() as conn:
             row = conn.execute(
                 "SELECT chunk_id FROM turns WHERE chat_id = ? AND (last_item_id = ? OR "
-                "turn_item_id = ?) ORDER BY chunk_id DESC LIMIT 1",
-                (chat_id, item_id, item_id),
+                "turn_item_id = ? OR instr(' ' || marks || ' ', ' ' || ? || ' ') > 0) "
+                "ORDER BY chunk_id DESC LIMIT 1",
+                (chat_id, item_id, item_id, item_id),
             ).fetchone()
         return int(row[0]) if row else None
 

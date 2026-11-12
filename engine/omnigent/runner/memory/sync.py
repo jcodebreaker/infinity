@@ -1,9 +1,8 @@
 """What feeds ``memory/``: a stored checkpoint, a settled Round, or a rebuild from the chats.
 
-Also what feeds the index's ``conversation`` source: the passages of the turns a checkpoint
-retires (:func:`index_retired_turns`), the turns from before that (:func:`backfill_turns`), and
-their removal with a deleted Conversation (:func:`reconcile`). A turn of the current epoch is
-still in context, so it is not a passage until the compaction that retires it.
+Also what feeds the index's ``conversation`` source: the passages of a Conversation's settled
+turns, read from the record past a cursor (:func:`index_settled_turns`), and their removal with a
+deleted Conversation (:func:`reconcile`).
 
 Every entry point here swallows its failures (logged): the files are a copy, and writing them must
 never fail or delay a turn. The compaction items stay the only source; a rebuild reads them and
@@ -29,25 +28,21 @@ from omnigent.superchat.feature import is_helper
 from omnigent.superchat.knowledge.db import TurnPassage
 from omnigent.superchat.knowledge.runtime import KnowledgeRuntime, default_workspace
 from omnigent.superchat.knowledge.turns import Turn, passage_of, split_turns
-from omnigent.superchat.rollover import (
-    ItemsPageFetchError,
-    _get_items_page,
-    fetch_latest_checkpoint,
-)
+from omnigent.superchat.rollover import ItemsPageFetchError, _get_items_page
 
 _logger = logging.getLogger(__name__)
 
 _COMPACTION_PAGE = "100"
 _MAX_PAGES = 200
 
-#: One backfill run reads at most this many pages (the route's maximum each) and writes at most
+#: One indexing run reads at most this many pages (the route's maximum each) and writes at most
 #: this many turns, so an old Conversation is indexed over a few turns, none of them slowed.
-_BACKFILL_PAGE = "1000"
-_BACKFILL_PAGES = 5
-_BACKFILL_TURNS = 300
-#: Index meta key: the last item a chat's backfill read.
-#: Versioned: bumped when what a passage holds changes, so the backfill writes it once again.
-CURSOR_KEY = "turns_cursor.v3:"
+_INDEX_PAGE = "1000"
+_INDEX_PAGES = 5
+_INDEX_TURNS = 300
+#: Index meta key: the last item a chat's indexing read.
+#: Versioned: bumped when what a passage holds changes, so every turn is written once again.
+CURSOR_KEY = "turns_cursor.v4:"
 
 
 async def _snapshot(server_client: Any, chat_id: str) -> dict[str, Any]:
@@ -436,7 +431,9 @@ def _passages(
     for t in turns:
         if t.notice:
             if out:
-                out[-1] = replace(out[-1], last_item_id=t.last_item_id)
+                out[-1] = replace(
+                    out[-1], last_item_id=t.last_item_id, marks=(*out[-1].marks, *t.marks)
+                )
             continue
         out.append(
             passage_of(
@@ -446,134 +443,79 @@ def _passages(
     return out
 
 
-async def index_retired_turns(
+def _step(items: list[dict[str, Any]], more: bool, room: int) -> tuple[list[Turn], str | None]:
+    """What one page of the record gives: ``(turns to write, new cursor)``.
+
+    Every turn before the page's last person turn is settled: that one may still run or go on
+    in the next page, so the cut is at its start and the notices after it wait with it. A page
+    that is one turn and has more is taken whole. At most *room* person turns are taken.
+    ``None`` as the cursor means no progress.
+    """
+    turns = split_turns(items)
+    people = [i for i, t in enumerate(turns) if not t.notice]
+    starts = [i for i in people if turns[i].first > 0]
+    if starts:
+        k = starts[-1]
+        if sum(1 for i in people if i < k) > room:
+            k = people[room]
+        keep, cut = turns[:k], turns[k].first
+    elif more:
+        keep, cut = turns, len(items)
+    else:
+        return [], None
+    cursor = items[cut - 1].get("id")
+    return keep, cursor if isinstance(cursor, str) else None
+
+
+async def index_settled_turns(
     server_client: Any,
     chat_id: str,
     labels: dict[str, str] | None,
-    window: list[dict[str, Any]],
     *,
     project: str = "",
     runtime: KnowledgeRuntime | None = None,
 ) -> None:
-    """Write the turns a stored checkpoint retired to the index, in one batch. Never raises.
+    """Index a Conversation's settled turns past the saved cursor, in bounded steps. Never raises.
 
-    *window* is the record the checkpoint summarized (the items after the previous anchor, up to
-    its own), already read by the rollover: nothing is read again. Called once the compaction
-    item is stored. *project* is the
-    Project folder the chat runs in. A Helper's turns, steers and runtime notices are never
-    passages (:mod:`.turns`).
+    Every settled turn is a passage, the current epoch's too: recall leaves those out when it
+    reads (:func:`omnigent.superchat.knowledge.handlers.current_epoch`). Reads at most
+    :data:`_INDEX_PAGES` pages and writes at most :data:`_INDEX_TURNS` turns per run. Progress
+    (the last item read) is saved with the passages, so a restart resumes where it stopped and
+    never writes a turn twice. A Helper's turns, steers and runtime notices are never passages
+    (:mod:`.turns`). *project* is the Project folder the chat runs in.
     """
     try:
         found = _knowledge(server_client, runtime)
         if is_helper(labels) or found is None:
             return
         origin = files.Origin("main", chat_id)
-        passages = _passages(split_turns(window), origin, chat_id, project)
-        if passages:
-            await asyncio.to_thread(found.indexer.index_turns, passages)
+        db, key = found.indexer.db, f"{CURSOR_KEY}{chat_id}"
+        room = _INDEX_TURNS
+        for _ in range(_INDEX_PAGES):
+            cursor = await asyncio.to_thread(db.meta, key)
+            params = {
+                "limit": _INDEX_PAGE,
+                "order": "asc",
+                **({"after": cursor} if cursor else {}),
+            }
+            try:
+                page = await _get_items_page(server_client, chat_id, params)
+            except ItemsPageFetchError as exc:
+                if exc.status_code == 400 and cursor:
+                    # A cursor item that is gone: read again from the start (idempotent writes).
+                    await asyncio.to_thread(db.set_meta, key, None)
+                raise
+            items = [it for it in page.get("data", []) if isinstance(it, dict)]
+            turns, moved = _step(items, bool(items) and bool(page.get("has_more")), room)
+            if moved is None:
+                return
+            room -= sum(1 for t in turns if not t.notice)
+            passages = _passages(turns, origin, chat_id, project)
+            await asyncio.to_thread(found.indexer.index_turns, passages, cursor=(key, moved))
+            if room <= 0:
+                return
     except Exception:  # indexing must never fail the turn
-        _logger.warning("recall: could not index the retired turns of %s", chat_id, exc_info=True)
-
-
-def _backfill_step(
-    items: list[dict[str, Any]], more: bool, room: int, ends: set[str]
-) -> tuple[list[Turn], str | None, bool]:
-    """What one page of the record gives: ``(turns to write, new cursor, reached the end)``.
-
-    *ends* are the chat's latest checkpoint anchor and the checkpoint item itself: the record
-    up to the first of them is retired, every turn in it complete. Before it, the page's last
-    turn may go on in the next page, so it is left for the next read; a single turn longer than
-    a page is taken whole. Past it is the current epoch, which only its compaction indexes.
-    ``None`` as the cursor means no progress.
-    """
-    end = next((i for i, it in enumerate(items) if it.get("id") in ends), None)
-    if end is not None:
-        items = items[: end + 1]
-        turns = split_turns(items)
-        keep, cut, done = turns, len(items), True
-    elif not more:
-        return [], None, True  # the cursor is at or past the anchor: nothing retired is left
-    else:
-        turns = split_turns(items)
-        keep, cut, done = turns[:-1], (turns[-1].first if turns else len(items)), False
-        if not keep and cut == 0:
-            keep, cut = turns, len(items)
-    if len(keep) > room:
-        keep, cut, done = keep[:room], turns[room].first, False
-    cursor = items[cut - 1].get("id") if cut > 0 else None
-    return keep, cursor if isinstance(cursor, str) else None, done
-
-
-async def _backfill_chat(
-    server_client: Any,
-    found: KnowledgeRuntime,
-    origin: files.Origin,
-    main_id: str,
-    budget: dict[str, int],
-    project: str = "",
-) -> bool:
-    """Index a chat's retired turns (up to its latest checkpoint's anchor) from its saved cursor
-    while *budget* lasts. ``True`` once none is left; a chat never compacted has none."""
-    db, key = found.indexer.db, f"{CURSOR_KEY}{origin.chat_id}"
-    checkpoint = await fetch_latest_checkpoint(
-        server_client, origin.chat_id, skip_placeholders=True
-    )
-    if checkpoint is None:
-        return True
-    ends = {e for e in (checkpoint.get("last_item_id"), checkpoint.get("id")) if e}
-    while budget["pages"] > 0 and budget["turns"] > 0:
-        cursor = await asyncio.to_thread(db.meta, key)
-        if cursor in ends:
-            return True
-        params = {"limit": _BACKFILL_PAGE, "order": "asc", **({"after": cursor} if cursor else {})}
-        try:
-            page = await _get_items_page(server_client, origin.chat_id, params)
-        except ItemsPageFetchError as exc:
-            if exc.status_code == 400 and cursor:
-                # A cursor item that is gone: read again from the start (writes are idempotent).
-                await asyncio.to_thread(db.set_meta, key, None)
-            raise
-        budget["pages"] -= 1
-        items = [it for it in page.get("data", []) if isinstance(it, dict)]
-        more = bool(items) and bool(page.get("has_more", False))
-        turns, moved, ended = _backfill_step(items, more, budget["turns"], ends)
-        budget["turns"] -= len(turns)
-        passages = _passages(turns, origin, main_id, project)
-        await asyncio.to_thread(
-            found.indexer.index_turns, passages, cursor=(key, moved) if moved else None
-        )
-        if ended:
-            return True
-    return False
-
-
-async def backfill_turns(
-    server_client: Any,
-    chat_id: str,
-    labels: dict[str, str] | None,
-    *,
-    project: str = "",
-    runtime: KnowledgeRuntime | None = None,
-) -> None:
-    """Index the turns of a Conversation up to its latest checkpoint's anchor. Never raises.
-
-    Reads the record from the saved cursor to the anchor (every retired turn, none of the
-    current epoch), at most :data:`_BACKFILL_PAGES` pages and :data:`_BACKFILL_TURNS` turns per
-    run. Progress (the last item read) is saved with the passages, so a restart resumes where it
-    stopped and never writes a turn twice. A cursor already at the anchor costs one checkpoint
-    read. A fold moves the anchor without a history load (ADR 0031), so the turns it folded
-    arrive here at the next turn; the ones a new session leaves out arrive with its history load.
-    """
-    try:
-        main_id = chat_id
-        found = _knowledge(server_client, runtime)
-        if is_helper(labels) or found is None:
-            return
-        budget = {"pages": _BACKFILL_PAGES, "turns": _BACKFILL_TURNS}
-        origin = files.Origin("main", main_id)
-        await _backfill_chat(server_client, found, origin, main_id, budget, project)
-    except Exception:  # indexing must never fail the turn
-        _logger.warning("recall: could not backfill the turns of %s", chat_id, exc_info=True)
+        _logger.warning("recall: could not index the turns of %s", chat_id, exc_info=True)
 
 
 async def _forget_conversation(

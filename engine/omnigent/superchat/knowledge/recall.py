@@ -129,9 +129,10 @@ async def recall_search(
     :param recency: Let conversation hits lose rank with age (off for questions about the past).
     :param limit: Most hits returned.
     :param exclude_chat_after: Chat id -> item id after which that chat's turns are left out
-        (the current epoch): the first or last item of a stored turn, as a checkpoint's anchor
-        (the last item it retired) is. An empty id leaves the whole chat out (no checkpoint yet);
-        an item that starts or ends no stored turn leaves the chat whole.
+        (the current epoch): the first or last item of a stored turn, or one of its marks, as a
+        view start is. An empty id leaves the whole chat out (no checkpoint yet); an item no
+        stored turn holds leaves the chat whole: the index has not read that far, so no turn
+        after it is stored yet.
     :param project: Only what belongs to this Project (folder slug).
     :param file: Only this file, and the journal lines and turns that touched it (newest first).
     :param chat: Only this chat's turns.
@@ -434,7 +435,7 @@ def _hits(
 
 
 def _cutoffs(db: Any, exclude: dict[str, str]) -> dict[str, tuple[str, float, int]]:
-    """Chat id -> the order (``turn_order``) of the turn the cutoff item starts or ends; that
+    """Chat id -> the order (``turn_order``) of the turn that holds the cutoff item; that
     chat's turns ordered after it are left out. An empty item id leaves out every turn."""
     found = {chat: db.turn_ending(chat, item) for chat, item in exclude.items() if item}
     order = db.turn_order([c for c in found.values() if c is not None])

@@ -4621,7 +4621,7 @@ def create_runner_app(
         tail's last answer on, the items stay raw, so the history still ends where the record
         does (the message this turn answers, an interrupted call) and the recovery check and the
         harness prompt builders read it as before. Code only: no model call, nothing awaited but
-        the Round read. Writes the view start and schedules indexing of the turns before it.
+        the Round read. Writes the view start.
         """
         from omnigent.context.rollover import (
             assemble_block,
@@ -4765,8 +4765,7 @@ def create_runner_app(
         session_id: str, retired: list[_JsonObject], checkpoint: _JsonObject | None
     ) -> None:
         """Write where this session's view starts (``VIEW_START_LABEL``: the last item before
-        it) and index the turns before it for recall, both in the background and only when the
-        view start moved. recall then finds a turn a restart or a handoff left out."""
+        it) in the background, only when it moved. recall leaves out the turns after it."""
         from omnigent.context.rollover import VIEW_START_LABEL
 
         after = str(
@@ -4777,9 +4776,6 @@ def create_runner_app(
         _view_starts[session_id] = after
 
         async def note() -> None:
-            from omnigent.runner.memory.sync import index_retired_turns
-            from omnigent.superchat.projects.card import project_slug_from_workspace
-
             try:
                 await server_client.patch(
                     f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
@@ -4793,18 +4789,6 @@ def create_runner_app(
                     exc_info=True,
                     extra={"session_id": session_id},
                 )
-            if not retired:
-                return
-            labels = await _rollover_labels_for_session(session_id)
-            lineage = await _memory_labels(session_id, labels)
-            workspace = await _session_workspace_value(session_id)
-            await index_retired_turns(
-                server_client,
-                session_id,
-                lineage,
-                retired,
-                project=project_slug_from_workspace(workspace) or "",
-            )
 
         task = asyncio.create_task(note(), name=f"view-start-{session_id}")
         task.add_done_callback(_background_tasks.discard)
@@ -5510,10 +5494,10 @@ def create_runner_app(
     def _schedule_memory_sync(conv_id: str, labels: Mapping[str, str] | None) -> None:
         """Heal ``memory/`` in the background: missing folder, new owner, a reset not yet seen.
 
-        Then a bounded step of indexing the Conversation's turns up to its checkpoint's anchor
-        (the ``conversation`` source), with the Project the chat runs in.
+        Then a bounded step of indexing the Conversation's settled turns (the ``conversation``
+        source), with the Project the chat runs in.
         """
-        from omnigent.runner.memory.sync import backfill_turns, reconcile
+        from omnigent.runner.memory.sync import index_settled_turns, reconcile
         from omnigent.superchat.projects.card import project_slug_from_workspace
 
         if _memory_rebuilds:
@@ -5527,7 +5511,7 @@ def create_runner_app(
                 lineage = await _memory_labels(conv_id, labels)
                 await reconcile(server_client, conv_id, lineage)
                 workspace = await _session_workspace_value(conv_id)
-                await backfill_turns(
+                await index_settled_turns(
                     server_client,
                     conv_id,
                     lineage,
