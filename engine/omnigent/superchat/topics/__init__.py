@@ -5,8 +5,8 @@ write), ``tools`` (tool def), ``handlers`` (runner side), ``note`` (the next tur
 after a pick, and the active topic the Conversation may update itself). The quiet brief reads
 the owner's topics through :func:`omnigent.superchat.feature.topics_brief`; other capabilities
 use :func:`list_watched_topics`, :func:`mark_topic_new` and :func:`set_topic_status`, and hear
-every topic write through :func:`register_topic_listener` (ADR 0038). Imports stay lazy so importing a
-submodule never loads the server.
+every topic write through :func:`register_topic_listener` (ADR 0038). Imports stay lazy so
+importing a submodule never loads the server.
 """
 
 from __future__ import annotations

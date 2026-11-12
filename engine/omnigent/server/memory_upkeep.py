@@ -60,8 +60,9 @@ MEMORY_HOW_IT_WORKS = (
     "Something said directly is kept at once; a pattern is kept as noticed (inferred) and joins "
     "standing memory once it has shown up about three times. One-off instructions for a single "
     "task, choices you made, questions about you, and secrets are never kept. "
-    "Separately, you save what the person states during a turn (memory_remember), the daily "
-    "note records each day (its quiet pass may save lasting facts by the same rules), and the conversation's working list tracks open work. The person "
+    "Separately, you save what the person explicitly asks you to keep during a turn "
+    "(memory_remember), the daily note records each day (its quiet pass may save lasting "
+    "facts by the same rules), and the conversation's working list tracks open work. The person "
     "can ask you to remember or forget something, and can see, edit or forget each memory, with "
     "its source quote, in the Memory tab of the side panel."
 )

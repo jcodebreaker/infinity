@@ -162,13 +162,6 @@ from omnigent.superchat.prompt_prefix import (
     setup_line,
     turn_prefix_blocks,
 )
-
-#: How a harness is named to the model when it says which setup it runs on.
-_HARNESS_LABELS = {"pi": "pi", "claude-sdk": "Claude Agent SDK"}
-#: A turn's end events; each may carry the turn's usage (``response.usage.context_tokens``).
-_TURN_END_EVENTS = frozenset(
-    {"response.completed", "response.failed", "response.incomplete", "response.cancelled"}
-)
 from omnigent.superchat.subagents import (
     STUDIO_QUEUED_NOTE,
     STUDIO_WARM_SECONDS,
@@ -186,6 +179,13 @@ from omnigent.tools.builtins.load_skill import (
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
+
+#: How a harness is named to the model when it says which setup it runs on.
+_HARNESS_LABELS = {"pi": "pi", "claude-sdk": "Claude Agent SDK"}
+#: A turn's end events; each may carry the turn's usage (``response.usage.context_tokens``).
+_TURN_END_EVENTS = frozenset(
+    {"response.completed", "response.failed", "response.incomplete", "response.cancelled"}
+)
 
 # Allow process termination and forwarder cleanup to finish before DELETE proceeds.
 _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
@@ -7966,8 +7966,8 @@ def create_runner_app(
             )
 
     #: The harness's agent (the Claude CLI, the Pi process) launched at session init, by session
-    #: (ADR 0026: cold start is paid before the person speaks). A turn waits for it before posting, so its message never lands inside
-    #: the launch.
+    #: (ADR 0026: cold start is paid before the person speaks). A turn waits for it before
+    #: posting, so its message never lands inside the launch.
     _harness_prelaunches: dict[str, asyncio.Task[None]] = {}
 
     async def _prelaunch_harness(

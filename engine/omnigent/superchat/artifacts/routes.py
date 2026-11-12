@@ -420,7 +420,7 @@ def create_artifacts_router(
     async def create_artifact(
         request: Request,
         response: Response,
-        parent_session_id: str = Query(),
+        parent_session_id: str,
         name: str = Query(min_length=1, max_length=512),
         title: str | None = Query(default=None, max_length=256),
         source_path: str | None = Query(default=None, max_length=1024),
@@ -637,7 +637,7 @@ def create_artifacts_router(
     async def studio_turn(
         request: Request,
         session_id: str = Query(),
-        element: list[str] = Query(default=[]),
+        element: list[str] = Query(default=[]),  # noqa: B008 — FastAPI reads a repeated query param only via Query
         slide: int | None = Query(default=None, ge=1),
     ) -> dict[str, Any]:
         """What a file's studio turn starts with (``{"studio": null}`` for any other session).
@@ -684,9 +684,7 @@ def create_artifacts_router(
             }
         }
 
-    def _selected(
-        source: bytes, version: int, ids: list[str], slide: int | None
-    ) -> str | None:
+    def _selected(source: bytes, version: int, ids: list[str], slide: int | None) -> str | None:
         """The source of the selected elements, else of the one slide the ask is about."""
         parts = [(f"element {i}", found) for i in ids if (found := element_source(source, i))]
         if not ids and slide is not None:

@@ -785,7 +785,8 @@ def _round_views(
             return {}
         for r in missing:
             view = views.get(r)
-            seen[conversation_id, r] = view if view and view["ask"] and not view["hidden"] else None
+            shown = view and view["ask"] and not view["hidden"]
+            seen[conversation_id, r] = view if shown else None
         break
     return {r: v for r in wanted if (v := seen.get((conversation_id, r))) is not None}
 
