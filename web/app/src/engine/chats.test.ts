@@ -153,6 +153,8 @@ describe("chats.watch", () => {
         roundId: "r1",
         status: "running",
         startedAt: 1500,
+        settledAt: null,
+        deliveredAt: null,
         live: "name=deck",
         helpers: 1,
         files: 0,

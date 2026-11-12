@@ -530,6 +530,37 @@ export const TOOL_PRESENTATION: Record<string, ToolPresentation> = {
     },
   },
 
+  topics_update: {
+    icon: "memory",
+    title: () => "Updated a topic",
+    snippet: () => null,
+  },
+
+  reach_rules: {
+    icon: "memory",
+    title: (args) =>
+      args.action === "list" ? "Checked how to reach you" : "Updated how to reach you",
+    snippet: () => null,
+  },
+
+  brief_save: {
+    icon: "generic",
+    title: () => "Saved the brief",
+    snippet: () => null,
+  },
+
+  mail_read_thread: {
+    icon: "search",
+    title: () => "Read an email",
+    snippet: () => null,
+  },
+
+  load_skill: {
+    icon: "generic",
+    title: (args) => (args.name === "decks" ? "Looked up the deck layouts" : "Looked up a guide"),
+    snippet: () => null,
+  },
+
   sys_read_inbox: {
     icon: "helper",
     title: () => "Collected the result",

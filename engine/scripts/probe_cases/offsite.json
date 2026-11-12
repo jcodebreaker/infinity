@@ -17,23 +17,14 @@
     "Unrelated: what's a good structure for a 30-minute retro?",
     "Unrelated: one tip for running a hybrid meeting."
   ],
-  "chain": [
-    3,
-    6,
-    9,
-    11,
-    13
-  ],
+  "chain": [3, 6, 9, 11, 13],
   "probes": [
     {
       "id": "P1",
       "question": "How many people are coming, and what can we spend?",
       "task": "Give me a per-person budget.",
       "truth": "14 people; CAD 21,000 all-in (raised from 18,500).",
-      "must": [
-        "14",
-        "21[, ]?000"
-      ],
+      "must": ["14", "21[, ]?000"],
       "must_not": [
         {
           "re": "18[, ]?500",
@@ -48,10 +39,7 @@
       "question": "When is it, and why then?",
       "task": null,
       "truth": "The week of March 23; moved from March 9 because March 9 clashes with quarter close.",
-      "must": [
-        "March 23|23 March|Mar 23",
-        "quarter close"
-      ],
+      "must": ["March 23|23 March|Mar 23", "quarter close"],
       "must_not": [
         {
           "re": "(week of )?March 9",
@@ -64,9 +52,7 @@
       "question": "Remind me of every hard requirement I gave you for the venues.",
       "task": null,
       "truth": "Step-free for Priya, who uses a wheelchair; 14 people; within two hours of Toronto; CAD 21,000 all-in; dinner on night one works for two vegans.",
-      "must": [
-        "step-free|wheelchair|accessib"
-      ],
+      "must": ["step-free|wheelchair|accessib"],
       "must_not": []
     },
     {
@@ -74,9 +60,7 @@
       "question": "Which venues did we rule out, and why?",
       "task": null,
       "truth": "The second option of the three, because its elevator is out until April.",
-      "must": [
-        "elevator"
-      ],
+      "must": ["elevator"],
       "must_not": []
     },
     {
@@ -84,11 +68,7 @@
       "question": "Tell me everything you know about the attendees.",
       "task": null,
       "truth": "14 people on the analytics team; Priya uses a wheelchair; two are vegan.",
-      "must": [
-        "14",
-        "Priya",
-        "vegan"
-      ],
+      "must": ["14", "Priya", "vegan"],
       "must_not": []
     },
     {
@@ -96,9 +76,7 @@
       "question": "Did I tell you which city the team is flying in from?",
       "task": null,
       "truth": "No. Only that venues must be within two hours of Toronto.",
-      "must": [
-        "\\b(no|didn't|did not|haven't|not mention)\\b"
-      ],
+      "must": ["\\b(no|didn't|did not|haven't|not mention)\\b"],
       "must_not": [
         {
           "re": "(flying|fly|flights?) in from (Toronto|Montreal|Vancouver|Calgary|Ottawa)",
@@ -111,16 +89,9 @@
       "question": "Which file are we working on, which version is it, and what changed last?",
       "task": "Write the invitation email to the team.",
       "truth": "The venue page; its newest version; the last change set the dates to the week of March 23 and the budget to CAD 21,000.",
-      "must": [
-        "{file}",
-        "\\bv(?:ersion)?\\W{0,4}{version}\\b"
-      ],
+      "must": ["{file}", "\\bv(?:ersion)?\\W{0,4}{version}\\b"],
       "must_not": [],
-      "task_must": [
-        "March 23|23 March|Mar 23",
-        "step-free|accessib|wheelchair",
-        "vegan|dietary"
-      ],
+      "task_must": ["March 23|23 March|Mar 23", "step-free|accessib|wheelchair", "vegan|dietary"],
       "task_must_not": [
         {
           "re": "March 9",

@@ -104,6 +104,8 @@ describe("automations router", () => {
         description: "Keeps your memory fresh",
         schedule: "Every hour",
         lastRunAt: "2023-11-14T22:13:20.000Z",
+        lastOutcome: null,
+        lastFailed: false,
         nextRunAt: null,
         enabled: true,
       },
