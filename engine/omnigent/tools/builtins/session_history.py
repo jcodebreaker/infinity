@@ -3,9 +3,9 @@
 The rollover super chat compacts older messages into a summary — "the
 summary is a pointer, not the truth" (``docs/context.md``). This tool
 lets the model page backward through, or full-text search, the exact items
-that summary was built from, check how much context headroom is left, and,
-from a scheduled or ad-hoc Helper, read the Conversation it works for
-(``list_chats``, then ``chat_id``).
+that summary was built from, check how much context headroom is left, and
+read a related chat by ``chat_id``: from a scheduled or ad-hoc Helper, the
+Conversation it works for (``list_chats``); from any chat, a Helper it started.
 """
 
 from __future__ import annotations
@@ -17,8 +17,7 @@ from typing import Any
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
 
-# Mirrors ``_ACTIVITY_MAX_CHARS`` in ``spawn.py`` — the same compact-preview
-# budget ``sys_session_get_history`` uses for its per-field truncation.
+# Mirrors ``_ACTIVITY_MAX_CHARS`` in ``spawn.py``, the compact-preview budget.
 _CONTENT_MAX_CHARS = 2000
 # A tool call's arguments and a tool's result are read as a short digest: the words of the
 # person and the assistant are what a recall is for, and bulk read here stays in context.
@@ -71,32 +70,22 @@ class SessionHistoryTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Call this before answering any question about earlier messages "
-            "(first message, exact wording, what was decided). "
-            "Recall the exact record of THIS session — what you see of "
-            "earlier turns may be shortened and may omit details. "
-            "action='read': read earlier turns of this conversation to "
-            "ground yourself before answering. Returns turns (a user "
-            "message plus everything that answered it; tool calls and "
-            "results shortened), newest first, or from the start with "
-            "order='oldest' (the first message: order='oldest', limit=1). "
-            "limit caps turns per call (default 5, maximum 20); a call "
-            f"returns about {_READ_MAX_CHARS} characters at most. Pass "
-            "next_cursor as cursor (with the same order) to read the next "
-            "page. Reading "
-            "never changes the chat. action='get' returns one stored item "
-            "unclipped, by call_id (a tool call's result) or item_id, "
-            f"{_READ_MAX_CHARS} characters at a time from offset; "
-            "next_offset says where the rest starts. "
-            "action='search' full-text searches "
-            "this session's own items. action='status' reports tokens "
-            "used, the context window, and tokens left before the next "
-            "rollover. Always scoped to the session that called this tool "
-            "by default. action='list_chats' lists the other chats this "
-            "session may read (a Helper's parent conversation) with a short "
-            "preview of each; pass that chat's id as chat_id to read or "
-            "search to look into it. This tool is read-only: it never "
-            "writes into another chat, only this one's own turns do."
+            "The exact record of this chat; what you see of earlier turns may be shortened. "
+            "Call it before answering about earlier messages (first message, exact wording, "
+            "what was decided). Read-only. "
+            "action='read': turns (a user message and everything that answered it; tool items "
+            "shortened), newest first, or from the start with order='oldest' (the first "
+            "message: order='oldest', limit=1). limit caps turns per call (default 5, maximum "
+            f"20); a call returns about {_READ_MAX_CHARS} characters at most. Pass next_cursor "
+            "as cursor, with the same order, to read the next page. "
+            "action='get': one item unclipped, by call_id or item_id (neither: the chat's last "
+            f"reply), {_READ_MAX_CHARS} characters at a time from offset; next_offset says "
+            "where the rest starts. "
+            "action='search': full-text search. "
+            "action='status': tokens used, the context window and tokens left before the next "
+            "rollover. "
+            "action='list_chats': the other chats you may read (a Helper's parent "
+            "conversation)."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -114,74 +103,49 @@ class SessionHistoryTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": sorted(_ACTIONS),
-                            "description": (
-                                "'read' returns full turns of this session, newest "
-                                "first; 'get' returns one item unclipped; "
-                                "'search' full-text searches its items; "
-                                "'status' reports token usage and headroom before "
-                                "the next rollover; 'list_chats' lists the other "
-                                "chats this session may read."
-                            ),
-                        },
+                        "action": {"type": "string", "enum": sorted(_ACTIONS)},
                         "cursor": {
                             "type": "string",
-                            "description": (
-                                "read only. Opaque pagination cursor from a previous "
-                                "call's next_cursor. Omit to start at the newest (or, "
-                                "with order='oldest', the first) turn; pass next_cursor "
-                                "back with the same order to read the next page."
-                            ),
+                            "description": "read only. next_cursor from the previous call.",
                         },
-                        "order": {
+                        "order": {"type": "string", "enum": sorted(_READ_ORDERS)},
+                        "around": {
                             "type": "string",
-                            "enum": sorted(_READ_ORDERS),
                             "description": (
-                                "read only. 'newest' (default) pages back from the "
-                                "latest turn; 'oldest' pages forward from the first."
+                                "read only. An item id: read from the turn that holds it, "
+                                "oldest first."
                             ),
                         },
                         "limit": {
                             "type": "integer",
                             "minimum": 1,
                             "description": (
-                                f"read: turns per call, default {_READ_DEFAULT_LIMIT}, "
-                                f"max {_READ_MAX_LIMIT}. search: max results, default "
+                                f"read: turns, default {_READ_DEFAULT_LIMIT}, max "
+                                f"{_READ_MAX_LIMIT}. search: results, default "
                                 f"{_SEARCH_DEFAULT_LIMIT}, max {_SEARCH_MAX_LIMIT}."
                             ),
                         },
-                        "query": {
-                            "type": "string",
-                            "description": "search only. The full-text search query.",
-                        },
+                        "query": {"type": "string", "description": "search only."},
                         "call_id": {
                             "type": "string",
-                            "description": "get only. The tool call id whose result to return.",
+                            "description": "get only. A tool call's id: returns its result.",
                         },
-                        "item_id": {
-                            "type": "string",
-                            "description": "get only. The id of the item to return.",
-                        },
+                        "item_id": {"type": "string", "description": "get only."},
                         "offset": {
                             "type": "integer",
                             "minimum": 0,
-                            "description": "get only. First character to return (default 0).",
+                            "description": "get only. First character (default 0).",
                         },
                         "length": {
                             "type": "integer",
                             "minimum": 1,
-                            "description": (
-                                f"get only. Characters to return, up to {_READ_MAX_CHARS}."
-                            ),
+                            "description": f"get only. Characters, up to {_READ_MAX_CHARS}.",
                         },
                         "chat_id": {
                             "type": "string",
                             "description": (
-                                "get/read/search only. Look into another chat instead of "
-                                "this one — must be an id returned by list_chats (or "
-                                "this chat's own id). Omit to read/search this chat."
+                                "get/read/search: another chat, by an id from list_chats or "
+                                "a Helper's id from its result. Omit for this chat."
                             ),
                         },
                     },
@@ -249,8 +213,9 @@ def _resolve_chat_target(
 
     ``chat_id`` is optional and defaults to *conversation_id* (the calling
     session itself). When set to something else, it must be one of
-    *conversation_id*'s own ``list_chats`` — never trusted on its own, the
-    same context-not-argument scoping the rest of this tool uses.
+    *conversation_id*'s own ``list_chats`` or a Helper it started, owned by the
+    same person — never trusted on its own, the same context-not-argument
+    scoping the rest of this tool uses.
 
     :returns: ``(target_conversation_id, None)`` on success, or
         ``(None, json_error_string)``.
@@ -265,7 +230,7 @@ def _resolve_chat_target(
 
     from omnigent.context.rollover import related_chat_ids
 
-    if chat_id not in related_chat_ids(conv_store, conversation_id):
+    if chat_id not in related_chat_ids(conv_store, conversation_id, chat_id):
         return None, json.dumps(
             {"error": "chat_id is not a related chat of this session", "chat_id": chat_id}
         )
@@ -297,6 +262,23 @@ def _read(conv_store: Any, conversation_id: str, args: dict[str, Any]) -> str:
 
     from omnigent.errors import StaleCursorError
 
+    around = args.get("around")
+    if around is not None:
+        if not isinstance(around, str) or not around:
+            return json.dumps({"error": "around must be an item id"})
+        try:
+            newer = conv_store.list_items(conversation_id, limit=1, after=around, order="asc")
+            back = conv_store.list_items(
+                conversation_id,
+                limit=_READ_BATCH_SIZE,
+                after=newer.data[0].id if newer.data else None,
+                order="desc",
+            )
+        except StaleCursorError:
+            return json.dumps({"error": "stale_cursor", "around": around})
+        cursor = around_cursor([_project_item(item) for item in back.data], back.has_more)
+        oldest = True
+
     def fetch_page(cursor_item_id: str | None) -> tuple[list[dict[str, Any]], bool]:
         # ``after`` (not ``before``) is correct here: it means "further in sort
         # direction" — older in desc order, newer in asc (see
@@ -322,8 +304,8 @@ def _read(conv_store: Any, conversation_id: str, args: dict[str, Any]) -> str:
 def get_window(args: dict[str, Any]) -> tuple[str | None, str | None, int, int] | str:
     """Validate ``get`` arguments: ``(call_id, item_id, offset, length)``, or an error JSON."""
     call_id, item_id = args.get("call_id"), args.get("item_id")
-    if not any(isinstance(v, str) and v for v in (call_id, item_id)):
-        return json.dumps({"error": "get requires a call_id or an item_id"})
+    if any(v is not None and not isinstance(v, str) for v in (call_id, item_id)):
+        return json.dumps({"error": "call_id and item_id must be strings"})
     offset = args.get("offset", 0)
     length = args.get("length", _READ_MAX_CHARS)
     for name, value, floor in (("offset", offset, 0), ("length", length, 1)):
@@ -333,7 +315,9 @@ def get_window(args: dict[str, Any]) -> tuple[str | None, str | None, int, int] 
 
 
 def is_requested_item(item: dict[str, Any], call_id: str | None, item_id: str | None) -> bool:
-    """Whether a flat API item is the one ``get`` asked for."""
+    """Whether a flat API item is the one ``get`` asked for; with no id, the last reply."""
+    if call_id is None and item_id is None:
+        return item.get("type") == "message" and item.get("role") == "assistant"
     if item_id is not None and item.get("id") == item_id:
         return True
     return (
@@ -386,6 +370,20 @@ def _get(conv_store: Any, conversation_id: str, args: dict[str, Any]) -> str:
             break
         cursor = page.data[-1].id
     return get_response(None, offset, length)
+
+
+def around_cursor(items: list[dict[str, Any]], has_more: bool) -> str | None:
+    """The cursor an oldest-first read starts from to begin at the turn holding ``items[0]``.
+
+    *items* are projected items, newest first: the ``around`` item, then older ones. The turn
+    starts at the first user message among them; the cursor is the item just before it.
+    """
+    for idx, item in enumerate(items):
+        if item.get("type") == "text" and item.get("role") == "user":
+            if idx + 1 < len(items):
+                return items[idx + 1]["id"]
+            return item["id"] if has_more else None
+    return items[-1]["id"] if items and has_more else None
 
 
 def read_order(raw: Any) -> bool | None:

@@ -80,7 +80,6 @@ from omnigent.models.model_override import (
     normalize_model_for_provider,
     validate_model_override,
 )
-from omnigent.runtime import pending_elicitations
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.runtime.runner_wire import SessionCreatedEvent
 from omnigent.tools import ToolManager
@@ -107,21 +106,12 @@ from omnigent.tools.builtins.os_env import (
     SysOsShellTool,
     SysOsWriteTool,
 )
+from omnigent.tools.builtins.scheduled_tasks import SCHEDULE_REQUIRED, ScheduleTool
 from omnigent.tools.builtins.session_history import SessionHistoryTool, status_from_labels
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
-    # Shared contract values with the in-process sys_session_* tools. Imported
-    # (not duplicated) so the runner's REST-backed peek clamps to the same
-    # bounds the LLM-facing tool schema advertises and tombstones with the
-    # same marker the in-process close writes.
-    _ACTIVITY_MAX_CHARS,
+    # Shared with the in-process close, so the runner tombstones with the same marker.
     _CLOSED_TITLE_INFIX,
-    _HISTORY_DEFAULT_TAIL,
-    _HISTORY_MAX_TOTAL_CHARS,
-    _bound_history_content_chars,
-    _clamp_history_content_chars,
-    _clamp_history_offset_chars,
-    _clamp_tail_items,
 )
 from omnigent.tools.builtins.sys_terminal import (
     SysTerminalCloseTool,
@@ -332,7 +322,7 @@ _ASYNC_INBOX_TOOLS = frozenset(
 
 # Priority 5f: Sub-agent tools. ``sys_session_send`` creates or
 # continues child sessions. The read-only observability helpers
-# (peek/list/close) dispatch via ``_SESSION_QUERY_TOOLS`` below.
+# (list/close) dispatch via ``_SESSION_QUERY_TOOLS`` below.
 _SUBAGENT_TOOLS = frozenset({"sys_session_send"})
 _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 
@@ -342,7 +332,7 @@ _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 # as _execute_subagent_tool.
 _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
 
-# Priority 5f.0: Session query tools — peek/list/close/get_info/share. The
+# Priority 5f.0: Session query tools — list/close/get_info/share. The
 # runner has no in-process ConversationStore, so these read/mutate session
 # state via the Omnigent server's existing REST endpoints (GET /items, GET
 # /child_sessions, GET /sessions/{id}, PATCH /sessions/{id}, PUT
@@ -350,7 +340,6 @@ _SESSION_CREATE_TOOLS = frozenset({"sys_session_create"})
 # posture as _execute_subagent_tool / _execute_comment_tool.
 _SESSION_QUERY_TOOLS = frozenset(
     {
-        "sys_session_get_history",
         "sys_session_list",
         "sys_session_close",
         "sys_session_get_info",
@@ -437,14 +426,7 @@ _POLICY_TOOLS = frozenset({"sys_add_policy", "sys_policy_registry"})
 
 # Priority 5l.1: Scheduled-task management — the runner proxies the Omnigent
 # server's /v1/scheduled-tasks REST endpoints (same posture as _POLICY_TOOLS).
-_SCHEDULED_TASK_TOOLS = frozenset(
-    {
-        "sys_scheduled_task_create",
-        "sys_scheduled_task_list",
-        "sys_scheduled_task_update",
-        "sys_scheduled_task_delete",
-    }
-)
+_SCHEDULED_TASK_TOOLS = frozenset({ScheduleTool.name()})
 
 # Super Chat features (omnigent/superchat/<name>/): handlers are registered via FEATURES.
 FEATURE_TOOL_NAMES = frozenset(FEATURE_HANDLERS)
@@ -3578,7 +3560,7 @@ async def _execute_session_create(
     Both modes force ``parent_session_id`` to the caller (child-only).
     The child inherits the caller's runner (server-side affinity), so a
     queued initial message starts a turn immediately. Returns a handle
-    the orchestrator can monitor (``sys_session_get_history`` /
+    the orchestrator can monitor (``session_history`` with ``chat_id`` /
     ``sys_session_get_info``) or drive (``sys_session_send`` by
     ``conversation_id``) — unlike named-mode send, it does NOT block on
     the child turn.
@@ -4477,39 +4459,25 @@ async def _execute_add_policy(
         return json.dumps({"error": f"sys_add_policy failed: {exc}"})
 
 
-# Fields the create tool forwards to POST /v1/scheduled-tasks.
+# Fields ``schedule`` forwards to POST /v1/scheduled-tasks (create) and PATCH
+# /v1/scheduled-tasks/{id} (update). Agent, host, workspace, model, effort,
+# permission mode and cost cap keep the server's defaults.
 _SCHEDULED_TASK_CREATE_FIELDS = (
     "name",
     "prompt",
     "rrule",
     "starts_on",
-    "agent_id",
     "parent_session_id",
     "agent_type",
     "kind",
     "timezone",
-    "model_override",
-    "reasoning_effort",
-    "permission_mode",
-    "workspace",
-    "host_id",
-    "execution_target",
 )
-# Fields the update tool forwards to PATCH /v1/scheduled-tasks/{id}.
 _SCHEDULED_TASK_UPDATE_FIELDS = (
     "name",
     "prompt",
     "rrule",
     "starts_on",
-    "agent_id",
     "timezone",
-    "model_override",
-    "reasoning_effort",
-    "permission_mode",
-    "max_cost_usd",
-    "workspace",
-    "host_id",
-    "execution_target",
     "state",
     "parent_session_id",
     "agent_type",
@@ -4525,82 +4493,78 @@ def _scheduled_task_url(task_id: object) -> str | None:
 
 
 async def _execute_scheduled_task_tool(
-    tool_name: str,
     arguments: str,
     *,
     server_client: httpx.AsyncClient | None,
     conversation_id: str | None = None,
 ) -> str:
     """
-    Runner-local handler for the ``sys_scheduled_task_*`` family.
+    Runner-local handler for ``schedule``.
 
-    The runner has no in-process ScheduledTaskStore, so these tools proxy the
+    The runner has no in-process ScheduledTaskStore, so each action proxies the
     Omnigent server's ``/v1/scheduled-tasks`` REST endpoints over
     ``server_client`` — same posture as :func:`_execute_policy_tool` /
     :func:`_execute_session_query_tool`. Ownership + RRULE validation are
-    enforced server-side.
+    enforced server-side; the fields each action needs are checked here.
 
-    :param tool_name: One of the ``sys_scheduled_task_*`` names.
     :param arguments: JSON-encoded arguments string from the LLM.
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         returns an error string.
     :param conversation_id: The calling session; ``"self"`` resolves to it and a
-        sub-agent caller is refused.
+        sub-agent caller may only ``list``.
     :returns: Tool output JSON string.
     """
     if server_client is None:
-        return json.dumps({"error": f"{tool_name} requires server access"})
+        return json.dumps({"error": "schedule requires server access"})
     try:
         args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError:
-        return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+        return json.dumps({"error": "schedule: malformed JSON arguments"})
+    action = args.get("action")
+    if action not in SCHEDULE_REQUIRED:
+        return json.dumps({"error": f"schedule action must be one of {list(SCHEDULE_REQUIRED)}"})
 
     # Helpers (sub-agent sessions) never manage schedules, only list them; fail
     # closed when the caller's kind cannot be verified.
     if conversation_id:
         lookup = await _session_kind_and_parent(conversation_id, server_client)
         # A Helper may only read the list (the daily Study dedupes against it).
-        read_only_ok = tool_name == "sys_scheduled_task_list"
-        if lookup is None or (lookup[0] == "sub_agent" and not read_only_ok):
+        if lookup is None or (lookup[0] == "sub_agent" and action != "list"):
             return json.dumps(
-                {"error": f"{tool_name} is not available to sub-agent sessions"}
+                {"error": f"schedule {action} is not available to sub-agent sessions"}
                 if lookup is not None
-                else {"error": f"{tool_name}: cannot verify the calling session"}
+                else {"error": "schedule: cannot verify the calling session"}
             )
-        # "self" binds the task to the calling session.
-        if args.get("parent_session_id") == "self":
+        # "self" binds the task to the calling session; a new task binds to it by default.
+        if args.get("parent_session_id") == "self" or (
+            action == "create" and not args.get("parent_session_id")
+        ):
             args["parent_session_id"] = conversation_id
-        # A chat that names no agent schedules for itself: bind to this chat as a worker.
-        if tool_name == "sys_scheduled_task_create":
-            if not args.get("agent_id") and not args.get("parent_session_id"):
-                args["parent_session_id"] = conversation_id
-            if args.get("parent_session_id") and not args.get("agent_type"):
-                args["agent_type"] = WORKER_TYPE
+        if action == "create" and not args.get("agent_type"):
+            args["agent_type"] = WORKER_TYPE
 
+    missing = next((f for f in SCHEDULE_REQUIRED[action] if not args.get(f)), None)
+    if missing is not None:
+        return json.dumps({"error": f"schedule {action} needs '{missing}'"})
     try:
-        if tool_name == "sys_scheduled_task_list":
+        if action == "list":
             resp = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
-        elif tool_name == "sys_scheduled_task_create":
+        elif action == "create":
             payload = {k: args[k] for k in _SCHEDULED_TASK_CREATE_FIELDS if k in args}
             resp = await server_client.post("/v1/scheduled-tasks", json=payload, timeout=30.0)
-        elif tool_name in ("sys_scheduled_task_update", "sys_scheduled_task_delete"):
-            task_id = args.get("scheduled_task_id")
-            if not task_id:
-                return json.dumps({"error": f"{tool_name} requires 'scheduled_task_id'"})
-            task_url = _scheduled_task_url(task_id)
+        else:
+            task_url = _scheduled_task_url(args["scheduled_task_id"])
             if task_url is None:
                 return json.dumps(
-                    {"error": f"{tool_name} requires canonical 32-character hex scheduled_task_id"}
+                    {"error": f"schedule {action} needs a 32-character hex scheduled_task_id"}
                 )
-            if tool_name == "sys_scheduled_task_delete":
+            if action == "delete":
                 resp = await server_client.delete(task_url, timeout=30.0)
             else:
                 payload = {k: args[k] for k in _SCHEDULED_TASK_UPDATE_FIELDS if k in args}
                 resp = await server_client.patch(task_url, json=payload, timeout=30.0)
-        else:  # pragma: no cover — routing guarantees a known name
-            return json.dumps({"error": f"unknown scheduled-task tool {tool_name!r}"})
     except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+        return json.dumps({"error": f"schedule {action} failed: {exc}"})
 
     if resp.status_code >= 400:
         return json.dumps(
@@ -4652,102 +4616,6 @@ def _parse_session_title(raw_title: str | None) -> _ParsedTitle:
     return _ParsedTitle(agent=head, title=tail)
 
 
-def _truncate_activity(
-    text: str | None,
-    *,
-    max_chars: int = _ACTIVITY_MAX_CHARS,
-    offset_chars: int = 0,
-) -> str | None:
-    """
-    Return a bounded window of ``text`` to bound peek prompt size.
-
-    :param text: The text to truncate, or ``None``.
-    :param max_chars: Maximum characters retained before the marker.
-    :param offset_chars: Characters skipped before the window.
-    :returns: ``text[offset_chars : offset_chars + max_chars]`` with a
-        ``" [truncated]"`` suffix when content remains past the window,
-        or ``None`` when the input is ``None``.
-    """
-    if text is None:
-        return None
-    window = text[offset_chars : offset_chars + max_chars]
-    if offset_chars + max_chars >= len(text):
-        return window
-    return window + " [truncated]"
-
-
-def _text_from_api_content(content: object) -> str:
-    """
-    Join the text blocks of an API message ``content`` array.
-
-    :param content: The ``content`` field of an API message item — a
-        list of blocks like ``{"type": "output_text", "text": "..."}``.
-    :returns: The concatenated text, or ``""`` when there is none.
-    """
-    if not isinstance(content, list):
-        return ""
-    parts = [
-        block["text"]
-        for block in content
-        if isinstance(block, dict) and isinstance(block.get("text"), str)
-    ]
-    return " ".join(parts)
-
-
-def _project_api_item(
-    item: _JsonObject,
-    *,
-    max_chars: int = _ACTIVITY_MAX_CHARS,
-    offset_chars: int = 0,
-) -> _JsonObject:
-    """
-    Project a REST API conversation item into the compact peek shape.
-
-    Mirrors :func:`omnigent.tools.builtins.spawn._project_activity_item`
-    but reads the API item JSON returned by
-    ``GET /v1/sessions/{id}/items`` (``ConversationItem.to_api_dict()``)
-    rather than the in-process entity, so the harness peek result reads
-    the same as the in-process tool's.
-
-    :param item: One API item dict from the items endpoint.
-    :param max_chars: Maximum characters retained in each content field.
-    :param offset_chars: Characters skipped from the start of each
-        content field before the window is taken.
-    :returns: A compact dict — ``{type, tool, args}`` for tool calls,
-        ``{type, output}`` for tool results, ``{type, role, text}`` for
-        messages.
-    """
-    itype = _optional_string(item.get("type"))
-    if itype == "function_call":
-        return {
-            "type": "function_call",
-            "tool": _optional_string(item.get("name")),
-            "args": _truncate_activity(
-                _optional_string(item.get("arguments")),
-                max_chars=max_chars,
-                offset_chars=offset_chars,
-            ),
-        }
-    if itype == "function_call_output":
-        output = item.get("output")
-        rendered = output if isinstance(output, str) else json.dumps(output)
-        return {
-            "type": "function_call_output",
-            "output": _truncate_activity(rendered, max_chars=max_chars, offset_chars=offset_chars),
-        }
-    if itype == "message":
-        return {
-            "type": "message",
-            "role": _optional_string(item.get("role")),
-            "text": _truncate_activity(
-                _text_from_api_content(item.get("content")),
-                max_chars=max_chars,
-                offset_chars=offset_chars,
-            ),
-        }
-    return {"type": itype}
-
-
 async def _execute_session_query_tool(
     tool_name: str,
     arguments: str,
@@ -4757,8 +4625,8 @@ async def _execute_session_query_tool(
     agent_spec: AgentSpec | None = None,
 ) -> str:
     """
-    Runner-local handler for ``sys_session_get_history`` / ``sys_session_list`` /
-    ``sys_session_close``.
+    Runner-local handler for ``sys_session_list`` / ``sys_session_get_info`` /
+    ``sys_session_close`` / ``sys_session_share``.
 
     The runner is a separate subprocess from the Omnigent server and has no
     in-process ``ConversationStore`` (same constraint as
@@ -4766,7 +4634,6 @@ async def _execute_session_query_tool(
     Omnigent server's existing REST endpoints over ``server_client``:
 
     - ``sys_session_list`` → ``GET /v1/sessions/{caller}/child_sessions``
-    - ``sys_session_get_history`` → ``GET /v1/sessions/{target}/items``
     - ``sys_session_get_info`` → ``GET /v1/sessions/{target}`` (plus
       best-effort runner connectivity and host readiness lookups)
     - ``sys_session_close`` → ``GET`` the target snapshot then ``PATCH
@@ -4781,11 +4648,10 @@ async def _execute_session_query_tool(
     on those endpoints for ``server_client`` — the same posture as
     :func:`_execute_subagent_tool`.
 
-    :param tool_name: ``"sys_session_get_history"``, ``"sys_session_list"``,
-        ``"sys_session_close"``, ``"sys_session_get_info"``, or
-        ``"sys_session_share"``.
+    :param tool_name: ``"sys_session_list"``, ``"sys_session_close"``,
+        ``"sys_session_get_info"``, or ``"sys_session_share"``.
     :param arguments: JSON-encoded arguments string from the LLM, e.g.
-        ``'{"conversation_id": "conv_abc123", "tail_items": 5}'``.
+        ``'{"conversation_id": "conv_abc123"}'``.
     :param conversation_id: The calling session id, e.g. ``"conv_root1"``;
         used as the parent for ``sys_session_list``.
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
@@ -4825,8 +4691,6 @@ async def _execute_session_query_tool(
             cursor_state=cursor_state,
             continued=continued,
         )
-    if tool_name == "sys_session_get_history":
-        return await _session_get_history_via_rest(args, server_client)
     if tool_name == "sys_session_get_info":
         return await _session_get_info_via_rest(args, conversation_id, server_client)
     if tool_name == "sys_session_share":
@@ -4899,7 +4763,7 @@ async def _session_get_info_via_rest(
     ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when
     the lookup fails or no runner is bound); host readiness is likewise
     best-effort via ``GET /v1/hosts/{id}``. The full transcript is
-    intentionally omitted — that is what ``sys_session_get_history`` returns.
+    intentionally omitted — that is what ``session_history`` with ``chat_id`` reads.
 
     Maps a 404 to ``session_not_found`` and 401/403 to ``access_denied``
     (the server denied the read, so from the caller's vantage the target
@@ -6043,86 +5907,6 @@ async def _session_parent_id(
     return parent if isinstance(parent, str) and parent else None
 
 
-async def _session_get_history_via_rest(
-    args: _JsonObject,
-    server_client: httpx.AsyncClient,
-) -> str:
-    """
-    Read a target session's recent items via ``GET .../items``.
-
-    Mirrors :class:`SysSessionGetHistoryTool`: returns
-    ``{"conversation_id", "agent", "title", "items"}`` with items in
-    chronological order. The target's ``agent``/``title`` come from its
-    session snapshot. Maps a 404 to ``session_not_found`` and a
-    403/401 to ``session_out_of_tree`` (the server denied read access,
-    so from the caller's vantage the target is outside the sessions it
-    may read).
-
-    :param args: Parsed tool arguments; requires ``conversation_id``,
-        optional ``tail_items``, ``content_max_chars``, and
-        ``content_offset_chars``.
-    :param server_client: HTTP client pointed at the Omnigent server.
-    :returns: JSON peek result, or a JSON error object.
-    """
-    target_id = args.get("conversation_id")
-    if not isinstance(target_id, str) or not target_id:
-        return json.dumps(
-            {"error": "sys_session_get_history requires a non-empty 'conversation_id' string"}
-        )
-    tail_items = _clamp_tail_items(args.get("tail_items", _HISTORY_DEFAULT_TAIL))
-    if isinstance(tail_items, str):
-        return tail_items
-    content_max_chars = _clamp_history_content_chars(
-        args.get("content_max_chars", _ACTIVITY_MAX_CHARS),
-    )
-    if isinstance(content_max_chars, str):
-        return content_max_chars
-    content_max_chars = _bound_history_content_chars(
-        tail_items=tail_items,
-        content_max_chars=content_max_chars,
-    )
-    content_offset_chars = _clamp_history_offset_chars(args.get("content_offset_chars", 0))
-    if isinstance(content_offset_chars, str):
-        return content_offset_chars
-    try:
-        resp = await server_client.get(
-            f"/v1/sessions/{target_id}/items",
-            params={"limit": tail_items, "order": "desc"},
-            timeout=30.0,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"sys_session_get_history failed: {exc}"})
-    if resp.status_code == 404:
-        return json.dumps({"error": "session_not_found", "conversation_id": target_id})
-    if resp.status_code in (401, 403):
-        return json.dumps({"error": "session_out_of_tree", "conversation_id": target_id})
-    if resp.status_code != 200:
-        return json.dumps({"error": f"sys_session_get_history returned {resp.status_code}"})
-    data: list[_JsonObject] = resp.json().get("data", [])
-    # ``order="desc"`` returns newest-first; reverse to chronological so
-    # the LLM reads top-to-bottom (matches the in-process peek).
-    items: list[_JsonObject] = [
-        _project_api_item(it, max_chars=content_max_chars, offset_chars=content_offset_chars)
-        for it in reversed(data)
-    ]
-    meta = await _fetch_peek_meta(target_id, server_client)
-    # A parked elicitation never lands in the conversation store (it
-    # lives only in the Omnigent server's pending-elicitations index, replayed
-    # on the snapshot), so append the snapshot's outstanding prompts
-    # after the stored tail — they are the sub-agent's most recent act.
-    items.extend(
-        pending_elicitations.project_for_peek(event) for event in meta.pending_elicitations
-    )
-    return json.dumps(
-        {
-            "conversation_id": target_id,
-            "agent": meta.agent,
-            "title": meta.title,
-            "items": items,
-        }
-    )
-
-
 async def _fetch_close_target(
     target_id: str,
     server_client: httpx.AsyncClient,
@@ -6227,8 +6011,9 @@ async def _resolve_chat_target_via_rest(
     Mirrors the in-process tool's ``_resolve_chat_target``: *conversation_id*
     (the runner's own dispatch context) is the only trusted scope. An
     explicit ``chat_id`` is only honored when it is *conversation_id* itself
-    or appears in its own ``related_chats`` — fetched fresh here, never
-    taken from *args*.
+    or appears in its own ``related_chats`` (the server lists a Helper it
+    started when asked for it, and checks the owner) — fetched fresh here,
+    never taken from *args*.
 
     :returns: ``(target_conversation_id, None)`` on success, or
         ``(None, json_error_string)``.
@@ -6242,7 +6027,9 @@ async def _resolve_chat_target_via_rest(
         return chat_id, None
     try:
         resp = await server_client.get(
-            f"/v1/sessions/{conversation_id}/related_chats", timeout=30.0
+            f"/v1/sessions/{conversation_id}/related_chats",
+            params={"chat_id": chat_id},
+            timeout=30.0,
         )
         resp.raise_for_status()
     except Exception as exc:  # noqa: BLE001
@@ -6324,6 +6111,9 @@ async def _session_history_read_via_rest(
     oldest = _session_history.read_order(args.get("order"))
     if oldest is None:
         return json.dumps({"error": "order must be one of ['newest', 'oldest']"})
+    around = args.get("around")
+    if around is not None and (not isinstance(around, str) or not around):
+        return json.dumps({"error": "around must be an item id"})
 
     async def fetch_page(cursor_item_id: str | None) -> tuple[list[_JsonObject], bool]:
         params: dict[str, str | int] = {
@@ -6342,6 +6132,33 @@ async def _session_history_read_via_rest(
         body = resp.json()
         items = [_session_history.project_api_item(raw) for raw in body.get("data", [])]
         return items, bool(body.get("has_more"))
+
+    try:
+        if around is not None:
+            # Start an oldest-first read at the turn holding ``around``: the item just newer
+            # than it, then it and the older items back to its turn's user message.
+            items_url = f"/v1/sessions/{target_id}/items"
+            newer = await server_client.get(
+                items_url, params={"limit": 1, "after": around, "order": "asc"}, timeout=30.0
+            )
+            newer.raise_for_status()
+            newer_data = newer.json().get("data", [])
+            back_params: dict[str, str | int] = {
+                "limit": _session_history._READ_BATCH_SIZE,
+                "order": "desc",
+            }
+            if newer_data:
+                back_params["after"] = newer_data[0]["id"]
+            back = await server_client.get(items_url, params=back_params, timeout=30.0)
+            back.raise_for_status()
+            back_body = back.json()
+            cursor = _session_history.around_cursor(
+                [_session_history.project_api_item(raw) for raw in back_body.get("data", [])],
+                bool(back_body.get("has_more")),
+            )
+            oldest = True
+    except Exception as exc:  # noqa: BLE001 — a failed lookup is reported to the model
+        return json.dumps({"error": f"session_history read failed: {exc}"})
 
     collector = _session_history.TurnCollector(limit, oldest_first=oldest)
     next_fetch_cursor: str | None = cursor
@@ -6545,60 +6362,6 @@ async def _session_close_via_rest(
             "title": parsed.title,
         }
     )
-
-
-@dataclass
-class _PeekMeta:
-    """
-    Session metadata peek reads off the target's ``GET /v1/sessions/{id}``.
-
-    :param agent: Parsed agent/tool segment of the title, e.g.
-        ``"researcher"``; ``None`` when the title isn't sub-agent-shaped.
-    :param title: Parsed instance label segment, e.g. ``"auth"``;
-        ``None`` in the same case.
-    :param pending_elicitations: Outstanding
-        ``response.elicitation_request`` event payloads the target is
-        parked on, replayed on the snapshot from the Omnigent server's
-        :mod:`omnigent.runtime.pending_elicitations` index. Empty list
-        when the target has none (or the snapshot couldn't be read).
-    """
-
-    agent: str | None
-    title: str | None
-    pending_elicitations: list[_JsonObject]
-
-
-async def _fetch_peek_meta(
-    target_id: str,
-    server_client: httpx.AsyncClient,
-) -> _PeekMeta:
-    """
-    Fetch a session's title + pending elicitations for peek output.
-
-    One snapshot read serves both peek's ``agent``/``title`` labels and
-    the parked-elicitation items it appends. Best-effort: returns empty
-    fields when the snapshot can't be read, so a miss degrades
-    gracefully (peek still returns the stored item tail) rather than
-    failing the whole call.
-
-    :param target_id: The session whose snapshot to read.
-    :param server_client: HTTP client pointed at the Omnigent server.
-    :returns: The parsed title plus any outstanding elicitation
-        payloads (all empty/``None`` on any miss).
-    """
-    try:
-        snap = await server_client.get(f"/v1/sessions/{target_id}", timeout=30.0)
-    except Exception:  # noqa: BLE001
-        return _PeekMeta(agent=None, title=None, pending_elicitations=[])
-    if snap.status_code != 200:
-        return _PeekMeta(agent=None, title=None, pending_elicitations=[])
-    body = _string_object_dict(snap.json())
-    if body is None:
-        return _PeekMeta(agent=None, title=None, pending_elicitations=[])
-    parsed = _parse_session_title(_optional_string(body.get("title")))
-    raw_pending = body.get("pending_elicitations")
-    pending = _json_object_list(raw_pending)
-    return _PeekMeta(agent=parsed.agent, title=parsed.title, pending_elicitations=pending)
 
 
 async def execute_tool(
@@ -6838,7 +6601,6 @@ async def execute_tool(
             )
         elif tool_name in _SCHEDULED_TASK_TOOLS:
             output = await _execute_scheduled_task_tool(
-                tool_name,
                 arguments,
                 server_client=server_client,
                 conversation_id=conversation_id,
@@ -7978,9 +7740,7 @@ def _truncate_inbox_output(output: object, *, source_session_id: str | None = No
     if len(text) <= _INBOX_OUTPUT_MAX_CHARS:
         return text
     hint = (
-        f" — read the full text with sys_session_get_history "
-        f"conversation_id={source_session_id} tail_items=1 "
-        f"content_max_chars={min(len(text), _HISTORY_MAX_TOTAL_CHARS)}"
+        f" — read the full text with session_history action='get' chat_id={source_session_id}"
         if source_session_id
         else ""
     )

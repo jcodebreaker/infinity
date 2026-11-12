@@ -123,8 +123,8 @@ again). `DELETE /v1/artifacts/{id}/publish` takes it offline. The assistant publ
 
 A live page is an HTML artifact that keeps itself up to date from source files in the host; a live
 sheet (CSV, XLSX) follows the same rules for cells (`live/`, `sheets/`). The assistant turns one on
-with `artifact_keep_updated` (`artifact_stop_updating` and `artifact_live_settings` change or
-stop it), and the person can from the page's popover. Each live page is one scheduled task
+with the `live` tool (`keep`; `stop` and `settings` stop it or read its setup), and the person
+can from the page's popover. Each live page is one scheduled task
 (`kind="live_artifact"`) bound to the conversation, run as a `worker` helper.
 
 - **Triggers.** A source file changing in the host: the host polls the modified time of live

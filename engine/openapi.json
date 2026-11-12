@@ -20670,7 +20670,7 @@
     },
     "/v1/sessions/{session_id}/related_chats": {
       "get": {
-        "description": "List the chats one session may read besides itself.\n\n:param session_id: Session/conversation identifier,\n    e.g. ``\"conv_abc123\"``.\n:returns: A :class:`PaginatedList` of chat summary dicts\n    (``id``, ``title``, ``created_at``, ``updated_at``,\n    ``last_message_preview``, ``archived``, ``live``, ``project``);\n    not cursor-paginated.\n:raises OmnigentError: 404 if no session exists.",
+        "description": "List the chats one session may read besides itself.\n\n:param session_id: Session/conversation identifier,\n    e.g. ``\"conv_abc123\"``.\n:param chat_id: A chat the session asks to read; listed too when it is a Helper the\n    session started, owned by the same person.\n:returns: A :class:`PaginatedList` of chat summary dicts\n    (``id``, ``title``, ``created_at``, ``updated_at``,\n    ``last_message_preview``, ``archived``, ``live``, ``project``);\n    not cursor-paginated.\n:raises OmnigentError: 404 if no session exists.",
         "operationId": "list_related_chats_route_v1_sessions__session_id__related_chats_get",
         "parameters": [
           {
@@ -20680,6 +20680,22 @@
             "schema": {
               "title": "Session Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "chat_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Chat Id"
             }
           }
         ],

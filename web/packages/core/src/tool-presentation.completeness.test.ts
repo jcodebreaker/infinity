@@ -77,9 +77,6 @@ const NOT_YET_PRESENTED = new Set([
   "recall",
   "recall_get",
   "report_progress",
-  "sys_session_close",
-  "sys_session_get_info",
-  "sys_session_list",
 ]);
 
 describe("tool presentation registry completeness", () => {

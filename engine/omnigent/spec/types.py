@@ -1501,7 +1501,7 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         specified sub-agent types (named ``sys_session_send`` +
         ``sys_session_close``, no ``sys_session_create``). The
         session *read* tools (``sys_session_list`` /
-        ``sys_session_get_history`` / ``sys_session_get_info``)
+        ``sys_session_get_info``)
         are always registered and are not affected by either
         opt-in.
     :param agent_session_sharing: Authority for the agent to share the

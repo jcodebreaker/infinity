@@ -10,7 +10,7 @@ owns the JSON (de)serialization of the Text-backed columns.
 Naming: the user-facing product name for this feature is "Automations"
 (web UI display copy only). The domain model, DB tables
 (``scheduled_tasks`` / ``scheduled_task_runs``), stores, REST paths
-(``/v1/scheduled-tasks``), agent tools (``sys_scheduled_task_*``), and
+(``/v1/scheduled-tasks``), the agent tool (``schedule``), and
 these types deliberately keep the name "scheduled task". Keep code,
 comments, and schema on "scheduled task"; only presentation strings say
 "Automations".

@@ -3534,7 +3534,7 @@ def test_create_session_with_agent_links_parent_and_inherits_root(
 
     This is the bundle-mode ``sys_session_create`` path: the multipart
     create must produce the same parent/kind/root/runner shape as the
-    JSON child create, or tree-scoped reads (``sys_session_get_history``
+    JSON child create, or tree-scoped tools (``sys_session_close``
     matches on ``root_conversation_id``) and runner co-location would
     silently break for bundle-created children.
     """

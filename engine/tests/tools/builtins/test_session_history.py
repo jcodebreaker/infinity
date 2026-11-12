@@ -213,6 +213,18 @@ def test_read_pages_backward_with_cursor(session_fixture: _Fixture) -> None:
     assert [m["content"] for m in page2["turns"][0]["messages"]] == ["q1", "a1"]
     assert page2["next_cursor"] is None
 
+    # ``around`` an item reads from the turn that holds it, oldest first.
+    a1_id = page2["turns"][0]["messages"][1]["id"]
+    around = json.loads(
+        tool.invoke(
+            json.dumps({"action": "read", "around": a1_id, "limit": 2}), session_fixture.ctx
+        )
+    )
+    assert [[m["content"] for m in t["messages"]] for t in around["turns"]] == [
+        ["q1", "a1"],
+        ["q2", "a2"],
+    ]
+
 
 def test_read_tool_call_rides_along_with_its_turn(session_fixture: _Fixture) -> None:
     """A tool call/result between a user message and the reply stays in that turn."""
@@ -427,8 +439,8 @@ def test_list_chats_is_empty_for_a_top_level_chat_and_a_plain_subagent(
     assert sub["chats"] == []
 
 
-def test_list_chats_excludes_another_users_parent(session_fixture: _Fixture, db_uri: str) -> None:
-    """A parent owned by a different user never surfaces as readable."""
+def test_another_users_chat_is_never_readable(session_fixture: _Fixture, db_uri: str) -> None:
+    """A parent or a Helper owned by a different user never surfaces as readable."""
     from omnigent.server.auth import LEVEL_OWNER
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
@@ -441,6 +453,13 @@ def test_list_chats_excludes_another_users_parent(session_fixture: _Fixture, db_
 
     result = json.loads(SessionHistoryTool().invoke(json.dumps({"action": "list_chats"}), ctx))
     assert result["chats"] == []
+    # The parent cannot read its Helper by chat_id either: the owners differ.
+    denied = json.loads(
+        SessionHistoryTool().invoke(
+            json.dumps({"action": "get", "chat_id": ctx.conversation_id}), session_fixture.ctx
+        )
+    )
+    assert denied["error"] == "chat_id is not a related chat of this session"
 
 
 # ── read / search: chat_id ───────────────────────────────────
@@ -478,9 +497,21 @@ def test_search_with_chat_id_searches_the_parent(
     assert len(result["results"]) == 1
 
 
-def test_read_with_unrelated_chat_id_is_denied(session_fixture: _Fixture) -> None:
-    """chat_id must be in list_chats (or the caller's own id) — other_conv_id isn't."""
+def test_chat_id_reads_an_own_helper_and_denies_an_unrelated_chat(
+    session_fixture: _Fixture, single_user: None
+) -> None:
+    """chat_id must be in list_chats, a Helper this chat started, or the caller's own id."""
+    store = session_fixture.conv_store
+    helper = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=session_fixture.conv_id, title="worker:deck"
+    )
+    store.append(helper.id, [_user_msg("brief"), _assistant_msg("the whole result")])
     tool = SessionHistoryTool()
+    # ``get`` with no id reads the Helper's last reply, unclipped (a capped Result's rest).
+    result = json.loads(
+        tool.invoke(json.dumps({"action": "get", "chat_id": helper.id}), session_fixture.ctx)
+    )
+    assert result["content"] == "the whole result"
     result = json.loads(
         tool.invoke(
             json.dumps({"action": "read", "chat_id": session_fixture.other_conv_id}),
@@ -530,6 +561,7 @@ def test_schema_shape() -> None:
         "offset",
         "length",
         "chat_id",
+        "around",
     }
     assert props["action"]["enum"] == ["get", "list_chats", "read", "search", "status"]
     assert func["parameters"]["required"] == ["action"]

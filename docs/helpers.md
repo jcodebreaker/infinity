@@ -88,7 +88,7 @@ Proactive work is a scheduled task bound to the conversation whose fire starts a
 (`GET`/`PUT /v1/me/proactivity`), deferred while another proactive run is in flight, retried once
 after a failure, and launched on the parent's runner. Its result comes back by the same path as any
 helper's, so the assistant decides whether it is worth telling the person. The assistant manages
-these tasks with the `sys_scheduled_task_*` tools; a helper can only list them.
+these tasks with the `schedule` tool; a helper can only `list` them.
 
 Two kinds run without a request from the person:
 

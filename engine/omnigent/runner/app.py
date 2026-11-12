@@ -6964,8 +6964,7 @@ def create_runner_app(
         """Labels that gate which tools a session is offered.
 
         The rollover labels plus a sub-agent marker for a session with a parent,
-        so top-level-only tools (e.g. ``sys_scheduled_task_*``) are withheld
-        from Helpers.
+        so top-level-only tools are withheld from Helpers.
         """
         labels = dict(await _rollover_labels_for_session(session_id))
         snapshot = await _session_snapshot(session_id)

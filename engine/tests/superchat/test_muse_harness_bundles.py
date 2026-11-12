@@ -267,7 +267,7 @@ def test_the_conversation_has_the_same_tools_on_either_harness() -> None:
 @pytest.mark.parametrize("bundle", [CLAUDE, PI], ids=["claude", "pi"])
 def test_the_conversation_gets_its_tools_from_the_allow_list_only(bundle: Path) -> None:
     names = _conversation_tools(bundle)
-    assert len(names) == 45
+    assert len(names) == 39
     assert not names & LEFT_OUT
     assert {"start_helper", "context_brief", "recall", "files_query", "files_status"} <= names
     for helper in HELPERS:
@@ -276,6 +276,10 @@ def test_the_conversation_gets_its_tools_from_the_allow_list_only(bundle: Path) 
         ]
         assert "context_brief" not in allow, helper
         assert "vault_fill" not in allow, helper
+        # No Helper carries the session-admin tools (ADR 0032).
+        assert not {"sys_session_list", "sys_session_get_info", "sys_session_close"} & set(
+            allow
+        ), helper
         if helper.startswith("worker"):
             assert {"recall", "recall_get"} <= set(allow), helper
 

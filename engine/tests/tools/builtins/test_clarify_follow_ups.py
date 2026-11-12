@@ -88,7 +88,8 @@ def test_schemas_bound_the_counts_and_say_when_to_use_them() -> None:
     options = ask["parameters"]["properties"]["options"]
     assert (options["minItems"], options["maxItems"]) == (2, 5)
     assert ask["parameters"]["required"] == ["question", "options"]
-    assert "genuinely ambiguous" in ask["description"] and "just proceed" in ask["description"]
+    # When to ask is the prompt's; the tool says what the card does.
+    assert "the card ends your reply" in ask["description"]
     follow = SuggestFollowUpsTool().get_schema()["function"]
     suggestions = follow["parameters"]["properties"]["suggestions"]
     assert (suggestions["minItems"], suggestions["maxItems"]) == (1, 3)

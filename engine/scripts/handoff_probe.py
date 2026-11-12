@@ -100,7 +100,7 @@ RUNNER_LOG_DIR_IN_HOST = "/home/superchat/.omnigent/logs/runner"
 #: Source person messages that are dev pings, not work.
 SKIP_DEFAULT = r"^(Reply with one word|Quick check after a restart|say hi$|hi$)"
 #: Tools that read the past back.
-RECALL_TOOLS = frozenset({"recall", "session_history", "sys_session_get_history"})
+RECALL_TOOLS = frozenset({"recall", "session_history"})
 #: Hard fail: the reply talks about the machinery of a new session.
 HARD_FAIL = re.compile(
     r"\b(reload(ed|ing)?|summar(y|ies|ised|ized) (of|from) (our|the|this) (chat|conversation|"

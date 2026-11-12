@@ -34,7 +34,7 @@ export interface PresentedStep {
 }
 
 /** The engine's always-on superside-chat tools (engine/omnigent/tools/builtins/
- * memory.py, session_history.py, spawn.py, async_inbox.py) — registered for
+ * memory.py, session_history.py, spawn.py, async_inbox.py, scheduled_tasks.py) — registered for
  * every `omnigent.context.mode=superside-chat` session regardless of the agent bundle's own
  * `tools.builtins` list. Kept next to the registry so the completeness test
  * (tool-presentation.completeness.test.ts) can assert every one of these has an entry too. */
@@ -49,11 +49,7 @@ export const ALWAYS_ON_SUPERSIDE_CHAT_TOOLS = [
   "sys_session_create",
   "sys_read_inbox",
   "sys_cancel_task",
-  "sys_session_get_history",
-  "sys_scheduled_task_create",
-  "sys_scheduled_task_list",
-  "sys_scheduled_task_update",
-  "sys_scheduled_task_delete",
+  "schedule",
 ] as const;
 
 const MAX_SNIPPET_CHARS = 240;
@@ -411,6 +407,22 @@ export const TOOL_PRESENTATION: Record<string, ToolPresentation> = {
     snippet: sessionHistorySnippet,
   },
 
+  schedule: {
+    icon: "helper",
+    title: (args) => {
+      const action = args.action;
+      if (action === "list") return "Checked followed topics";
+      if (action === "update") return "Updated a followed topic";
+      if (action === "delete") return "Stopped following a topic";
+      const name = args.name;
+      return isNonEmptyString(name)
+        ? `Set up following “${name.trim()}”`
+        : "Set up a followed topic";
+    },
+    snippet: () => null,
+  },
+
+  // Old names: stored items keep them, so they keep their presentation (ADR 0032).
   sys_session_get_history: {
     icon: "helper",
     title: () => "Checked on background work",
@@ -664,6 +676,17 @@ export const TOOL_PRESENTATION: Record<string, ToolPresentation> = {
     snippet: () => null,
   },
 
+  live: {
+    icon: "generic",
+    title: (args) => {
+      if (args.action === "stop") return "Stopped updating a file";
+      if (args.action === "settings") return "Checked how a file is updated";
+      return "Set a file to stay updated";
+    },
+    snippet: () => null,
+  },
+
+  // Old names: stored items keep them (ADR 0032).
   artifact_keep_updated: {
     icon: "generic",
     title: () => "Set a file to stay updated",

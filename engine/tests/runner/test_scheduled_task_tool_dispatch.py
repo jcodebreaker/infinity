@@ -1,14 +1,12 @@
-"""Tests for the scheduled-task (``sys_scheduled_task_*``) tool surface.
+"""Tests for the ``schedule`` tool surface.
 
 Covers the runner-side half:
 
-- ``_execute_scheduled_task_tool``: the create/list/update/delete calls proxy
+- ``_execute_scheduled_task_tool``: the create/list/update/delete actions proxy
   the correct ``/v1/scheduled-tasks`` REST verb + payload over ``server_client``,
   pass the JSON body through verbatim, and translate a server 4xx/5xx and a
-  missing id into clean error JSON.
-- Registration: the four ``sys_scheduled_task_*`` names are always registered by
-  ``ToolManager`` (no spec opt-in) and are members of the local-dispatch and
-  native-relay tool sets.
+  missing field into clean error JSON.
+- Registration: ``schedule`` is always registered by ``ToolManager`` (no spec opt-in).
 """
 
 from __future__ import annotations
@@ -21,12 +19,6 @@ from omnigent.runner.tool_dispatch import (
     _execute_scheduled_task_tool,
 )
 
-_ALL_NAMES = {
-    "sys_scheduled_task_create",
-    "sys_scheduled_task_list",
-    "sys_scheduled_task_update",
-    "sys_scheduled_task_delete",
-}
 _TASK_ID = "0123456789abcdef0123456789abcdef"
 
 
@@ -71,15 +63,17 @@ class _RecordingClient:
 async def test_create_posts_payload() -> None:
     client = _RecordingClient(_Resp(body={"id": "t1", "name": "nightly"}))
     out = await _execute_scheduled_task_tool(
-        "sys_scheduled_task_create",
         json.dumps(
             {
+                "action": "create",
                 "name": "nightly",
                 "prompt": "go",
                 "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
                 "agent_id": "ag_1",
                 "workspace": "/repo",
                 "host_id": "host_1",
+                "permission_mode": "bypassPermissions",
+                "model_override": "any-model",
                 "base_branch": "main",
                 "unexpected": "dropped",
             }
@@ -88,21 +82,20 @@ async def test_create_posts_payload() -> None:
     )
     verb, url, body = client.calls[0]
     assert (verb, url) == ("POST", "/v1/scheduled-tasks")
+    # Fields outside the schema (agent, host, workspace, permission mode, model) keep the
+    # server's defaults: they are never forwarded.
     assert body == {
         "name": "nightly",
         "prompt": "go",
         "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
-        "agent_id": "ag_1",
-        "workspace": "/repo",
-        "host_id": "host_1",
-    }  # unknown fields filtered out
+    }
     assert json.loads(out)["id"] == "t1"
 
 
 @pytest.mark.asyncio
 async def test_list_gets() -> None:
     client = _RecordingClient(_Resp(body={"scheduled_tasks": []}))
-    out = await _execute_scheduled_task_tool("sys_scheduled_task_list", "", server_client=client)
+    out = await _execute_scheduled_task_tool(json.dumps({"action": "list"}), server_client=client)
     assert client.calls[0] == ("GET", "/v1/scheduled-tasks", None)
     assert json.loads(out) == {"scheduled_tasks": []}
 
@@ -111,56 +104,28 @@ async def test_list_gets() -> None:
 async def test_update_patches_by_id() -> None:
     client = _RecordingClient(_Resp(body={"id": "t1", "state": "paused"}))
     await _execute_scheduled_task_tool(
-        "sys_scheduled_task_update",
         json.dumps(
             {
+                "action": "update",
                 "scheduled_task_id": _TASK_ID,
                 "state": "paused",
                 "workspace": "/repo2",
-                "host_id": "fedcba9876543210fedcba9876543210",
-            }
-        ),
-        server_client=client,
-    )
-    verb, url, body = client.calls[0]
-    assert (verb, url) == ("PATCH", f"/v1/scheduled-tasks/{_TASK_ID}")
-    assert body == {
-        "state": "paused",
-        "workspace": "/repo2",
-        "host_id": "fedcba9876543210fedcba9876543210",
-    }
-
-
-@pytest.mark.asyncio
-async def test_update_forwards_agent_switch_and_cost_cap() -> None:
-    """``agent_id`` / ``max_cost_usd`` reach the PATCH instead of being dropped.
-
-    The dispatch allowlist is what an agent's ``sys_scheduled_task_update`` call
-    actually travels through, so a field missing from it is silently ignored —
-    the update appears to succeed while changing nothing.
-    """
-    client = _RecordingClient(_Resp(body={"id": "t1"}))
-    await _execute_scheduled_task_tool(
-        "sys_scheduled_task_update",
-        json.dumps(
-            {
-                "scheduled_task_id": _TASK_ID,
                 "agent_id": "ag_pi",
                 "max_cost_usd": 2.5,
             }
         ),
         server_client=client,
     )
-    _, _, body = client.calls[0]
-    assert body == {"agent_id": "ag_pi", "max_cost_usd": 2.5}
+    verb, url, body = client.calls[0]
+    assert (verb, url) == ("PATCH", f"/v1/scheduled-tasks/{_TASK_ID}")
+    assert body == {"state": "paused"}
 
 
 @pytest.mark.asyncio
 async def test_delete_by_id() -> None:
     client = _RecordingClient(_Resp(body={"deleted": True, "id": "t1"}))
     await _execute_scheduled_task_tool(
-        "sys_scheduled_task_delete",
-        json.dumps({"scheduled_task_id": _TASK_ID.upper()}),
+        json.dumps({"action": "delete", "scheduled_task_id": _TASK_ID.upper()}),
         server_client=client,
     )
     assert client.calls[0] == ("DELETE", f"/v1/scheduled-tasks/{_TASK_ID}", None)
@@ -170,13 +135,16 @@ async def test_delete_by_id() -> None:
 async def test_update_rejects_path_confusion_task_id() -> None:
     client = _RecordingClient()
     out = await _execute_scheduled_task_tool(
-        "sys_scheduled_task_update",
         json.dumps(
-            {"scheduled_task_id": "../0123456789abcdef0123456789abcdef", "state": "paused"}
+            {
+                "action": "update",
+                "scheduled_task_id": "../0123456789abcdef0123456789abcdef",
+                "state": "paused",
+            }
         ),
         server_client=client,
     )
-    assert "canonical 32-character hex" in json.loads(out)["error"]
+    assert "32-character hex" in json.loads(out)["error"]
     assert client.calls == []
 
 
@@ -184,9 +152,10 @@ async def test_update_rejects_path_confusion_task_id() -> None:
 async def test_update_without_id_errors() -> None:
     client = _RecordingClient()
     out = await _execute_scheduled_task_tool(
-        "sys_scheduled_task_update", json.dumps({"state": "paused"}), server_client=client
+        json.dumps({"action": "update", "state": "paused"}), server_client=client
     )
-    assert "scheduled_task_id" in json.loads(out)["error"]
+    # The error names the missing field and the action.
+    assert json.loads(out)["error"] == "schedule update needs 'scheduled_task_id'"
     assert client.calls == []  # never hit the server
 
 
@@ -194,8 +163,7 @@ async def test_update_without_id_errors() -> None:
 async def test_server_error_becomes_clean_json() -> None:
     client = _RecordingClient(_Resp(status_code=400, body={"error": {"message": "bad rrule"}}))
     out = await _execute_scheduled_task_tool(
-        "sys_scheduled_task_create",
-        json.dumps({"name": "x", "prompt": "p", "rrule": "FREQ=SECONDLY", "agent_id": "a"}),
+        json.dumps({"action": "create", "name": "x", "prompt": "p", "rrule": "FREQ=SECONDLY"}),
         server_client=client,
     )
     assert "server returned 400" in json.loads(out)["error"]
@@ -203,47 +171,39 @@ async def test_server_error_becomes_clean_json() -> None:
 
 @pytest.mark.asyncio
 async def test_no_server_client_errors() -> None:
-    out = await _execute_scheduled_task_tool("sys_scheduled_task_list", "", server_client=None)
+    out = await _execute_scheduled_task_tool('{"action": "list"}', server_client=None)
     assert "requires server access" in json.loads(out)["error"]
 
 
 def test_tools_registered_without_spec_optin() -> None:
-    """All four tools register on a minimal spec (always-on, like policy)."""
+    """``schedule`` registers on a minimal spec (always-on, like policy)."""
     from omnigent.spec.types import AgentSpec
     from omnigent.tools.manager import ToolManager
 
     mgr = ToolManager(AgentSpec(spec_version=1))
     names = {s["function"]["name"] for s in mgr.get_tool_schemas()}
-    assert names >= _ALL_NAMES
+    assert "schedule" in names
 
 
-def test_create_tool_schema_makes_workspace_and_host_optional() -> None:
-    from omnigent.tools.builtins.scheduled_tasks import SysScheduledTaskCreateTool
+def test_schema_leaves_out_the_fields_no_caller_sets() -> None:
+    from omnigent.tools.builtins.scheduled_tasks import ScheduleTool
 
-    schema = SysScheduledTaskCreateTool().get_schema()["function"]["parameters"]
+    schema = ScheduleTool().get_schema()["function"]["parameters"]
     properties = schema["properties"]
-    # workspace / host_id stay available as optional properties (a task that
-    # does code work still pins them), but are no longer required — a
-    # no-workspace research / summary / chat-only task omits both.
-    assert "workspace" in properties
-    assert "host_id" in properties
-    assert "base_branch" not in properties
-    assert "workspace" not in schema["required"]
-    assert "host_id" not in schema["required"]
-    # agent_id is optional: a parent-bound task runs the parent's agent.
-    assert set(schema["required"]) == {"name", "prompt", "rrule"}
-    assert "schedule" not in properties
-
-
-def test_update_tool_schema_allows_connected_host_changes() -> None:
-    from omnigent.tools.builtins.scheduled_tasks import SysScheduledTaskUpdateTool
-
-    schema = SysScheduledTaskUpdateTool().get_schema()["function"]["parameters"]
-    properties = schema["properties"]
-    assert "workspace" in properties
-    assert "host_id" in properties
-    # Switching which agent/harness a task runs is part of the update surface.
-    assert "agent_id" in properties
+    for dropped in (
+        "permission_mode",
+        "execution_target",
+        "host_id",
+        "workspace",
+        "max_cost_usd",
+        "model_override",
+        "reasoning_effort",
+        "agent_id",
+    ):
+        assert dropped not in properties
+    # A flat schema requires only the action; the handler checks each action's fields.
+    assert schema["required"] == ["action"]
+    assert properties["action"]["enum"] == ["create", "list", "update", "delete"]
 
 
 class _KindClient(_RecordingClient):
@@ -263,9 +223,11 @@ class _KindClient(_RecordingClient):
 async def test_sub_agent_caller_is_refused() -> None:
     client = _KindClient("sub_agent")
     out = await _execute_scheduled_task_tool(
-        "sys_scheduled_task_create", "{}", server_client=client, conversation_id="conv_child"
+        json.dumps({"action": "create", "name": "n", "prompt": "go", "rrule": "FREQ=DAILY"}),
+        server_client=client,
+        conversation_id="conv_child",
     )
-    assert "not available to sub-agent" in json.loads(out)["error"]
+    assert json.loads(out)["error"] == "schedule create is not available to sub-agent sessions"
     assert not [c for c in client.calls if c[0] == "POST"]
 
 
@@ -273,7 +235,7 @@ async def test_sub_agent_caller_is_refused() -> None:
 async def test_sub_agent_caller_may_list() -> None:
     client = _KindClient("sub_agent")
     out = await _execute_scheduled_task_tool(
-        "sys_scheduled_task_list", "{}", server_client=client, conversation_id="conv_child"
+        '{"action": "list"}', server_client=client, conversation_id="conv_child"
     )
     assert "error" not in json.loads(out)
     assert [c for c in client.calls if c[0] == "GET" and "scheduled-tasks" in c[1]]
@@ -283,9 +245,9 @@ async def test_sub_agent_caller_may_list() -> None:
 async def test_self_parent_resolves_to_calling_session() -> None:
     client = _KindClient("default")
     await _execute_scheduled_task_tool(
-        "sys_scheduled_task_create",
         json.dumps(
             {
+                "action": "create",
                 "name": "feed",
                 "prompt": "go",
                 "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
@@ -303,12 +265,19 @@ async def test_self_parent_resolves_to_calling_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_without_agent_binds_to_calling_chat_as_worker() -> None:
-    """A chat that names neither an agent nor a parent schedules for itself."""
+async def test_create_binds_to_calling_chat_as_worker() -> None:
+    """A new task schedules for the chat that made it, even when an agent is named."""
     client = _KindClient("default")
     await _execute_scheduled_task_tool(
-        "sys_scheduled_task_create",
-        json.dumps({"name": "remind", "prompt": "go", "rrule": "FREQ=DAILY;BYHOUR=9"}),
+        json.dumps(
+            {
+                "action": "create",
+                "name": "remind",
+                "prompt": "go",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "agent_id": "ag_1",
+            }
+        ),
         server_client=client,
         conversation_id="conv_chat",
     )
@@ -319,27 +288,13 @@ async def test_create_without_agent_binds_to_calling_chat_as_worker() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_with_agent_id_stays_unbound() -> None:
-    client = _KindClient("default")
-    await _execute_scheduled_task_tool(
-        "sys_scheduled_task_create",
-        json.dumps({"name": "n", "prompt": "go", "rrule": "FREQ=DAILY", "agent_id": "ag_1"}),
-        server_client=client,
-        conversation_id="conv_chat",
-    )
-    _, _, body = next(c for c in client.calls if c[0] == "POST")
-    assert body is not None
-    assert "parent_session_id" not in body and "agent_type" not in body
-
-
-@pytest.mark.asyncio
 async def test_update_forwards_a_new_rrule_and_timezone_and_nothing_else() -> None:
     # A rule change must reach the server: dropping it would send an empty PATCH.
     client = _RecordingClient(_Resp(body={"id": "t1"}))
     await _execute_scheduled_task_tool(
-        "sys_scheduled_task_update",
         json.dumps(
             {
+                "action": "update",
                 "scheduled_task_id": _TASK_ID,
                 "rrule": "FREQ=WEEKLY;BYDAY=FR;BYHOUR=17;BYMINUTE=0",
                 "timezone": "Europe/Paris",

@@ -17,7 +17,6 @@ from omnigent.entities import (
     Conversation,
     ConversationItem,
 )
-from omnigent.runtime import pending_elicitations
 from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.spec import AgentSpec
 from omnigent.stores import ConversationStore
@@ -39,24 +38,6 @@ from omnigent.util.session_lifecycle import (
 # without bloating the parent's prompt. At 5 items × 2000 chars
 # the activity section is bounded to ~10k chars.
 _ACTIVITY_MAX_CHARS = 2000
-
-# sys_session_get_history bounds. ``tail_items`` defaults to 10 (more
-# context than ``check_task``'s 5 because peek is invoked
-# explicitly by the LLM rather than auto-injected on a poll).
-# The cap of 50 keeps the worst-case prompt addition bounded
-# (50 items × _ACTIVITY_MAX_CHARS ≈ 100k chars) while still
-# letting the LLM request a substantial slice for triage. Individual
-# content fields keep the compact activity limit by default, but an
-# explicit read may raise that limit to recover one substantive child
-# response without sending another turn.
-_HISTORY_DEFAULT_TAIL = 10
-_HISTORY_MAX_TAIL = 50
-# The total budget intentionally follows the default preview and tail cap;
-# changing either value above also changes this budget. An explicit
-# ``content_max_chars`` is honored up to this budget (divided across the
-# requested tail), so a narrow read can recover one long child result in
-# full; ``content_offset_chars`` pages beyond it for even longer items.
-_HISTORY_MAX_TOTAL_CHARS = _HISTORY_MAX_TAIL * _ACTIVITY_MAX_CHARS
 
 # sys_session_close still rewrites the stored title internally to free
 # the DB's ``(parent_conversation_id, title)`` unique slot. API display
@@ -512,7 +493,7 @@ class SysSessionListTool(Tool):
       a child caller, its parent/siblings) under this conversation. The
       LLM uses these to decide which pairs already exist (so a follow-up
       ``sys_session_send`` continues rather than spawns) and to grab each
-      child's ``conversation_id`` for ``sys_session_get_history`` /
+      child's ``conversation_id`` for ``session_history`` /
       ``sys_session_get_info`` / ``sys_session_close``.
     - ``sessions`` — a **global** view of every session the caller can
       access (bounded by the server's per-user permission model), each
@@ -673,7 +654,7 @@ class SysSessionGetInfoTool(Tool):
     ``last_activity_at`` across polls distinguishes a running session that
     is advancing from one whose persisted output has stalled. For the
     conversation transcript, use
-    ``sys_session_get_history`` instead.
+    ``session_history`` with ``chat_id`` instead.
 
     ``session_id`` is optional — when omitted, the caller's own
     session is described.
@@ -702,7 +683,7 @@ class SysSessionGetInfoTool(Tool):
             "prompts. Global read — any "
             "session you can access. Pass session_id to target another "
             "session; omit it to describe your own. Metadata only — "
-            "use sys_session_get_history for the conversation transcript."
+            "use session_history with chat_id for the conversation transcript."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -893,7 +874,7 @@ class SysSessionCreateTool(Tool):
     an optional ``title`` labels the session.
 
     Returns a handle ``{conversation_id, agent_id, title, status}``. The
-    session runs asynchronously — use ``sys_session_get_history`` /
+    session runs asynchronously — use ``session_history`` /
     ``sys_session_get_info`` to monitor it, or ``sys_session_send`` (with
     the returned ``conversation_id``) to drive it further.
 
@@ -931,7 +912,7 @@ class SysSessionCreateTool(Tool):
             "session (you cannot create top-level or sibling sessions). "
             "Returns {conversation_id, agent_id, title, status}; the "
             "session runs asynchronously — monitor it with "
-            "sys_session_get_history / sys_session_get_info or drive it "
+            "session_history / sys_session_get_info or drive it "
             "with sys_session_send."
         )
 
@@ -1131,7 +1112,7 @@ def _truncate(
     return window + " [truncated]"
 
 
-# ── 13a: sys_session_get_history / sys_session_close ─────────
+# ── 13a: sys_session_close ─────────
 
 
 def _find_open_child_by_title(
@@ -1312,7 +1293,7 @@ def _resolve_session_call(
     :param arguments: Raw JSON arguments string from the LLM.
     :param ctx: The tool's :class:`ToolContext`.
     :param tool_name: The calling tool's name (for error
-        messages, e.g. ``"sys_session_get_history"``).
+        messages, e.g. ``"sys_session_close"``).
     :returns: A :class:`_SessionResolution` on success; a JSON
         error string when the call should fail.
     """
@@ -1397,292 +1378,6 @@ def _busy_check_or_none(
         no longer available at the tool layer.
     """
     return None
-
-
-def _clamp_tail_items(raw: Any) -> int | str:
-    """
-    Validate + clamp the ``tail_items`` argument for peek.
-
-    The schema's ``maximum`` keyword is advisory (LLM providers
-    don't all enforce schema validation), so the handler does the
-    clamp itself rather than trusting the input. Non-integer or
-    sub-1 inputs return a JSON error string suitable for
-    returning verbatim to the LLM.
-
-    :param raw: The raw value from the parsed args dict; may be
-        an int, a string the LLM sent, or anything else if the
-        provider passed the JSON value through untyped.
-    :returns: An int in ``[1, _HISTORY_MAX_TAIL]`` on success; a
-        JSON error string on failure.
-    """
-    try:
-        tail_items = int(raw)
-    except (TypeError, ValueError):
-        return json.dumps({"error": f"tail_items must be an integer, got {raw!r}"})
-    if tail_items < 1:
-        return json.dumps({"error": "tail_items must be >= 1"})
-    return min(tail_items, _HISTORY_MAX_TAIL)
-
-
-def _clamp_history_content_chars(raw: Any) -> int | str:
-    """
-    Validate and clamp the per-item history content limit.
-
-    Accepts integers, integral floats, and other non-boolean values that
-    ``int()`` converts to whole numbers, including numeric integer strings.
-    Rejects booleans, fractional floats, values ``int()`` cannot convert, and
-    values below 1.
-
-    :param raw: Provider-supplied value that may not have passed JSON schema
-        validation.
-    :returns: An integer in ``[1, _HISTORY_MAX_TOTAL_CHARS]`` or a
-        JSON error string suitable for returning to the model.
-    """
-    error = json.dumps({"error": f"content_max_chars must be a whole number, got {raw!r}"})
-    if isinstance(raw, bool):
-        return error
-    if isinstance(raw, int):
-        max_chars = raw
-    elif isinstance(raw, float):
-        if not raw.is_integer():
-            return error
-        max_chars = int(raw)
-    else:
-        try:
-            max_chars = int(raw)
-        except (TypeError, ValueError):
-            return error
-    if max_chars < 1:
-        return json.dumps({"error": "content_max_chars must be >= 1"})
-    return min(max_chars, _HISTORY_MAX_TOTAL_CHARS)
-
-
-def _clamp_history_offset_chars(raw: Any) -> int | str:
-    """
-    Validate the per-item history content offset.
-
-    Same coercion rules as :func:`_clamp_history_content_chars` with a
-    floor of 0. No upper bound: an offset at or past the end of a
-    content field simply yields an empty field.
-
-    :param raw: Provider-supplied value that may not have passed JSON schema
-        validation.
-    :returns: A non-negative integer or a JSON error string suitable for
-        returning to the model.
-    """
-    error = json.dumps({"error": f"content_offset_chars must be a whole number, got {raw!r}"})
-    if isinstance(raw, bool):
-        return error
-    if isinstance(raw, int):
-        offset = raw
-    elif isinstance(raw, float):
-        if not raw.is_integer():
-            return error
-        offset = int(raw)
-    else:
-        try:
-            offset = int(raw)
-        except (TypeError, ValueError):
-            return error
-    if offset < 0:
-        return json.dumps({"error": "content_offset_chars must be >= 0"})
-    return offset
-
-
-def _bound_history_content_chars(*, tail_items: int, content_max_chars: int) -> int:
-    """Keep the requested per-item limit within the total history prompt budget."""
-    return min(content_max_chars, _HISTORY_MAX_TOTAL_CHARS // tail_items)
-
-
-class SysSessionGetHistoryTool(Tool):
-    """
-    Return the recent conversation items (history) of a session.
-
-    The LLM uses ``sys_session_get_history`` to inspect another
-    session's recent activity without sending a new turn or waiting on
-    a poll. The target is identified by ``conversation_id`` (obtained
-    from ``sys_session_list``, ``sys_agent_list``, or a prior
-    ``sys_session_send`` handle).
-
-    A **global read**: on the runner (REST) path it reads any session
-    the caller is permitted to access (bounded by the server's per-user
-    permission model via the auth-gated ``GET /items`` endpoint). The
-    in-process path is tree-scoped (it has no caller identity), reading
-    only sessions sharing the caller's ``root_conversation_id``.
-
-    Item content uses the same compact activity format as
-    ``check_task``. It defaults to ``_ACTIVITY_MAX_CHARS`` per field;
-    callers may request a larger bounded field through
-    ``content_max_chars`` when they need a substantive response (up
-    to the total prompt budget divided across the tail), and page
-    through a field longer than one window with
-    ``content_offset_chars``, so long sub-agent handoffs stay fully
-    reachable.
-
-    Returns ``session_not_found`` when the conversation_id does
-    not exist, ``session_out_of_tree`` when the server denies the read
-    (in-process: a different spawn tree).
-    """
-
-    @classmethod
-    def name(cls) -> str:
-        """:returns: ``"sys_session_get_history"``."""
-        return "sys_session_get_history"
-
-    @classmethod
-    def description(cls) -> str:
-        """:returns: Human-readable description of the tool."""
-        return (
-            "Read the most recent items from a session's conversation "
-            "without sending input. Global read — any session you can "
-            "access (not just sub-agents in your spawn tree), bounded "
-            "by the server's per-user permission model. Returns the "
-            "tail of conversation items (assistant/user messages, tool "
-            "calls, tool results) in chronological order. Returns "
-            "session_not_found if conversation_id is unknown, or "
-            "session_out_of_tree if the server denies read access."
-        )
-
-    def get_schema(self) -> dict[str, Any]:
-        """
-        Return the OpenAI-format tool schema.
-
-        :returns: Dict with ``"type": "function"`` and a
-            ``"function"`` sub-dict.
-        """
-        return {
-            "type": "function",
-            "function": {
-                "name": SysSessionGetHistoryTool.name(),
-                "description": SysSessionGetHistoryTool.description(),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "conversation_id": {
-                            "type": "string",
-                            "description": (
-                                "The target session's "
-                                "conversation_id. Get this from "
-                                "sys_session_list, sys_agent_list, "
-                                "or a prior sys_session_send handle. "
-                                "Any session you can access — need "
-                                "not be in your spawn tree."
-                            ),
-                        },
-                        "tail_items": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": _HISTORY_MAX_TAIL,
-                            "description": (
-                                f"Number of recent items to return. "
-                                f"Defaults to {_HISTORY_DEFAULT_TAIL}; "
-                                f"clamped to {_HISTORY_MAX_TAIL} to keep "
-                                "prompt size bounded."
-                            ),
-                        },
-                        "content_max_chars": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": _HISTORY_MAX_TOTAL_CHARS,
-                            "description": (
-                                "Maximum characters returned per message, tool call, "
-                                "or tool result. Defaults to the compact activity "
-                                f"preview limit ({_ACTIVITY_MAX_CHARS}); scaled down "
-                                "when needed to keep the whole read near the "
-                                f"~{_HISTORY_MAX_TOTAL_CHARS}-character budget "
-                                "(use tail_items=1 to spend it on one item). "
-                                "Truncation markers and pending prompts are extra."
-                            ),
-                        },
-                        "content_offset_chars": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "description": (
-                                "Characters to skip from the start of each content "
-                                "field before applying content_max_chars. Defaults "
-                                "to 0. To page through one long item, use "
-                                "tail_items=1 and step this by content_max_chars "
-                                "until the ' [truncated]' suffix disappears."
-                            ),
-                        },
-                    },
-                    "required": ["conversation_id"],
-                    "additionalProperties": False,
-                },
-            },
-        }
-
-    def invoke(self, arguments: str, ctx: ToolContext) -> str:
-        """
-        Look up the target sub-agent and return its recent items.
-
-        :param arguments: JSON-encoded arguments, such as
-            ``{"conversation_id": "conv_abc123", "content_max_chars": 12000}``.
-        :param ctx: Server-side execution context.
-        :returns: JSON ``{"conversation_id": ..., "agent": ...,
-            "title": ..., "items": [...]}`` on success;
-            ``{"error": "...", ...}`` on failure.
-        """
-        resolution = _resolve_session_call(
-            arguments=arguments,
-            ctx=ctx,
-            tool_name=SysSessionGetHistoryTool.name(),
-        )
-        if isinstance(resolution, str):
-            return resolution
-        tail_items = _clamp_tail_items(
-            resolution.args.get("tail_items", _HISTORY_DEFAULT_TAIL),
-        )
-        if isinstance(tail_items, str):
-            return tail_items
-        content_max_chars = _clamp_history_content_chars(
-            resolution.args.get("content_max_chars", _ACTIVITY_MAX_CHARS),
-        )
-        if isinstance(content_max_chars, str):
-            return content_max_chars
-        content_max_chars = _bound_history_content_chars(
-            tail_items=tail_items,
-            content_max_chars=content_max_chars,
-        )
-        content_offset_chars = _clamp_history_offset_chars(
-            resolution.args.get("content_offset_chars", 0),
-        )
-        if isinstance(content_offset_chars, str):
-            return content_offset_chars
-        page = resolution.conv_store.list_items(
-            resolution.child.id,
-            limit=tail_items,
-            order="desc",
-        )
-        # ``list_items(order="desc")`` returns newest-first; reverse
-        # to chronological order so the LLM reads top-to-bottom.
-        items: list[dict[str, Any]] = [
-            _project_activity_item(
-                item,
-                max_chars=content_max_chars,
-                offset_chars=content_offset_chars,
-            )
-            for item in reversed(page.data)
-        ]
-        # A parked elicitation never lands in the conversation store
-        # (it lives only in the pending-elicitations index), so without
-        # this a peek on a sub-agent blocked on AskUserQuestion would
-        # show no sign it needs input. Append the index's outstanding
-        # prompts after the stored tail — they are the most recent
-        # thing the sub-agent did.
-        items.extend(
-            pending_elicitations.project_for_peek(event)
-            for event in pending_elicitations.snapshot_for(resolution.child.id)
-        )
-        labelled = _agent_title_from_conversation(resolution.child)
-        return json.dumps(
-            {
-                "conversation_id": resolution.child.id,
-                "agent": labelled.agent,
-                "title": labelled.title,
-                "items": items,
-            }
-        )
 
 
 class SysSessionCloseTool(Tool):
@@ -1826,7 +1521,7 @@ def _parse_session_args(
         ``("agent", "title", "args")``); each must appear in the
         parsed object or the call returns an error.
     :param tool_name: The calling tool's name (e.g.
-        ``"sys_session_get_history"``). Used only for richer error
+        ``"sys_session_close"``). Used only for richer error
         messages — the LLM otherwise can't tell which tool's
         validator complained when the same shape recurs.
     :returns: Parsed dict on success; JSON error string on

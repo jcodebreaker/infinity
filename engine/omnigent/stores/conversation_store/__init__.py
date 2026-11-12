@@ -730,8 +730,7 @@ class ConversationStore(ABC):
             conversations whose
             ``root_conversation_id == root_conversation_id``
             (every conversation in the same spawn tree). Powers
-            the tree-scoped guard for ``sys_session_get_history`` /
-            ``sys_session_close`` so any agent in a tree can
+            the tree-scoped guard for ``sys_session_close`` so any agent in a tree can
             address any other by ``conversation_id``. ``None``
             disables the filter.
         :param agent_id: When set, only return conversations

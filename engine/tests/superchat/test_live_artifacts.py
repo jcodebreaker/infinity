@@ -368,9 +368,7 @@ def test_tool_schemas_are_valid_json_schema() -> None:
     from omnigent.superchat.live import tools
 
     for tool in (
-        tools.KeepUpdatedTool(),
-        tools.StopUpdatingTool(),
-        tools.LiveSettingsTool(),
+        tools.LiveTool(),
         tools.UpdateContextTool(),
         tools.UpdateSaveTool(),
     ):

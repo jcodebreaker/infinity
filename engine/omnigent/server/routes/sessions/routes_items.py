@@ -313,9 +313,10 @@ def register_items_routes(
     # ── GET /sessions/{session_id}/related_chats ──────────────────
     # The chats session_id may read besides itself, for ``session_history``'s
     # ``list_chats`` action run by the runner: a scheduled or ad-hoc Helper's
-    # parent Conversation. ``list_related_chats`` resolves by owner, not by the
-    # caller's grants, so ``_caller_readable_ids`` re-checks each one against
-    # the caller's own permissions before it is returned.
+    # parent Conversation, plus ``chat_id`` when it names a Helper session_id
+    # started (``session_history``'s ``chat_id``). ``list_related_chats``
+    # resolves by owner, not by the caller's grants, so ``_caller_readable_ids``
+    # re-checks each one against the caller's own permissions before it is returned.
 
     @router.get(
         "/sessions/{session_id}/related_chats",
@@ -325,12 +326,15 @@ def register_items_routes(
     async def list_related_chats_route(
         request: Request,
         session_id: str,
+        chat_id: str | None = Query(default=None),
     ) -> PaginatedList:
         """
         List the chats one session may read besides itself.
 
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
+        :param chat_id: A chat the session asks to read; listed too when it is a Helper the
+            session started, owned by the same person.
         :returns: A :class:`PaginatedList` of chat summary dicts
             (``id``, ``title``, ``created_at``, ``updated_at``,
             ``last_message_preview``, ``archived``, ``live``, ``project``);
@@ -347,7 +351,9 @@ def register_items_routes(
                 raise _session_not_found()
         from omnigent.context.rollover import list_related_chats
 
-        chats = await asyncio.to_thread(list_related_chats, conversation_store, session_id)
+        chats = await asyncio.to_thread(
+            list_related_chats, conversation_store, session_id, chat_id
+        )
         allowed_ids = await _caller_readable_ids(
             user_id, [chat["id"] for chat in chats], permission_store, conversation_store
         )

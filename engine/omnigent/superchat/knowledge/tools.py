@@ -117,7 +117,6 @@ class RecallTool(ArtifactTool):
             "type": "array",
             "items": {"type": "string"},
             "maxItems": 3,
-            "description": "One to three queries, each a different angle.",
         },
         "sources": {
             "type": "array",

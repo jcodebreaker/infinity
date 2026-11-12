@@ -3040,7 +3040,7 @@ def test_maybe_signal_changed_files_throttles_within_window() -> None:
 
 def test_subagent_read_tools_are_runner_local() -> None:
     """
-    ``sys_session_list`` and ``sys_session_get_history`` dispatch locally in the runner.
+    ``sys_session_list`` and ``session_history`` dispatch locally in the runner.
 
     If this regresses, native harnesses that call these tools fall through to
     spec-callable resolution and the user sees "not in local dispatch table"
@@ -3049,8 +3049,8 @@ def test_subagent_read_tools_are_runner_local() -> None:
     from omnigent.runner.tool_dispatch import should_dispatch_locally
 
     assert should_dispatch_locally("sys_session_list") is True
-    assert should_dispatch_locally("sys_session_get_history") is True
-    # get_info is a runner-local read like list/get_history; if it falls out of
+    assert should_dispatch_locally("session_history") is True
+    # get_info is a runner-local read like list/history; if it falls out of
     # the local dispatch table the orchestrator's status checks break.
     assert should_dispatch_locally("sys_session_get_info") is True
 
@@ -5179,9 +5179,9 @@ def test_register_unregister_child_session_roundtrip() -> None:
     assert _child_session_parents.get(child_id) is None
 
 
-# ── sys_session_get_history / _list / _close runner dispatch ────────
+# ── sys_session_list / _close runner dispatch ────────
 #
-# These verify the runner-local handler that makes get_history/list/close
+# These verify the runner-local handler that makes list/close
 # work for harness agents (claude-sdk/pi), whose
 # Omnigent tool calls surface as action_required and route through
 # the runner — NOT the in-process inner Session. Confirmed empirically:
@@ -5206,315 +5206,6 @@ def _session_query_client(
         transport=httpx.MockTransport(handler),
         base_url="http://server",
     )
-
-
-@pytest.mark.asyncio
-async def test_session_peek_returns_chronological_projected_items() -> None:
-    """
-    ``sys_session_get_history`` reads ``GET /items`` (newest-first), reverses to
-    chronological, projects each item, and labels with the target's
-    parsed agent/title from its snapshot — matching ``SysSessionGetHistoryTool``.
-    """
-    from omnigent.runner.tool_dispatch import _execute_session_query_tool
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/sessions/conv_target/items":
-            assert request.url.params["order"] == "desc"
-            return httpx.Response(
-                200,
-                json={
-                    "object": "list",
-                    "data": [
-                        {
-                            "id": "i2",
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": "found it"}],
-                        },
-                        {
-                            "id": "i1",
-                            "type": "message",
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": "where is the bug"}],
-                        },
-                    ],
-                },
-            )
-        if request.url.path == "/v1/sessions/conv_target":
-            return httpx.Response(200, json={"id": "conv_target", "title": "reviewer:auth"})
-        raise AssertionError(f"unexpected path {request.url.path}")
-
-    async with _session_query_client(handler) as client:
-        out = json.loads(
-            await _execute_session_query_tool(
-                "sys_session_get_history",
-                json.dumps({"conversation_id": "conv_target", "tail_items": 5}),
-                conversation_id="conv_caller",
-                server_client=client,
-            )
-        )
-    assert out["conversation_id"] == "conv_target"
-    assert out["agent"] == "reviewer"
-    assert out["title"] == "auth"
-    # Reversed to chronological (user ask first), and message text is
-    # extracted from the content blocks — proves the projection ran.
-    assert [(i["role"], i["text"]) for i in out["items"]] == [
-        ("user", "where is the bug"),
-        ("assistant", "found it"),
-    ]
-
-
-_REST_HISTORY_CONTENT_SCENARIOS = [
-    pytest.param(3000, 4000, "R" * 3000, id="raised-limit"),
-    pytest.param(3000, None, "R" * 2000 + " [truncated]", id="default-limit"),
-    # An explicit limit recovers one long item in full (a sub-agent
-    # handoff longer than the inbox delivery cap stays reachable).
-    pytest.param(13000, 50000, "R" * 13000, id="explicit-limit-recovers-long-item"),
-    # The total prompt budget still bounds a single read.
-    pytest.param(100050, 200000, "R" * 100000 + " [truncated]", id="budget-ceiling"),
-    # No REST request is expected because validation rejects before the GET.
-    pytest.param(None, 0, "content_max_chars must be >= 1", id="non-positive"),
-]
-
-
-@pytest.mark.parametrize(
-    ("content_length", "content_max_chars", "expected"),
-    _REST_HISTORY_CONTENT_SCENARIOS,
-)
-@pytest.mark.asyncio
-async def test_session_peek_rest_content_limit_scenario(
-    content_length: int | None,
-    content_max_chars: int | None,
-    expected: str,
-) -> None:
-    """Apply one history content-limit scenario through runner REST dispatch."""
-    from omnigent.runner.tool_dispatch import _execute_session_query_tool
-
-    content = "R" * content_length if content_length is not None else None
-    arguments: dict[str, object] = {"conversation_id": "conv_target"}
-    if content is not None:
-        arguments["tail_items"] = 1
-    if content_max_chars is not None:
-        arguments["content_max_chars"] = content_max_chars
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if content is None:
-            pytest.fail("REST request should not run for rejected arguments")
-        if request.url.path == "/v1/sessions/conv_target/items":
-            return httpx.Response(
-                200,
-                json={
-                    "object": "list",
-                    "data": [
-                        {
-                            "id": "i1",
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": content}],
-                        }
-                    ],
-                },
-            )
-        if request.url.path == "/v1/sessions/conv_target":
-            return httpx.Response(200, json={"id": "conv_target", "title": "reviewer:auth"})
-        raise AssertionError(f"unexpected path {request.url.path}")
-
-    async with _session_query_client(handler) as client:
-        payload = json.loads(
-            await _execute_session_query_tool(
-                "sys_session_get_history",
-                json.dumps(arguments),
-                conversation_id="conv_caller",
-                server_client=client,
-            )
-        )
-
-    if "error" in payload:
-        actual = payload["error"]
-    else:
-        assert payload["title"] == "auth"
-        actual = payload["items"][0]["text"]
-    assert actual == expected
-
-
-@pytest.mark.asyncio
-async def test_session_peek_rest_offset_pages_through_long_item() -> None:
-    """
-    ``content_offset_chars`` pages through one long item on the REST path.
-
-    Stepping the offset by the window size reconstructs a content field
-    longer than one window, so a long sub-agent handoff stays reachable
-    from a runner-bound parent.
-    """
-    from omnigent.runner.tool_dispatch import _execute_session_query_tool
-
-    text = "BEGIN|" + ("0123456789" * 2000) + "|END"
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/sessions/conv_target/items":
-            return httpx.Response(
-                200,
-                json={
-                    "object": "list",
-                    "data": [
-                        {
-                            "id": "i1",
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": text}],
-                        }
-                    ],
-                },
-            )
-        if request.url.path == "/v1/sessions/conv_target":
-            return httpx.Response(200, json={"id": "conv_target", "title": "reviewer:auth"})
-        raise AssertionError(f"unexpected path {request.url.path}")
-
-    window = 12000
-    windows: list[str] = []
-    async with _session_query_client(handler) as client:
-        for offset in (0, window):
-            payload = json.loads(
-                await _execute_session_query_tool(
-                    "sys_session_get_history",
-                    json.dumps(
-                        {
-                            "conversation_id": "conv_target",
-                            "tail_items": 1,
-                            "content_max_chars": window,
-                            "content_offset_chars": offset,
-                        }
-                    ),
-                    conversation_id="conv_caller",
-                    server_client=client,
-                )
-            )
-            windows.append(payload["items"][0]["text"])
-
-    assert windows[0] == text[:window] + " [truncated]"
-    # The second window reaches the true end: no marker, tail present.
-    assert windows[1] == text[window:]
-    assert windows[0].removesuffix(" [truncated]") + windows[1] == text
-
-
-@pytest.mark.asyncio
-async def test_session_peek_rest_rejects_invalid_offset() -> None:
-    """An invalid offset is rejected before any REST request is made."""
-    from omnigent.runner.tool_dispatch import _execute_session_query_tool
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise AssertionError("REST request should not run for rejected arguments")
-
-    async with _session_query_client(handler) as client:
-        payload = json.loads(
-            await _execute_session_query_tool(
-                "sys_session_get_history",
-                json.dumps({"conversation_id": "conv_target", "content_offset_chars": -1}),
-                conversation_id="conv_caller",
-                server_client=client,
-            )
-        )
-    assert payload["error"] == "content_offset_chars must be >= 0"
-
-
-@pytest.mark.asyncio
-async def test_session_peek_appends_pending_elicitation_from_snapshot() -> None:
-    """
-    ``sys_session_get_history`` appends the target's parked elicitations (read
-    off its snapshot) after the stored items.
-
-    A parked elicitation never lands in the conversation store, so the
-    ``/items`` response ends at the last message. The snapshot's
-    ``pending_elicitations`` block is the only place the prompt lives;
-    get_history must read it and project a ``pending_elicitation`` item so the
-    parent agent isn't blind to a sub-agent awaiting input.
-    """
-    from omnigent.runner.tool_dispatch import _execute_session_query_tool
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/sessions/conv_target/items":
-            return httpx.Response(
-                200,
-                json={
-                    "object": "list",
-                    "data": [
-                        {
-                            "id": "i1",
-                            "type": "message",
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": "ask me 3 questions"}],
-                        },
-                    ],
-                },
-            )
-        if request.url.path == "/v1/sessions/conv_target":
-            return httpx.Response(
-                200,
-                json={
-                    "id": "conv_target",
-                    "title": "reviewer:auth",
-                    "pending_elicitations": [
-                        {
-                            "type": "response.elicitation_request",
-                            "elicitation_id": "elicit_bio",
-                            "params": {
-                                "mode": "form",
-                                "message": "Answer 3 questions on human biology",
-                                "requestedSchema": {"properties": {"q1": {}, "q2": {}}},
-                            },
-                        }
-                    ],
-                },
-            )
-        raise AssertionError(f"unexpected path {request.url.path}")
-
-    async with _session_query_client(handler) as client:
-        out = json.loads(
-            await _execute_session_query_tool(
-                "sys_session_get_history",
-                json.dumps({"conversation_id": "conv_target", "tail_items": 5}),
-                conversation_id="conv_caller",
-                server_client=client,
-            )
-        )
-    items = out["items"]
-    # 2 = 1 stored message + 1 synthesized pending elicitation. If 1,
-    # the snapshot's pending_elicitations weren't read/appended and the
-    # parent stays blind to the prompt.
-    assert len(items) == 2
-    # Stored item first (chronological), elicitation appended last.
-    assert items[0]["type"] == "message"
-    elicit = items[-1]
-    assert elicit["type"] == "pending_elicitation"
-    assert elicit["elicitation_id"] == "elicit_bio"
-    # Prompt + fields prove the snapshot payload reached the projector.
-    assert elicit["prompt"] == "Answer 3 questions on human biology"
-    assert elicit["fields"] == ["q1", "q2"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "status,expected_error",
-    [(404, "session_not_found"), (403, "session_out_of_tree")],
-)
-async def test_session_peek_maps_access_errors(status: int, expected_error: str) -> None:
-    """A 404/403 from ``GET /items`` maps to the in-process tool's typed errors."""
-    from omnigent.runner.tool_dispatch import _execute_session_query_tool
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(status, json={"error": "x"})
-
-    async with _session_query_client(handler) as client:
-        out = json.loads(
-            await _execute_session_query_tool(
-                "sys_session_get_history",
-                json.dumps({"conversation_id": "conv_other"}),
-                conversation_id="conv_caller",
-                server_client=client,
-            )
-        )
-    assert out["error"] == expected_error
-    assert out["conversation_id"] == "conv_other"
 
 
 @pytest.mark.asyncio
@@ -7451,8 +7142,7 @@ def test_format_async_task_item_truncated_subagent_output_names_retrieval_path()
         }
     )
     assert "...[truncated 8000 chars" in line
-    assert "sys_session_get_history conversation_id=conv_child_long" in line
-    assert f"content_max_chars={len(long_output)}" in line
+    assert "session_history action='get' chat_id=conv_child_long" in line
 
 
 def test_format_async_task_item_truncated_generic_task_keeps_plain_marker() -> None:
@@ -7474,7 +7164,7 @@ def test_format_async_task_item_truncated_generic_task_keeps_plain_marker() -> N
         }
     )
     assert "...[truncated 500 chars]" in line
-    assert "sys_session_get_history" not in line
+    assert "session_history" not in line
 
 
 @pytest.mark.asyncio
