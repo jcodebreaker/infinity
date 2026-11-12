@@ -275,6 +275,8 @@ def _stored(item_id: str, summary: str, **extra: Any) -> dict[str, Any]:
         "created_at": DAY,
         "summary": summary,
         "response_id": f"compact_{item_id}",
+        "last_item_id": "msg_1",
+        "token_count": 1,
         **extra,
     }
 
