@@ -1,6 +1,6 @@
 # 0044: The record is the window
 
-> **Status:** Accepted 2026-11-11 by the owner (plan reviewed five times, 5 → 9 out of 10). Amends [0031](0031-a-new-session-is-assembled-from-state.md) (the rejected option "resume the harness's session file", and the indexing note at line 50) and narrows [0017](0017-the-working-list-is-tagged-and-the-journal-lives-in-the-host.md)'s turn indexing.
+> **Status:** Accepted 2026-11-11 by the owner (plan reviewed five times, 5 → 9 out of 10). Amends [0031](0031-a-new-session-is-assembled-from-state.md) (the rejected option "resume the harness's session file", and the indexing note at line 50) and narrows [0017](0017-the-working-list-is-tagged-and-the-journal-lives-in-the-host.md)'s turn indexing. The approved plan: [durable-conversation-plan.md](../durable-conversation-plan.md).
 
 A restart is most cold starts (ADR 0033: 17 of 20). pi ran with `--no-session`, so its window lived only in process memory, and a restart rebuilt a small summary start and handed it over as one flattened text prompt. The record could not do better: the runner sent a prefix before each turn (time, gap line, profile, Projects, file handles) and never stored it, and a steer was stored when it arrived, not where pi read it. So no window could be rebuilt exactly.
 
