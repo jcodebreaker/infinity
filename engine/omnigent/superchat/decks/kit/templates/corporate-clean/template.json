@@ -1,0 +1,35 @@
+{
+  "id": "corporate-clean",
+  "name": "Corporate Clean",
+  "tagline": "Sober, board-ready",
+  "description": "White and navy with one blue accent; sober, precise, board-ready.",
+  "best_for": "board and management reports, bank and finance updates, B2B proposals",
+  "category": "professional",
+  "mode": "light",
+  "upstream": "https://github.com/lewislulu/html-ppt-skill",
+  "source": "nexu-io/open-design design-templates/html-ppt/assets/themes/corporate-clean.css@802708f",
+  "license": "MIT (see LICENSE); fonts SIL OFL 1.1 (see ../../fonts/OFL-*.txt)",
+  "fonts": [
+    {
+      "family": "Inter",
+      "weight": 400,
+      "style": "normal",
+      "file": "Inter-400.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Inter",
+      "weight": 600,
+      "style": "normal",
+      "file": "Inter-600.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Inter",
+      "weight": 700,
+      "style": "normal",
+      "file": "Inter-700.ttf",
+      "license": "OFL-inter.txt"
+    }
+  ]
+}

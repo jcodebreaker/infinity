@@ -1,0 +1,409 @@
+<!doctype html>
+<!-- Portions modified from nexu-io/open-design skills/data-report/example.html@802708f, Apache-2.0
+     (see /NOTICE). Changes: rewritten as Superchat's one dashboard page, filled by superchat-dashboard from
+     the person's files: the header, KPI cards with a sparkline and change, the chart grid with a
+     fixed-height chart box (the data-report rule) and the data table are kept; Tailwind, the CDN
+     Chart.js and Google Fonts are replaced by plain CSS, an inlined Chart.js and system fonts;
+     Superchat's chart palette (@superchat/ui-tokens --chart-*) in light and dark; a source line and a
+     "Data" table under every chart; the insight cards and methodology block are dropped. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="generator" content="superchat-dashboard">
+<title>{{title}}</title>
+<style>
+:root {
+  --bg: #f5f5f7;
+  --card: #ffffff;
+  --ink: #1d1d1f;
+  --ink-2: #6e6e73;
+  --ink-3: #8e8e93;
+  --line: rgba(0, 0, 0, 0.08);
+  --grid: rgba(0, 0, 0, 0.06);
+  --up: #1f9a3f;
+  --down: #c93400;
+  /* @superchat/ui-tokens, light */
+  --chart-1: #1d1d1f;
+  --chart-2: #0071e3;
+  --chart-3: #8e8e93;
+  --chart-4: #1d93c8;
+  --chart-5: #48484a;
+  --chart-6: #5856d6;
+  --chart-7: #c93400;
+  --chart-8: #1f9a3f;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0b0c0e;
+    --card: #141518;
+    --ink: #ececee;
+    --ink-2: #a1a1a6;
+    --ink-3: #85858a;
+    --line: rgba(255, 255, 255, 0.08);
+    --grid: rgba(255, 255, 255, 0.07);
+    --up: #30d158;
+    --down: #f0532b;
+    /* @superchat/ui-tokens, dark */
+    --chart-1: #f5f5f7;
+    --chart-2: #0a84ff;
+    --chart-3: #78787d;
+    --chart-4: #64d2ff;
+    --chart-5: #ffb830;
+    --chart-6: #6462ec;
+    --chart-7: #f0532b;
+    --chart-8: #30d158;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0b0c0e;
+  --card: #141518;
+  --ink: #ececee;
+  --ink-2: #a1a1a6;
+  --ink-3: #85858a;
+  --line: rgba(255, 255, 255, 0.08);
+  --grid: rgba(255, 255, 255, 0.07);
+  --up: #30d158;
+  --down: #f0532b;
+  /* @superchat/ui-tokens, dark */
+  --chart-1: #f5f5f7;
+  --chart-2: #0a84ff;
+  --chart-3: #78787d;
+  --chart-4: #64d2ff;
+  --chart-5: #ffb830;
+  --chart-6: #6462ec;
+  --chart-7: #f0532b;
+  --chart-8: #30d158;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI",
+    Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "tnum" 1;
+}
+.page { max-width: 1200px; margin: 0 auto; padding: 36px 32px 28px; }
+.head { margin-bottom: 24px; }
+.eyebrow {
+  margin: 0 0 6px; font-size: 12px; font-weight: 600; letter-spacing: 0.02em;
+  color: var(--ink-3); text-transform: uppercase;
+}
+h1 { margin: 0; font-size: 28px; line-height: 1.15; font-weight: 700; letter-spacing: -0.022em; }
+.sub { margin: 8px 0 0; max-width: 64ch; font-size: 15px; color: var(--ink-2); }
+.kpis {
+  display: grid; gap: 12px; margin-bottom: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+.card {
+  min-width: 0; background: var(--card); border-radius: 16px;
+  box-shadow: 0 0 0 0.5px var(--line), 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+.kpi { padding: 16px 18px 14px; display: flex; flex-direction: column; }
+.kpi .label { margin: 0; font-size: 12.5px; font-weight: 500; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.kpi .period { font-weight: 400; color: var(--ink-3); }
+.kpi .value {
+  margin: 6px 0 0; font-size: 28px; line-height: 1.1; font-weight: 600; letter-spacing: -0.02em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.kpi .change {
+  margin: 6px 0 0; font-size: 12.5px; color: var(--ink-3);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.kpi .change b { font-weight: 600; }
+.kpi .change .up { color: var(--up); }
+.kpi .change .down { color: var(--down); }
+.kpi .spark { position: relative; height: 34px; margin-top: 10px; }
+.grid { display: grid; gap: 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.chart { padding: 18px 20px 14px; display: flex; flex-direction: column; }
+.chart.wide { grid-column: 1 / -1; }
+.chart h2 { margin: 0; font-size: 15px; line-height: 1.3; font-weight: 600; letter-spacing: -0.01em; }
+.chart .note { margin: 3px 0 0; font-size: 13px; color: var(--ink-2); }
+/* Chart.js needs a parent with a fixed height (data-report rule), or it grows forever. */
+.plot { position: relative; margin-top: 14px; height: var(--h, 260px); }
+.source { margin: 12px 0 0; font-size: 12px; color: var(--ink-3); }
+details.data { margin-top: 4px; font-size: 12px; color: var(--ink-3); }
+details.data summary {
+  cursor: pointer; width: max-content; list-style: none; color: var(--ink-2);
+  border-radius: 6px; outline-offset: 2px;
+}
+details.data summary::-webkit-details-marker { display: none; }
+details.data summary::before { content: "\25B8\00a0"; font-size: 10px; }
+details.data[open] summary::before { content: "\25BE\00a0"; }
+.table { margin-top: 8px; max-height: 280px; overflow: auto; border-radius: 10px; box-shadow: 0 0 0 0.5px var(--line); }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; color: var(--ink); }
+th, td { padding: 6px 10px; text-align: right; white-space: nowrap; border-bottom: 0.5px solid var(--line); }
+th:first-child, td:first-child { text-align: left; }
+thead th { position: sticky; top: 0; background: var(--card); font-weight: 600; color: var(--ink-2); }
+tbody tr:last-child td { border-bottom: 0; }
+.foot { margin-top: 22px; font-size: 12px; color: var(--ink-3); }
+.foot p { margin: 2px 0; }
+@media (max-width: 600px) {
+  .grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 720px) {
+  .page { padding: 24px 20px 20px; }
+  h1 { font-size: 24px; }
+  .kpis { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+  .kpi { padding: 14px 14px 12px; }
+  .kpi .value { font-size: 22px; }
+  .kpi .change { font-size: 11.5px; }
+  .kpi .period { display: none; }
+  .chart { padding: 16px 16px 12px; }
+  .plot { height: calc(var(--h, 260px) * 0.8); }
+}
+@media (max-width: 380px) {
+  .kpis { grid-template-columns: minmax(0, 1fr); }
+}
+@media print {
+  @page { margin: 12mm; }
+  body { background: #fff; }
+  .page { max-width: none; padding: 0; }
+  .card { box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.18); break-inside: avoid; }
+  details.data { display: none; }
+}
+</style>
+</head>
+<body>
+<main class="page">
+  <header class="head">
+{{header}}
+  </header>
+{{kpis}}
+  <section class="grid" aria-label="Charts">
+{{charts}}
+  </section>
+  <footer class="foot">
+{{footer}}
+  </footer>
+</main>
+<script>
+/* Chart.js (MIT), vendored and inlined so the page works offline: never edit this block. */
+{{chartjs}}
+</script>
+<script type="application/json" id="superchat-dashboard-data">{{data}}</script>
+<script>
+(function () {
+  "use strict";
+  var DATA = JSON.parse(document.getElementById("superchat-dashboard-data").textContent);
+  // Series colors: the palette's accents first (as in Superchat's own charts), then the neutrals.
+  var ORDER = [2, 8, 7, 6, 4, 5, 3, 1];
+
+  function css(name) {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  }
+  function palette() {
+    return ORDER.map(function (n) { return css("--chart-" + n); });
+  }
+  function alpha(hex, a) {
+    var h = hex.replace("#", "");
+    if (h.length === 3) h = h.replace(/./g, "$&$&");
+    var n = parseInt(h.slice(0, 6), 16);
+    return "rgba(" + (n >> 16 & 255) + "," + (n >> 8 & 255) + "," + (n & 255) + "," + a + ")";
+  }
+
+  // The same rules as superchat-dashboard's Python formatter (prefix, suffix, decimals, compact, percent).
+  function format(value, f, axis) {
+    if (value === null || value === undefined || isNaN(value)) return "–";
+    f = f || {};
+    var v = f.percent ? value * 100 : value;
+    var unit = "";
+    var compact = f.compact || (axis && Math.abs(v) >= 10000 && !f.percent);
+    var digits = f.decimals;
+    if (compact) {
+      var a = Math.abs(v);
+      if (a >= 1e12) { v /= 1e12; unit = "T"; }
+      else if (a >= 1e9) { v /= 1e9; unit = "B"; }
+      else if (a >= 1e6) { v /= 1e6; unit = "M"; }
+      else if (a >= 1e3) { v /= 1e3; unit = "K"; }
+      if (unit && (digits === undefined || digits === null)) digits = Math.abs(v) < 100 ? 1 : 0;
+    }
+    if (digits === undefined || digits === null) digits = Math.abs(v) < 10 && v % 1 ? 2 : (v % 1 ? 1 : 0);
+    var text = v.toLocaleString("en-US", { minimumFractionDigits: unit ? 0 : digits, maximumFractionDigits: digits });
+    var sign = text.charAt(0) === "-" ? "-" : "";
+    if (sign) text = text.slice(1);
+    return sign + (f.prefix || "") + text + unit + (f.percent ? "%" : "") + (f.suffix || "");
+  }
+
+  var charts = [];
+
+  function config(spec) {
+    var colors = palette();
+    var ink2 = css("--ink-2"), grid = css("--grid"), line = css("--line");
+    var round = spec.type === "pie" || spec.type === "doughnut";
+    var datasets = spec.datasets.map(function (d, i) {
+      var color = colors[i % colors.length];
+      var set = { label: d.label, data: d.data };
+      if (round) {
+        set.backgroundColor = d.data.map(function (_, j) { return colors[j % colors.length]; });
+        set.borderColor = css("--card");
+        set.borderWidth = 2;
+        set.hoverOffset = 4;
+      } else if (d.kind === "line" || spec.type === "line" || spec.type === "area" || spec.type === "radar") {
+        set.type = spec.type === "combo" ? "line" : undefined;
+        set.borderColor = color;
+        set.backgroundColor = spec.type === "area" || spec.type === "radar" ? alpha(color, spec.type === "radar" ? 0.16 : 0.14) : color;
+        set.fill = spec.type === "area" ? (spec.stacked && i > 0 ? "-1" : "origin") : spec.type === "radar";
+        set.borderWidth = 2;
+        set.cubicInterpolationMode = "monotone";
+        set.pointRadius = d.data.length > 24 ? 0 : 2.5;
+        set.pointHoverRadius = 4;
+        set.pointBackgroundColor = color;
+        if (d.axis === "y2") { set.yAxisID = "y2"; set.order = 0; }
+      } else if (spec.type === "scatter") {
+        set.backgroundColor = alpha(color, 0.7);
+        set.borderColor = color;
+        set.pointRadius = 3;
+      } else {
+        set.backgroundColor = color;
+        set.borderRadius = 5;
+        set.maxBarThickness = 44;
+        set.order = 1;
+      }
+      return set;
+    });
+    var many = datasets.length > 1 || round;
+    var cfg = {
+      type: spec.type === "area" ? "line" : spec.type === "combo" ? "bar" : spec.type,
+      data: { labels: spec.labels, datasets: datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        interaction: { mode: round || spec.type === "scatter" ? "nearest" : "index", intersect: round || spec.type === "scatter" },
+        plugins: {
+          legend: {
+            display: many,
+            position: round ? "right" : "bottom",
+            align: round ? "center" : "start",
+            labels: { sort: function (a, b) { return a.datasetIndex - b.datasetIndex; }, color: ink2, usePointStyle: true, pointStyle: "circle", boxWidth: 7, boxHeight: 7, padding: 14 },
+          },
+          tooltip: {
+            backgroundColor: css("--ink"),
+            titleColor: css("--card"),
+            bodyColor: css("--card"),
+            padding: 10,
+            cornerRadius: 8,
+            boxPadding: 4,
+            usePointStyle: true,
+            callbacks: {
+              label: function (ctx) {
+                var raw = spec.type === "scatter" ? ctx.parsed.y : ctx.raw;
+                var f = ctx.dataset.yAxisID === "y2" ? spec.format2 : spec.format;
+                var name = round ? ctx.label : ctx.dataset.label;
+                var text = format(raw, f, false);
+                if (round) {
+                  var total = ctx.dataset.data.reduce(function (s, v) { return s + (v || 0); }, 0);
+                  if (total) text += " (" + Math.round(raw / total * 1000) / 10 + "%)";
+                }
+                return name ? " " + name + ": " + text : " " + text;
+              },
+            },
+          },
+        },
+      },
+    };
+    if (round) {
+      if (spec.type === "doughnut") cfg.options.cutout = "62%";
+      cfg.options.layout = { padding: 4 };
+      return cfg;
+    }
+    var tick = { color: ink2, font: { size: 11.5 } };
+    if (spec.type === "radar") {
+      cfg.options.scales = {
+        r: { angleLines: { color: grid }, grid: { color: grid }, pointLabels: { color: ink2, font: { size: 11.5 } },
+             ticks: { display: false, backdropColor: "transparent" }, beginAtZero: true },
+      };
+      return cfg;
+    }
+    var horizontal = !!spec.horizontal;
+    var valueAxis = {
+      beginAtZero: spec.type !== "scatter",
+      stacked: !!spec.stacked,
+      border: { display: false },
+      grid: { color: grid, drawTicks: false },
+      ticks: Object.assign({ padding: 8, maxTicksLimit: 6, callback: function (v) { return format(v, spec.format, true); } }, tick),
+    };
+    var labelAxis = {
+      stacked: !!spec.stacked,
+      border: { color: line },
+      grid: { display: spec.type === "scatter", color: grid, drawTicks: false },
+      ticks: Object.assign({ padding: 6, autoSkipPadding: 12, maxRotation: 0 }, tick),
+    };
+    if (spec.type === "scatter") {
+      labelAxis.ticks.callback = function (v) { return format(v, spec.formatX, true); };
+      labelAxis.title = { display: !!spec.xTitle, text: spec.xTitle, color: ink2 };
+      valueAxis.title = { display: !!spec.yTitle, text: spec.yTitle, color: ink2 };
+    }
+    cfg.options.scales = horizontal ? { x: valueAxis, y: labelAxis } : { x: labelAxis, y: valueAxis };
+    if (horizontal) cfg.options.indexAxis = "y";
+    if (spec.type === "combo") {
+      cfg.options.scales.y2 = {
+        position: "right",
+        beginAtZero: true,
+        border: { display: false },
+        grid: { display: false },
+        ticks: Object.assign({ padding: 8, maxTicksLimit: 6, callback: function (v) { return format(v, spec.format2, true); } }, tick),
+      };
+    }
+    return cfg;
+  }
+
+  function sparkConfig(kpi) {
+    var color = css("--chart-2");
+    return {
+      type: "line",
+      data: { labels: kpi.labels, datasets: [{ data: kpi.values, borderColor: color, backgroundColor: alpha(color, 0.12),
+        fill: "origin", borderWidth: 1.75, cubicInterpolationMode: "monotone", pointRadius: 0 }] },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false, events: [],
+        plugins: { legend: { display: false }, tooltip: { enabled: false } },
+        scales: { x: { display: false }, y: { display: false } },
+      },
+    };
+  }
+
+  function draw() {
+    charts.forEach(function (c) { c.destroy(); });
+    charts = [];
+    Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;
+    Chart.defaults.color = css("--ink-2");
+    DATA.charts.forEach(function (spec) {
+      var canvas = document.getElementById(spec.id + "-canvas");
+      if (canvas) charts.push(new Chart(canvas, config(spec)));
+    });
+    DATA.kpis.forEach(function (kpi) {
+      var canvas = document.getElementById(kpi.id + "-spark");
+      if (canvas && kpi.values) charts.push(new Chart(canvas, sparkConfig(kpi)));
+    });
+  }
+
+  draw();
+  if (window.matchMedia) {
+    var scheme = window.matchMedia("(prefers-color-scheme: dark)");
+    if (scheme.addEventListener) scheme.addEventListener("change", draw);
+  }
+
+  // Inside Superchat's chat the page is framed: tell the frame how tall the page is so it shows whole.
+  if (window.parent !== window) {
+    var last = 0;
+    var report = function () {
+      var height = Math.ceil(document.documentElement.scrollHeight);
+      if (height === last) return;
+      last = height;
+      window.parent.postMessage({ type: "superchat:dashboard-height", height: height }, "*");
+    };
+    report();
+    if (window.ResizeObserver) new ResizeObserver(report).observe(document.body);
+  }
+})();
+</script>
+</body>
+</html>

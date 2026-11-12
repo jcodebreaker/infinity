@@ -1,0 +1,35 @@
+{
+  "id": "japanese-minimal",
+  "name": "Japanese Minimal",
+  "tagline": "Quiet, spacious ivory",
+  "description": "Ivory, vermilion and ink with generous space and a quiet serif.",
+  "best_for": "brand and craft stories, reflective updates, restrained design talks",
+  "category": "editorial",
+  "mode": "light",
+  "upstream": "https://github.com/lewislulu/html-ppt-skill",
+  "source": "nexu-io/open-design design-templates/html-ppt/assets/themes/japanese-minimal.css@802708f",
+  "license": "MIT (see LICENSE); fonts SIL OFL 1.1 (see ../../fonts/OFL-*.txt)",
+  "fonts": [
+    {
+      "family": "Inter",
+      "weight": 400,
+      "style": "normal",
+      "file": "Inter-400.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Inter",
+      "weight": 600,
+      "style": "normal",
+      "file": "Inter-600.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Newsreader",
+      "weight": 600,
+      "style": "normal",
+      "file": "Newsreader-600.ttf",
+      "license": "OFL-newsreader.txt"
+    }
+  ]
+}

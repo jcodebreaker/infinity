@@ -1,0 +1,615 @@
+"""Managed model policy is checked before provisioning or persistence."""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import json
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock
+
+import pytest
+import pytest_asyncio
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient, Request, Response
+
+from omnigent.db.utils import generate_agent_id
+from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server.app import create_app
+from omnigent.server.hosts import HostDeployment, HostProviderConfig
+from omnigent.server.routes import sessions as sessions_module
+from omnigent.server.routes.sessions import routes_core, routes_events
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
+from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_store import HostStore
+from tests.server.helpers import build_agent_bundle, create_test_agent
+
+pytestmark = pytest.mark.asyncio
+
+
+class _Catalog:
+    def __init__(self) -> None:
+        self.revision = "revision-1"
+        self.owner = "local"
+        self.calls: list[tuple[str | None, str, str | None]] = []
+        self.runtime_config = {
+            "providers": {
+                "bifrost": {
+                    "kind": "gateway",
+                    "openai": {
+                        "base_url": "https://gateway.example/v1",
+                        "api_key_ref": "env:POD_GATEWAY_KEY",
+                        "wire_api": "responses",
+                    },
+                }
+            },
+            "inference": {
+                "harnesses": {
+                    harness: {
+                        "provider": "bifrost",
+                        "default_model": "gateway/main",
+                        "model_allowlist": ["gateway/main", "gateway/fast"],
+                    }
+                    for harness in ("pi",)
+                }
+            },
+        }
+
+    async def prepare(
+        self,
+        provider: str | None,
+        harness: str,
+        user_id: str | None,
+        agent_auth: object = None,
+    ) -> dict[str, Any]:
+        self.calls.append((provider, harness, user_id))
+        return {
+            "version": 1,
+            "target_id": "sandbox:host",
+            "configuration_revision": self.revision,
+            "harness": harness,
+            "owner_id": self.owner,
+            "runtime_config": copy.deepcopy(self.runtime_config),
+            "model_discovery": {},
+            "connections": {},
+            "catalog": {
+                "configured": True,
+                "configuration_revision": self.revision,
+                "provider_label": "Bifrost",
+                "default_model": "gateway/main",
+                "status": "ready",
+                "models": [
+                    {"id": "gateway/main", "displayName": "Main", "isDefault": True},
+                    {"id": "gateway/fast", "displayName": "Fast", "isDefault": False},
+                ],
+            },
+        }
+
+    async def catalog(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        return copy.deepcopy(snapshot["catalog"])
+
+
+@dataclass
+class _Env:
+    app: FastAPI
+    client: AsyncClient
+    store: SqlAlchemyConversationStore
+    catalog: _Catalog
+    launch: AsyncMock
+    artifact_dir: Path
+
+    def persisted(self) -> tuple[list[str], list[tuple[str, bytes]]]:
+        return (
+            sorted(row.id for row in self.store.list_conversations(limit=100, kind=None).data),
+            sorted(
+                (str(path.relative_to(self.artifact_dir)), path.read_bytes())
+                for path in self.artifact_dir.rglob("*")
+                if path.is_file()
+            ),
+        )
+
+
+@pytest_asyncio.fixture
+async def env(
+    runtime_init: None, db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[_Env]:
+    artifact_dir = tmp_path / "artifacts"
+    artifact_store = LocalArtifactStore(str(artifact_dir))
+    catalog = _Catalog()
+    config = HostProviderConfig(
+        provider="docker",
+        server_url="http://test",
+        launcher_factory=lambda: None,
+        token_ttl_s=100,
+        host_config=catalog.runtime_config,
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=store,
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        host_store=HostStore(db_uri),
+        sandbox_config=HostDeployment.single(config),
+    )
+    app.state.inference_catalog = catalog
+    launch = AsyncMock()
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        yield _Env(app, client, store, catalog, launch, artifact_dir)
+
+
+async def _json_create(env: _Env, **overrides: Any):
+    agent = await create_test_agent(
+        env.client,
+        executor={"type": "omnigent", "config": {"harness": "pi"}},
+        include_llm=False,
+    )
+    return await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "sandbox_provider": "docker",
+            "inference_configuration_revision": "revision-1",
+            **overrides,
+        },
+    )
+
+
+@pytest.mark.parametrize("location", ["provider", "discovery"])
+async def test_literal_credentials_rejected_before_session_or_artifact_writes(env: _Env, location):
+    from omnigent.server.inference_catalog import SandboxInferenceService
+
+    target = env.app.state.sandbox_config.default
+    if location == "provider":
+        target.host_config["providers"]["bifrost"]["openai"]["api_key_ref"] = "literal-test-token"
+    else:
+        target.model_discovery["bifrost"] = {
+            "base_url": "https://catalog.example/v1",
+            "api_key_ref": "literal-test-token",
+        }
+    env.app.state.inference_catalog = SandboxInferenceService(env.app.state)
+    agent = await create_test_agent(
+        env.client,
+        executor={"type": "omnigent", "config": {"harness": "pi"}},
+        include_llm=False,
+    )
+    before = env.persisted()
+    response = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "sandbox_provider": "docker",
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert "api_key_ref" in response.text
+    assert "literal-test-token" not in response.text
+    assert env.persisted() == before
+    env.launch.assert_not_awaited()
+
+
+async def _multipart_create(env: _Env, **metadata: Any):
+    return await env.client.post(
+        "/v1/sessions",
+        data={
+            "metadata": json.dumps(
+                {
+                    "host_type": "managed",
+                    "sandbox_provider": "docker",
+                    "inference_configuration_revision": "revision-1",
+                    **metadata,
+                }
+            )
+        },
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                build_agent_bundle(
+                    "managed-pi",
+                    executor={"type": "omnigent", "config": {"harness": "pi"}},
+                    include_llm=False,
+                ),
+                "application/gzip",
+            )
+        },
+    )
+
+
+@pytest.mark.parametrize("selected", [None, "gateway/fast"])
+async def test_json_create_captures_selected_model_and_configuration(env: _Env, selected):
+    response = await _json_create(env, model_override=selected)
+    assert response.status_code == 201, response.text
+    saved = env.store.get_conversation(response.json()["id"])
+    assert saved is not None
+    assert saved.model_override == (selected or "gateway/main")
+    assert saved.inference_snapshot is not None
+    assert saved.inference_snapshot["configuration_revision"] == "revision-1"
+    assert saved.inference_snapshot["runtime_config"] == env.catalog.runtime_config
+    await asyncio.sleep(0)
+    env.launch.assert_awaited_once()
+
+
+@pytest.mark.parametrize("multipart", [False, True])
+async def test_external_create_on_configured_server_does_not_capture_sandbox_policy(
+    env, multipart
+):
+    create = _multipart_create if multipart else _json_create
+    response = await create(
+        env,
+        host_type="external",
+        sandbox_provider=None,
+        inference_configuration_revision=None,
+        **({} if multipart else {"model_override": "gpt-legacy"}),
+    )
+    assert response.status_code == 201, response.text
+    saved = env.store.get_conversation(response.json()["session_id" if multipart else "id"])
+    assert saved.inference_snapshot is None
+    assert saved.model_override == (None if multipart else "gpt-legacy")
+    assert env.catalog.calls == []
+    env.launch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("explicit_policy", [True, False])
+async def test_multipart_create_captures_default_model_in_saved_configuration(
+    env: _Env, explicit_policy: bool
+):
+    if not explicit_policy:
+        binding = env.catalog.runtime_config["inference"]["harnesses"]["pi"]
+        del binding["default_model"]
+        del binding["model_allowlist"]
+    response = await _multipart_create(env)
+    assert response.status_code == 201, response.text
+    saved = env.store.get_conversation(response.json()["session_id"])
+    assert saved is not None and saved.inference_snapshot is not None
+    snapshot = saved.inference_snapshot
+    assert snapshot["configuration_revision"] == "revision-1"
+    assert snapshot["catalog"]["default_model"] == "gateway/main"
+    assert saved.model_override == snapshot["catalog"]["default_model"]
+    assert snapshot["runtime_config"] == env.catalog.runtime_config
+    await asyncio.sleep(0)
+    env.launch.assert_awaited_once()
+
+
+@pytest.mark.parametrize("multipart", [False, True])
+async def test_stale_revision_rejects_before_rows_artifacts_or_provisioning(env: _Env, multipart):
+    agent = await create_test_agent(
+        env.client,
+        executor={"type": "omnigent", "config": {"harness": "pi"}},
+        include_llm=False,
+    )
+    env.catalog.revision = "revision-2"
+    before = env.persisted()
+    if multipart:
+        response = await _multipart_create(env)
+    else:
+        response = await env.client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "host_type": "managed",
+                "sandbox_provider": "docker",
+                "inference_configuration_revision": "revision-1",
+            },
+        )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "inference_configuration_changed"
+    assert env.persisted() == before
+    env.launch.assert_not_called()
+
+
+async def test_unlisted_patch_rejects_before_any_metadata_change(env: _Env):
+    created = await _json_create(env, model_override="gateway/main", title="Original")
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    before = env.store.get_conversation(session_id)
+    response = await env.client.patch(
+        f"/v1/sessions/{session_id}",
+        json={
+            "model_override": "gateway/hidden",
+            "title": "Must not apply",
+            "labels": {"review": "must-not-apply"},
+            "reasoning_effort": "high",
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert "configured model list" in response.text
+    after = env.store.get_conversation(session_id)
+    assert after is not None and before is not None
+    assert after.title == before.title
+    assert after.labels == before.labels
+    assert after.model_override == before.model_override
+    assert after.reasoning_effort == before.reasoning_effort
+    assert after.inference_snapshot == before.inference_snapshot
+
+
+async def test_inherited_child_rejects_conflicting_auth_before_persistence(env: _Env):
+    created = await _json_create(env)
+    assert created.status_code == 201, created.text
+    before = env.persisted()
+    prepare_calls = len(env.catalog.calls)
+    response = await env.client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"parent_session_id": created.json()["id"]})},
+        files={
+            "bundle": (
+                "child.tar.gz",
+                build_agent_bundle(
+                    "child",
+                    executor={
+                        "type": "omnigent",
+                        "config": {"harness": "pi"},
+                        "auth": {"type": "provider", "name": "other"},
+                    },
+                    include_llm=False,
+                ),
+                "application/gzip",
+            )
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert "conflict" in response.text.lower()
+    assert len(env.catalog.calls) == prepare_calls
+    assert env.persisted() == before
+
+
+async def test_default_reset_and_catalog_use_saved_config_after_operator_edit(env: _Env):
+    created = await _json_create(env, model_override="gateway/fast")
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    env.catalog.revision = "revision-2"
+    binding = env.catalog.runtime_config["inference"]["harnesses"]["pi"]
+    binding["default_model"] = "gateway/fast"
+    binding["model_allowlist"] = ["gateway/fast"]
+    calls = len(env.catalog.calls)
+    response = await env.client.patch(
+        f"/v1/sessions/{session_id}", json={"model_override": "default", "silent": True}
+    )
+    assert response.status_code == 200, response.text
+    saved = env.store.get_conversation(session_id)
+    assert saved is not None
+    assert saved.model_override == "gateway/main"
+    snapshot = await env.client.get(f"/v1/sessions/{session_id}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["inference_configured"] is True
+    assert snapshot.json()["inference_error"] is None
+    assert [row["id"] for row in snapshot.json()["model_options"]] == [
+        "gateway/main",
+        "gateway/fast",
+    ]
+    assert len(env.catalog.calls) == calls
+
+
+async def test_default_stores_the_persons_foundation_only_in_a_super_chat(env: _Env):
+    from omnigent.context.labels import CONTEXT_MODE_LABEL, SUPERSIDE_CHAT_MODE_VALUE
+
+    async def foundation(_user: str | None, harness: str, catalog: dict | None) -> str | None:
+        # The person's Foundation is not the connection's default (gateway/main).
+        return "gateway/fast" if harness == "pi" else None
+
+    env.app.state.foundation_model = foundation
+    super_chat = await _json_create(env, labels={CONTEXT_MODE_LABEL: SUPERSIDE_CHAT_MODE_VALUE})
+    other = await _json_create(env)
+    assert super_chat.status_code == other.status_code == 201
+
+    async def patch(session_id: str, model: str):
+        return await env.client.patch(
+            f"/v1/sessions/{session_id}", json={"model_override": model, "silent": True}
+        )
+
+    def stored(session_id: str) -> str | None:
+        saved = env.store.get_conversation(session_id)
+        assert saved is not None
+        return saved.model_override
+
+    sc, plain = super_chat.json()["id"], other.json()["id"]
+    # Created on the Foundation; any other session on the connection's default.
+    assert (stored(sc), stored(plain)) == ("gateway/fast", "gateway/main")
+    # A real id is still checked against the saved catalog, then stored.
+    assert (await patch(sc, "gateway/hidden")).status_code == 400
+    assert (await patch(sc, "gateway/main")).status_code == 200
+    assert stored(sc) == "gateway/main"
+    for clear in ("default", "reset"):
+        await patch(sc, "gateway/main")
+        assert (await patch(sc, clear)).status_code == 200
+        assert stored(sc) == "gateway/fast"
+        await patch(plain, "gateway/fast")
+        assert (await patch(plain, clear)).status_code == 200
+        assert stored(plain) == "gateway/main"
+
+
+@pytest.mark.parametrize("event_type", ["message", "slash_command"])
+async def test_unavailable_saved_provider_rejects_input_before_dispatch_or_items(
+    env: _Env, monkeypatch: pytest.MonkeyPatch, event_type: str
+):
+    created = await _json_create(env)
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    unavailable = {
+        "configured": True,
+        "configuration_revision": "revision-1",
+        "status": "unavailable",
+        "models": [],
+        "default_model": "gateway/main",
+        "provider_label": "Bifrost",
+        "error": "The configured provider is unavailable.",
+    }
+    monkeypatch.setattr(env.catalog, "catalog", AsyncMock(return_value=unavailable))
+    dispatch = AsyncMock()
+    slash_dispatch = AsyncMock()
+    monkeypatch.setattr(routes_events, "_dispatch_session_event_to_runner", dispatch)
+    monkeypatch.setattr(routes_events, "_dispatch_skill_slash_command_to_runner", slash_dispatch)
+    before = env.store.list_items(session_id).data
+    data = (
+        {"role": "user", "content": [{"type": "input_text", "text": "Hello"}]}
+        if event_type == "message"
+        else {"agent": "claude", "name": "review", "arguments": ""}
+    )
+    response = await env.client.post(
+        f"/v1/sessions/{session_id}/events", json={"type": event_type, "data": data}
+    )
+    assert response.status_code == 400, response.text
+    assert "configured provider is unavailable" in response.text
+    assert env.store.list_items(session_id).data == before
+    dispatch.assert_not_called()
+    slash_dispatch.assert_not_called()
+    snapshot = await env.client.get(f"/v1/sessions/{session_id}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["inference_configured"] is True
+    assert snapshot.json()["model_options"] == []
+    assert snapshot.json()["inference_error"] == unavailable["error"]
+
+
+@pytest.mark.parametrize("runner_status", [409, 200])
+@pytest.mark.parametrize("previous_runner", [None, "runner_previous"])
+async def test_configured_rebind_rejection_restores_previous_runner(
+    env: _Env,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_status: int,
+    previous_runner: str | None,
+):
+    created = await _json_create(env, title="Original")
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    if previous_runner is not None:
+        env.store.replace_runner_id(session_id, previous_runner)
+    runner_post = AsyncMock(
+        return_value=Response(
+            runner_status,
+            json={"error": "configuration rejected"} if runner_status == 409 else {},
+            request=Request("POST", "/v1/sessions"),
+        )
+    )
+    monkeypatch.setattr(
+        sessions_module,
+        "_registered_runner_id",
+        lambda _router, runner_id, **_kwargs: runner_id,
+    )
+    monkeypatch.setattr(
+        routes_core,
+        "_get_runner_client",
+        AsyncMock(return_value=SimpleNamespace(post=runner_post)),
+    )
+    relay = AsyncMock()
+    monkeypatch.setattr(routes_core, "_ensure_runner_relay_ready", relay)
+    response = await env.client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"runner_id": "runner_replacement", "title": "Must not apply"},
+    )
+    assert response.status_code == 503, response.text
+    assert "did not accept" in response.text
+    saved = env.store.get_conversation(session_id)
+    assert saved is not None
+    assert saved.runner_id == previous_runner
+    assert saved.title == "Original"
+    runner_post.assert_awaited_once()
+    init = runner_post.call_args.kwargs["json"]["session_init"]["snapshot"]
+    assert init["inference_config"] == saved.inference_snapshot["runtime_config"]
+    relay.assert_not_called()
+
+
+async def _builtin(env: _Env, harness: str) -> str:
+    agent = await create_test_agent(
+        env.client,
+        name=f"target-{harness}",
+        executor={"type": "omnigent", "config": {"harness": harness}},
+        include_llm=False,
+    )
+    stored = env.app.state.agent_store.get(agent["id"])
+    assert stored is not None
+    builtin = env.app.state.agent_store.create(
+        generate_agent_id(), f"builtin-{harness}", stored.bundle_location
+    )
+    return builtin.id
+
+
+async def test_configured_session_switch_captures_the_target_harness_configuration(env: _Env):
+    created = await _json_create(env, model_override="gateway/fast")
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    target_id = await _builtin(env, "claude-sdk")
+    response = await env.client.post(
+        f"/v1/sessions/{session_id}/switch-agent", json={"agent_id": target_id}
+    )
+    assert response.status_code == 200, response.text
+    saved = env.store.get_conversation(session_id)
+    assert saved is not None and saved.inference_snapshot is not None
+    # Captured again for the target's harness, on the same provider target.
+    assert saved.inference_snapshot["harness"] == "claude-sdk"
+    assert saved.model_override in {
+        row["id"] for row in saved.inference_snapshot["catalog"]["models"]
+    }
+
+
+@pytest.mark.parametrize("unbound_harness", [False, True])
+async def test_configured_fork_rejects_different_harness_before_persistence(
+    env: _Env, unbound_harness: bool
+):
+    if unbound_harness:
+        del env.catalog.runtime_config["inference"]["harnesses"]["pi"]
+    created = await _json_create(env)
+    assert created.status_code == 201, created.text
+    target_id = await _builtin(env, "claude-sdk")
+    before = env.persisted()
+    response = await env.client.post(
+        f"/v1/sessions/{created.json()['id']}/fork", json={"agent_id": target_id}
+    )
+    assert response.status_code == 400, response.text
+    assert "same harness" in response.text
+    assert env.persisted() == before
+
+
+@pytest.mark.parametrize("unbound_harness", [False, True])
+async def test_configured_fork_rejects_foreign_provider_owner(env: _Env, unbound_harness: bool):
+    if unbound_harness:
+        del env.catalog.runtime_config["inference"]["harnesses"]["pi"]
+    env.catalog.owner = "alice@example.com"
+    created = await _json_create(env)
+    assert created.status_code == 201, created.text
+    before = env.persisted()
+    response = await env.client.post(f"/v1/sessions/{created.json()['id']}/fork", json={})
+    assert response.status_code == 400, response.text
+    assert "another user" in response.text
+    assert env.persisted() == before
+
+
+@pytest.mark.parametrize(
+    "selection,expected",
+    [
+        ({}, "gateway/fast"),
+        ({"model_override": "gateway/main"}, "gateway/main"),
+        ({"model_override": "default"}, "gateway/main"),
+        ({"model_override": None}, "gateway/main"),
+        ({"model_override": "gateway/hidden"}, None),
+    ],
+)
+async def test_same_harness_fork_validates_model_against_saved_policy(
+    env: _Env, selection: dict[str, Any], expected: str | None
+):
+    created = await _json_create(env, model_override="gateway/fast")
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    before = env.persisted()
+    original = env.store.get_conversation(session_id)
+    response = await env.client.post(f"/v1/sessions/{session_id}/fork", json=selection)
+    if expected is None:
+        assert response.status_code == 400, response.text
+        assert "configured model list" in response.text
+        assert env.persisted() == before
+    else:
+        assert response.status_code == 201, response.text
+        fork = env.store.get_conversation(response.json()["id"])
+        assert fork is not None and original is not None
+        assert fork.model_override == expected
+        assert fork.inference_snapshot == original.inference_snapshot

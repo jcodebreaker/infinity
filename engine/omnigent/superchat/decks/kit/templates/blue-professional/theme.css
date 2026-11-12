@@ -1,0 +1,12 @@
+/* Design derived from nexu-io/open-design design-templates/html-ppt-zhangzara-blue-professional@802708f (https://github.com/zarazhangrui/beautiful-html-templates),
+   MIT, Copyright (c) 2026 Zara Zhang; the license is kept in ../LICENSE. Changes: palette, type and
+   motifs kept; rewritten for Superchat's fixed 1920x1080 canvas (px units, no vw/vh or clamp()),
+   expressed as tokens (tokens.css) plus the three surface classes of the shared layouts
+   (../../layouts.css); web fonts replaced by static Latin-subset TTFs embedded at assembly
+   (kit/fonts, SIL OFL 1.1, license texts alongside). */
+/* Blue Professional: cream paper, electric cobalt. t-a = paper, t-b = cobalt, t-c = ink. */
+.slide.t-a { background: var(--bg); color: var(--fg); }
+.slide.t-b { background: #1e2bfa; color: #fdfae7; --muted: #d6d9ff; --accent: #fdfae7; --surface: #2c39fb; --line: #6b74fc; }
+.slide.t-c { background: #111111; color: #fdfae7; --muted: #bdbab0; --accent: #8f97ff; --surface: #1c1c1c; --line: #3a3a3a; }
+.kicker { font-weight: 500; letter-spacing: 0.12em; }
+.title { font-weight: 700; }

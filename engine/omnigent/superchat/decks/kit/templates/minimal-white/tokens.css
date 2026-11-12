@@ -1,0 +1,18 @@
+      --bg: #ffffff;
+      --fg: #0c0d10;
+      --muted: #55596a;
+      --accent: #111216;
+      --surface: #f6f6f7;
+      --shell: #08090d;
+      --line: #e3e4e8;
+      --radius: 14px;
+      --font-display: "Inter", "Helvetica Neue", Arial, sans-serif;
+      --font-body: "Inter", "Helvetica Neue", Arial, sans-serif;
+      --font-mono: "Inter", "Helvetica Neue", Arial, sans-serif;
+      --display-weight: 700;
+      --display-tracking: -0.035em;
+      --accent-2: #3b3f4a;
+      --accent-3: #6b6f7a;
+      --good: #157a50;
+      --warn: #a66c00;
+      --font-serif: var(--font-display);

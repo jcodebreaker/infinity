@@ -1,0 +1,137 @@
+#!/bin/sh
+set -eu
+SUPERCHAT_HOME="${HOME:-/home/superchat}"
+# Page-browser tools and desktop launchers share the assigned display profile.
+DISPLAY_NUM="${DISPLAY:-:1}"
+DISPLAY_NUM="${DISPLAY_NUM#:}"
+DISPLAY_NUM="${DISPLAY_NUM%%.*}"
+case "$DISPLAY_NUM" in
+  ''|*[!0-9]*) DISPLAY_NUM=1 ;;
+esac
+# POSIX shell arithmetic treats a leading zero as octal.
+while [ "${DISPLAY_NUM#0}" != "$DISPLAY_NUM" ]; do DISPLAY_NUM="${DISPLAY_NUM#0}"; done
+DISPLAY_NUM="${DISPLAY_NUM:-0}"
+DEBUG_PORT=$((9221 + DISPLAY_NUM))
+if [ -n "${SUPERCHAT_BROWSER_PROFILE:-}" ]; then
+  PROFILE="$SUPERCHAT_BROWSER_PROFILE"
+elif [ -s "/tmp/superchat/browser-profile-$DISPLAY_NUM" ]; then
+  PROFILE="$(cat "/tmp/superchat/browser-profile-$DISPLAY_NUM")"
+else
+  case "$DISPLAY_NUM" in
+    1) PROFILE="$SUPERCHAT_HOME/.browser-profiles/chromium" ;;
+    *) PROFILE="$SUPERCHAT_HOME/.browser-profiles/chromium-screen-$DISPLAY_NUM" ;;
+  esac
+fi
+mkdir -p "$PROFILE"
+BIN="$(command -v chromium || command -v chromium-browser || true)"
+if [ -z "$BIN" ]; then
+  echo "chromium is not installed" >&2
+  exit 1
+fi
+USER_DATA_DIR_SET=0
+ACTUAL_PROFILE="$PROFILE"
+PREV_ARG_WAS_USER_DATA_DIR=0
+for arg in "$@"; do
+  if [ "$PREV_ARG_WAS_USER_DATA_DIR" -eq 1 ]; then
+    ACTUAL_PROFILE="$arg"
+    PREV_ARG_WAS_USER_DATA_DIR=0
+  fi
+  case "$arg" in
+    --user-data-dir=*) ACTUAL_PROFILE="${arg#*=}"; USER_DATA_DIR_SET=1 ;;
+    --user-data-dir) PREV_ARG_WAS_USER_DATA_DIR=1; USER_DATA_DIR_SET=1 ;;
+  esac
+done
+
+clear_crash_state() {
+  f="$1"
+  [ -f "$f" ] || return 0
+  sed -E \
+    's/"exit_type"[[:space:]]*:[[:space:]]*"Crashed"/"exit_type":"Normal"/g; s/"exited_cleanly"[[:space:]]*:[[:space:]]*false/"exited_cleanly":true/g' \
+    "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
+}
+
+# Match one argument in NUL-separated argv or in Chromium's space-joined title.
+# The whole flag is the search string, so spaces and " --" inside a profile path stay intact.
+cmdline_text() {
+  tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null || true
+}
+has_arg() {
+  text=$(cmdline_text "$1")
+  if printf '%s\n' "$text" | grep -Fx -- "$2" >/dev/null; then return 0; fi
+  if printf ' %s ' "$text" | grep -F -- " $2 " >/dev/null; then return 0; fi
+  return 1
+}
+has_prefix() {
+  text=$(cmdline_text "$1")
+  if [ $# -ge 3 ]; then
+    case "$text" in
+      *"$3"*) text="${text%%"$3"*}${text#*"$3"}" ;;
+    esac
+  fi
+  if printf '%s\n' "$text" | grep -e "^$2" >/dev/null; then return 0; fi
+  if printf ' %s ' "$text" | grep -F -- " $2" >/dev/null; then return 0; fi
+  return 1
+}
+
+# A stale SingletonLock is not a live browser. Leaving exit_type=Crashed makes Chrome
+# drop session cookies (account sign-in) on the next start while persistent cookies remain.
+# kill -0 is not enough: the PID may have been reused by an unrelated process.
+profile_lock_is_live() {
+  profile="$1"
+  lock=$(readlink "$profile/SingletonLock" 2>/dev/null || true)
+  pid=${lock##*-}
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  [ -r "/proc/$pid/cmdline" ] || return 0
+  has_arg "$pid" "--user-data-dir=$profile" || return 1
+  if has_prefix "$pid" "--type=" "--user-data-dir=$profile"; then
+    return 1
+  fi
+  return 0
+}
+
+if [ -d "$ACTUAL_PROFILE" ] && ! profile_lock_is_live "$ACTUAL_PROFILE"; then
+  rm -f "$ACTUAL_PROFILE/SingletonLock" "$ACTUAL_PROFILE/SingletonCookie" "$ACTUAL_PROFILE/SingletonSocket" 2>/dev/null || true
+  find "$ACTUAL_PROFILE" \( -name Preferences -o -name 'Local State' \) -type f 2>/dev/null |
+    while IFS= read -r f; do
+      clear_crash_state "$f" 2>/dev/null || rm -f "${f}.tmp"
+    done || true
+fi
+
+# Downloads land in the workspace (docs/adr/0007), not in a prompt. Chromium reads this from the
+# profile's Preferences and rewrites it on exit; skip a profile whose browser is still running.
+if ! profile_lock_is_live "$ACTUAL_PROFILE"; then
+  DOWNLOAD_DIR="$SUPERCHAT_HOME/workspace/Downloads"
+  mkdir -p "$DOWNLOAD_DIR" "$ACTUAL_PROFILE/Default"
+  python3 - "$ACTUAL_PROFILE/Default/Preferences" "$DOWNLOAD_DIR" <<'PY' 2>/dev/null || true
+import json, sys
+path, folder = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        prefs = json.load(f)
+except (OSError, ValueError):
+    prefs = {}
+download = prefs.setdefault("download", {})
+download["default_directory"] = folder
+download["prompt_for_download"] = False
+prefs.setdefault("savefile", {})["default_directory"] = folder
+with open(path, "w") as f:
+    json.dump(prefs, f, separators=(",", ":"))
+PY
+fi
+
+# This container has no GPU. --disable-gpu keeps Chromium from probing one.
+# WebGL still needs SwiftShader: --disable-software-rasterizer blocks it, and
+# current Chromium allows that fallback only with --enable-unsafe-swiftshader.
+FLAGS="--test-type --no-sandbox --disable-dev-shm-usage --disable-gpu --enable-unsafe-swiftshader --no-first-run --no-default-browser-check --disable-session-crashed-bubble --hide-crash-restore-bubble --password-store=basic --restore-last-session --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=$DEBUG_PORT"
+# The host has no screen: with no X server behind this display, Chromium runs headless and
+# is driven over the debug port only (superchat-page-browser).
+if [ ! -S "/tmp/.X11-unix/X$DISPLAY_NUM" ]; then
+  FLAGS="$FLAGS --headless=new --window-size=1280,800"
+fi
+if [ "$USER_DATA_DIR_SET" -eq 0 ]; then
+  exec "$BIN" $FLAGS --user-data-dir="$PROFILE" "$@"
+fi
+exec "$BIN" $FLAGS "$@"

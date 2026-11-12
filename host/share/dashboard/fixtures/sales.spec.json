@@ -1,0 +1,84 @@
+{
+  "title": "Sales 2025",
+  "eyebrow": "Full year",
+  "subtitle": "Orders shipped from January to December 2025, every region and product line.",
+  "source": "sales.csv",
+  "kpis": [
+    {
+      "label": "Revenue",
+      "value": "revenue",
+      "agg": "sum",
+      "date": "order_date",
+      "bucket": "month",
+      "format": { "prefix": "$", "compact": true }
+    },
+    { "label": "Orders", "agg": "count", "date": "order_date", "bucket": "month" },
+    {
+      "label": "Average order",
+      "value": "revenue",
+      "agg": "mean",
+      "date": "order_date",
+      "bucket": "month",
+      "format": { "prefix": "$", "decimals": 0 }
+    },
+    {
+      "label": "Cost",
+      "value": "cost",
+      "agg": "sum",
+      "date": "order_date",
+      "bucket": "month",
+      "good": "down",
+      "format": { "prefix": "$", "compact": true }
+    }
+  ],
+  "charts": [
+    {
+      "title": "Revenue by month",
+      "type": "area",
+      "x": "order_date",
+      "bucket": "month",
+      "y": "revenue",
+      "names": { "revenue": "Revenue" },
+      "format": { "prefix": "$" },
+      "wide": true
+    },
+    {
+      "title": "Revenue by region",
+      "type": "bar",
+      "horizontal": true,
+      "x": "region",
+      "y": "revenue",
+      "names": { "revenue": "Revenue" },
+      "format": { "prefix": "$" }
+    },
+    {
+      "title": "Revenue mix",
+      "type": "doughnut",
+      "x": "category",
+      "y": "revenue",
+      "names": { "revenue": "Revenue" },
+      "format": { "prefix": "$" }
+    },
+    {
+      "title": "Revenue by quarter and product line",
+      "type": "bar",
+      "stacked": true,
+      "x": "order_date",
+      "bucket": "quarter",
+      "y": "revenue",
+      "split": "category",
+      "format": { "prefix": "$" }
+    },
+    {
+      "title": "Units and revenue by month",
+      "type": "combo",
+      "x": "order_date",
+      "bucket": "month",
+      "y": "units",
+      "y2": "revenue",
+      "agg": "sum",
+      "names": { "units": "Units", "revenue": "Revenue" },
+      "format2": { "prefix": "$" }
+    }
+  ]
+}

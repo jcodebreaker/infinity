@@ -1,0 +1,1199 @@
+@import "tailwindcss";
+@import "@superchat/ui-web/styles.css";
+@import "@fontsource-variable/geist/wght.css";
+@import "@fontsource-variable/geist-mono/wght.css";
+@import "@fontsource-variable/instrument-sans/wght.css";
+@import "@fontsource/instrument-serif/400.css";
+@import "@fontsource/instrument-serif/400-italic.css";
+
+@source "../../packages/ui-web/src/**/*.{ts,tsx}";
+@source "./src/**/*.{ts,tsx}";
+
+/* Muse edition type and elevation (the old design notes). */
+@theme {
+  --font-display: "Instrument Serif", ui-serif, Georgia, serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
+  --shadow-float: 0 1px 2px rgb(0 0 0 / 0.04), 0 12px 32px -12px rgb(0 0 0 / 0.14);
+  /* Home's "Continue the conversation" chevron: a gentle 3px nudge down. */
+  --animate-nudge: sc-nudge 1.8s ease-in-out infinite;
+  @keyframes sc-nudge {
+    50% {
+      transform: translateY(3px);
+    }
+  }
+}
+
+/* Signed-out welcome: the app's own type, and a soft pulse on the "working" dot. */
+[data-superchat-surface="welcome"] {
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Instrument Sans Variable", "Geist Variable",
+    ui-sans-serif, system-ui, sans-serif;
+}
+.welcome-orb {
+  background: radial-gradient(
+    circle at 35% 30%,
+    var(--welcome-orb-hi) 0,
+    var(--welcome-orb-mid) 35%,
+    var(--welcome-orb-deep) 70%,
+    var(--welcome-orb-lo) 100%
+  );
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--welcome-orb-mid) 25%, transparent);
+}
+@keyframes welcomeBlink {
+  50% {
+    opacity: 0;
+  }
+}
+@keyframes welcomePulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--welcome-me) 45%, transparent);
+  }
+  70%,
+  100% {
+    box-shadow: 0 0 0 9px transparent;
+  }
+}
+
+/* Signed-out welcome, night edition: the film hero, the grain and the stacked demo cards. */
+.welcome-display {
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Display", "Instrument Sans Variable", system-ui,
+    sans-serif;
+}
+.welcome-mark-orb {
+  background: radial-gradient(
+    circle at 30% 30%,
+    var(--welcome-night-orb-hi),
+    var(--welcome-night-glow) 45%,
+    var(--welcome-night-orb-lo)
+  );
+  box-shadow: 0 0 16px var(--welcome-night-glow);
+}
+.welcome-grain {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='220' height='220'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  animation: welcomeGrain 1.2s steps(6) infinite;
+}
+@keyframes welcomeGrain {
+  0% {
+    transform: translate(0, 0);
+  }
+  20% {
+    transform: translate(-3%, 2%);
+  }
+  40% {
+    transform: translate(2%, -3%);
+  }
+  60% {
+    transform: translate(-2%, -1%);
+  }
+  80% {
+    transform: translate(3%, 3%);
+  }
+  100% {
+    transform: translate(0, 0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .welcome-grain {
+    animation: none;
+  }
+}
+.welcome-shade {
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--welcome-night) 55%, transparent) 0,
+    color-mix(in srgb, var(--welcome-night) 5%, transparent) 30%,
+    color-mix(in srgb, var(--welcome-night) 15%, transparent) 60%,
+    var(--welcome-night) 100%
+  );
+}
+.welcome-hero video::cue {
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Instrument Sans Variable", system-ui,
+    sans-serif;
+  font-size: clamp(16px, 1.6vw, 22px);
+  background: rgb(0 0 0 / 0.55);
+  color: var(--welcome-paper);
+}
+.welcome-blink {
+  animation: welcomeBlink 1s steps(2) infinite;
+}
+.welcome-rec-blink {
+  animation: welcomeBlink 1.2s steps(2) infinite;
+}
+.welcome-caret::after {
+  content: "\258D";
+  color: var(--welcome-me);
+  animation: welcomeBlink 1s steps(2) infinite;
+}
+.welcome-cursor::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--welcome-night-rose);
+  clip-path: polygon(0 0, 100% 55%, 55% 60%, 40% 100%);
+}
+.welcome-card {
+  box-shadow: 0 -10px 40px color-mix(in srgb, var(--welcome-night-bar) 18%, transparent);
+}
+.welcome-card:nth-child(1) {
+  top: 70px;
+}
+.welcome-card:nth-child(2) {
+  top: 122px;
+}
+.welcome-card:nth-child(3) {
+  top: 174px;
+}
+.welcome-card:nth-child(4) {
+  top: 226px;
+}
+.welcome-card:nth-child(5) {
+  top: 278px;
+}
+.welcome-card:nth-child(6) {
+  top: 330px;
+}
+@media (max-width: 860px) {
+  .welcome-card:nth-child(1) {
+    top: 64px;
+  }
+  .welcome-card:nth-child(2) {
+    top: 106px;
+  }
+  .welcome-card:nth-child(3) {
+    top: 148px;
+  }
+  .welcome-card:nth-child(4) {
+    top: 190px;
+  }
+  .welcome-card:nth-child(5) {
+    top: 232px;
+  }
+  .welcome-card:nth-child(6) {
+    top: 274px;
+  }
+}
+.welcome-screen {
+  background: radial-gradient(
+    120% 90% at 20% 10%,
+    var(--welcome-screen-hi) 0,
+    var(--welcome-screen-mid) 45%,
+    var(--welcome-screen-lo) 100%
+  );
+}
+
+/* Notch and home-indicator insets (the viewport is `viewport-fit=cover`). */
+@utility pt-safe {
+  padding-top: env(safe-area-inset-top);
+}
+@utility pb-safe {
+  padding-bottom: env(safe-area-inset-bottom);
+}
+@utility ps-safe {
+  padding-inline-start: env(safe-area-inset-left);
+}
+@utility pe-safe {
+  padding-inline-end: env(safe-area-inset-right);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background: var(--background);
+  color: var(--foreground);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "Geist Variable", ui-sans-serif,
+    system-ui, sans-serif;
+}
+
+/* Nothing pans sideways on a phone, whatever a stray child measures. */
+html,
+body {
+  overflow-x: clip;
+  max-width: 100%;
+}
+
+/* Muse edition: content scrolls, but scrollbars stay out of sight and nothing pans
+   sideways. */
+[data-product="muse"] .sc-scroll,
+[data-product="muse"] main {
+  scrollbar-width: none;
+}
+[data-product="muse"] .sc-scroll::-webkit-scrollbar,
+[data-product="muse"] main ::-webkit-scrollbar {
+  display: none;
+}
+[data-product="muse"] main {
+  overflow-x: hidden;
+}
+[data-product="muse"] main pre {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+/* Muse edition body type: Instrument Sans pairs with the Instrument Serif titles. */
+/* Muse edition: fixed pixel sizes read tiny on very wide windows, so scale the whole
+   interface up on large screens. */
+/* Embedded frames (page previews) size themselves from their own
+   viewport, so they cancel the zoom and render 1:1; percentage sizes keep their boxes. */
+@media (min-width: 1600px) {
+  [data-product="muse"] #root {
+    zoom: 1.1;
+  }
+  [data-product="muse"] #root iframe {
+    zoom: calc(1 / 1.1);
+  }
+}
+@media (min-width: 1900px) {
+  [data-product="muse"] #root {
+    zoom: 1.2;
+  }
+  [data-product="muse"] #root iframe {
+    zoom: calc(1 / 1.2);
+  }
+}
+
+/* Muse edition type: the system font first (SF Pro on Apple devices), Instrument Sans where
+   there is no system San Francisco. */
+[data-product="muse"] body,
+[data-product="muse"] #root {
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Instrument Sans Variable", "Geist Variable",
+    ui-sans-serif, system-ui, sans-serif;
+  letter-spacing: -0.08px;
+  -webkit-font-smoothing: antialiased;
+}
+
+.sc-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.sc-scroll {
+  scrollbar-color: var(--scrollbar) transparent;
+  scrollbar-width: thin;
+}
+.sc-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.sc-scroll::-webkit-scrollbar-thumb {
+  background: var(--scrollbar);
+  border-radius: 3px;
+}
+.sc-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-hover);
+}
+
+.app-drag {
+  -webkit-app-region: drag;
+  user-select: none;
+}
+
+.app-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* A message brought into view on purpose (a version's "from your message", a search hit):
+   one soft wash that fades, so the eye lands on it. */
+@keyframes sc-message-flash {
+  from {
+    background-color: var(--accent);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+.sc-message-flash {
+  border-radius: 18px;
+  animation: sc-message-flash 1.6s ease-out 1;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sc-message-flash {
+    animation: none;
+  }
+}
+
+@keyframes rkPulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+/* Muse: the transcript fades out under the top edge once scrolled, like a
+   reading view. The mask only uses alpha, so it follows both themes. */
+[data-product="muse"] [data-fade-top][data-scrolled="true"] {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 88px);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 88px);
+}
+
+/* Muse glass shell (the old design notes "Background wash"): the shell root paints the
+   ground with one soft radial wash; the rail, chat and context panels float above it as
+   translucent `panel` surfaces. A plain gradient, not a blur filter, so it paints once. */
+[data-product="muse"] .muse-wash {
+  background-color: var(--window);
+}
+
+/* Superchat's Mac window (the old design notes "Window"): the content is one rounded window on
+   the window ground; the sidebar and inspector float inside it as glass panels inset 8px. */
+[data-product="muse"] {
+  --superchat-window-shadow: 0 10px 30px rgb(0 0 0 / 0.08), 0 0 0 0.5px rgb(0 0 0 / 0.1);
+  --superchat-lift: 0 1px 3px rgb(0 0 0 / 0.06);
+}
+[data-product="muse"][data-theme="dark"] {
+  --superchat-window-shadow: 0 10px 30px rgb(0 0 0 / 0.5), 0 0 0 0.5px rgb(255 255 255 / 0.08);
+  --superchat-lift: 0 1px 3px rgb(0 0 0 / 0.4);
+}
+/* Superchat's surfaces live in the components layer, so a utility on the same element still wins. */
+@layer components {
+  .superchat-window {
+    background-color: var(--content);
+  }
+  @media (min-width: 768px) {
+    .superchat-window {
+      border-radius: 22px;
+      box-shadow: var(--superchat-window-shadow);
+    }
+  }
+  .superchat-glass {
+    background-color: var(--glass);
+    -webkit-backdrop-filter: blur(30px) saturate(1.8);
+    backdrop-filter: blur(30px) saturate(1.8);
+    box-shadow: inset 0 0 0 0.5px var(--glass-line);
+  }
+  @media (min-width: 768px) {
+    .superchat-glass {
+      border-radius: 18px;
+    }
+  }
+  /* superchat: the dock and the home panels float as glass on the slate ground. */
+  .sc-glass {
+    background-color: var(--glass);
+    -webkit-backdrop-filter: blur(14px);
+    backdrop-filter: blur(14px);
+    border: 1px solid var(--glass-line);
+  }
+  /* Activity inside a superchat glass card: flat rows, no inner group box. */
+  .sc-activity .superchat-group {
+    background-color: transparent;
+    box-shadow: none;
+    border-radius: 0;
+    overflow: visible;
+  }
+  .sc-activity .superchat-group > .superchat-row + .superchat-row::before {
+    background: var(--glass-line);
+    inset-inline: 56px 8px;
+  }
+  .sc-activity .superchat-row {
+    border-radius: 14px;
+  }
+  /* superchat: the person's messages sit in a soft slate panel, not a colored pill. */
+  .sc-user-bubble {
+    background-color: color-mix(in oklab, var(--tint-ink) 16%, var(--glass));
+    box-shadow: inset 0 0 0 1px var(--glass-line);
+  }
+  /* superchat: the composer, a two-row glass box (text on top, controls below). */
+  .sc-composer {
+    background-color: var(--glass);
+    box-shadow: inset 0 0 0 1px var(--glass-line);
+  }
+  .sc-composer:focus-within {
+    box-shadow: inset 0 0 0 1px var(--ring);
+  }
+  /* The dim behind a dock sheet. */
+  [data-slot="dialog-overlay"]:has(+ .sc-sheet) {
+    background-color: color-mix(in srgb, var(--window) 55%, transparent);
+    -webkit-backdrop-filter: blur(5px);
+    backdrop-filter: blur(5px);
+  }
+  /* A small glass pill (the toolbar's button group). */
+  .superchat-glass-pill {
+    background-color: var(--glass);
+    -webkit-backdrop-filter: blur(20px);
+    backdrop-filter: blur(20px);
+    box-shadow:
+      inset 0 0 0 0.5px var(--glass-line),
+      var(--superchat-lift);
+  }
+  /* iOS inset grouped list: one rounded card, rows split by inset hairlines. */
+  .superchat-group {
+    background-color: var(--group);
+    border-radius: 16px;
+    box-shadow: inset 0 0 0 0.5px var(--separator);
+    overflow: hidden;
+  }
+  .superchat-group > .superchat-row + .superchat-row::before {
+    content: "";
+    position: absolute;
+    inset-inline: 52px 0;
+    top: 0;
+    height: 0.5px;
+    background: var(--separator);
+  }
+  .superchat-row {
+    position: relative;
+  }
+  /* A row without a tile: its separator starts at the text. */
+  .superchat-group > .superchat-row-plain + .superchat-row::before,
+  .superchat-group > .superchat-row + .superchat-row-plain::before {
+    inset-inline-start: 12px;
+  }
+  /* A card (Goals, Waiting decisions, Library tiles): 18px, the group fill, a hairline. */
+  .superchat-card {
+    background-color: var(--group);
+    border-radius: 18px;
+    box-shadow:
+      inset 0 0 0 0.5px var(--separator),
+      0 1px 3px rgb(0 0 0 / 0.04);
+  }
+  /* The Feed's media tiles take a tone: warm, pink or green instead of the blue glow. */
+  .superchat-media[data-tone="warm"] {
+    background-image: radial-gradient(
+      120% 120% at 80% 110%,
+      var(--media-warm-glow) 0%,
+      var(--media-warm-deep) 45%,
+      var(--media) 85%
+    );
+  }
+  .superchat-media[data-tone="pink"] {
+    background-image: radial-gradient(
+      120% 120% at 80% 110%,
+      var(--media-pink-glow) 0%,
+      var(--media-pink-deep) 50%,
+      var(--media) 85%
+    );
+  }
+  .superchat-media[data-tone="green"] {
+    background-image: radial-gradient(
+      120% 120% at 80% 110%,
+      var(--media-green-glow) 0%,
+      var(--media-green-deep) 50%,
+      var(--media) 85%
+    );
+  }
+
+  /* The Ask field (the composer): a rounded 24px field on the group surface, a hairline and a
+     soft drop; focus adds a quiet accent halo. */
+  .superchat-ask {
+    box-shadow:
+      inset 0 0 0 0.5px var(--separator),
+      0 6px 20px rgb(0 0 0 / 0.06);
+  }
+  .superchat-ask:focus-within {
+    box-shadow:
+      inset 0 0 0 0.5px var(--separator),
+      0 0 0 4px color-mix(in srgb, var(--tint) 25%, transparent),
+      0 6px 20px rgb(0 0 0 / 0.06);
+  }
+
+  /* A colored app tile: an Apple-style rounded square with a soft top-to-bottom gradient. */
+  .superchat-tile {
+    display: grid;
+    place-items: center;
+    flex: none;
+    color: #fff;
+    border-radius: 30%;
+    box-shadow: inset 0 0 0 0.5px rgb(0 0 0 / 0.06);
+  }
+  .superchat-tile > svg {
+    width: 60%;
+    height: 60%;
+  }
+  .superchat-tile[data-tone="blue"] {
+    background-image: linear-gradient(var(--tile-blue-from), var(--tile-blue-to));
+  }
+  .superchat-tile[data-tone="green"] {
+    background-image: linear-gradient(var(--tile-green-from), var(--tile-green-to));
+  }
+  .superchat-tile[data-tone="yellow"] {
+    background-image: linear-gradient(var(--tile-yellow-from), var(--tile-yellow-to));
+  }
+  .superchat-tile[data-tone="orange"] {
+    background-image: linear-gradient(var(--tile-orange-from), var(--tile-orange-to));
+  }
+  .superchat-tile[data-tone="purple"] {
+    background-image: linear-gradient(var(--tile-purple-from), var(--tile-purple-to));
+  }
+  .superchat-tile[data-tone="red"] {
+    background-image: linear-gradient(var(--tile-red-from), var(--tile-red-to));
+  }
+  .superchat-tile[data-tone="indigo"] {
+    background-image: linear-gradient(var(--tile-indigo-from), var(--tile-indigo-to));
+  }
+  .superchat-tile[data-tone="teal"] {
+    background-image: linear-gradient(var(--tile-teal-from), var(--tile-teal-to));
+  }
+  .superchat-tile[data-tone="gray"] {
+    background-image: linear-gradient(var(--tile-gray-from), var(--tile-gray-to));
+  }
+
+  /* The result tile (Conversation): a dark card with a deep blue glow from the bottom right. */
+  .superchat-media {
+    background-color: var(--media);
+    background-image: radial-gradient(
+      120% 120% at 85% 110%,
+      var(--media-glow) 0%,
+      var(--media-deep) 45%,
+      var(--media) 80%
+    );
+  }
+  .superchat-media-bar {
+    background-image: linear-gradient(var(--media-bar), var(--media-bar-2));
+    box-shadow: inset 0 0 0 0.5px rgb(255 255 255 / 0.08);
+  }
+  .superchat-media-key {
+    background-image: linear-gradient(
+      var(--media-key-from),
+      var(--tile-blue-to) 60%,
+      var(--media-key-to)
+    );
+    box-shadow: 0 0 40px color-mix(in srgb, var(--tile-blue-to) 55%, transparent);
+  }
+
+  /* Superchat's orb before its first frame, and where WebGL is unavailable: a still sphere in the
+     shader's own colors (components/ai/orb/shader.ts), filling the same 90% circle. */
+  .superchat-orb {
+    background: radial-gradient(
+      circle closest-side,
+      rgb(16 17 28) 0%,
+      rgb(13 14 26) 52%,
+      rgb(66 92 210) 74%,
+      rgb(150 110 240) 84%,
+      rgb(240 110 190) 89%,
+      transparent 91%
+    );
+  }
+  .superchat-orb[data-orb-state="working"][data-orb-fallback] {
+    filter: brightness(1.25) saturate(1.2);
+  }
+  .superchat-orb:has(canvas) {
+    background: none;
+  }
+}
+
+/* Superchat's switches are iOS toggles: 44×26, green when on, a white knob with a soft shadow.
+   Unlayered, so it outranks the shadcn switch's utilities. */
+[data-product="muse"] [data-slot="switch"][data-size="default"] {
+  width: 44px;
+  height: 26px;
+  border: 0;
+  padding: 2px;
+}
+[data-product="muse"] [data-slot="switch"][data-checked] {
+  background-color: var(--ok);
+}
+[data-product="muse"] [data-slot="switch"][data-unchecked] {
+  background-color: var(--selection);
+}
+[data-product="muse"] [data-slot="switch"][data-size="default"] [data-slot="switch-thumb"] {
+  width: 22px;
+  height: 22px;
+  background-color: #fff;
+  box-shadow: 0 2px 4px rgb(0 0 0 / 0.2);
+}
+[data-product="muse"]
+  [data-slot="switch"][data-size="default"]
+  [data-slot="switch-thumb"][data-checked] {
+  translate: 18px 0;
+}
+
+/* The orb's flight from the start page to its home (components/ai/orb/flight.ts): the orb and
+   the composer move as one object each on an Apple-like spring; the rest crossfades. */
+::view-transition-group(superchat-orb),
+::view-transition-group(superchat-composer) {
+  animation-duration: 600ms;
+  animation-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
+}
+::view-transition-old(superchat-orb),
+::view-transition-new(superchat-orb) {
+  animation-duration: 600ms;
+  height: 100%;
+}
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 300ms;
+}
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation: none;
+  }
+}
+
+/* Keyboard focus everywhere in Superchat: the accent at 50%. */
+[data-product="muse"] :focus-visible {
+  outline-color: var(--ring);
+}
+
+/* Reduced motion: unlayered, so it outranks Tailwind's layered animation and transition
+   utilities without !important. */
+@media (prefers-reduced-motion: reduce) {
+  [data-product="muse"] *,
+  [data-product="muse"] *::before,
+  [data-product="muse"] *::after {
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+    transition-duration: 0.01ms;
+  }
+}
+
+/* Muse replies (MessageView.tsx `muse-reply`): one reading rhythm for Superchat's markdown.
+   Headings stay at the body size and lean on weight; lists breathe; code sits on the
+   bubble surface in Geist Mono. */
+.muse-reply .sc-chat-markdown p,
+.muse-reply .sc-chat-markdown ul,
+.muse-reply .sc-chat-markdown ol,
+.muse-reply .sc-chat-markdown blockquote,
+.muse-reply .sc-chat-markdown table,
+.muse-reply .sc-chat-markdown-pre-wrap {
+  margin: 0.75em 0;
+}
+.muse-reply .sc-chat-markdown h1,
+.muse-reply .sc-chat-markdown h2,
+.muse-reply .sc-chat-markdown h3,
+.muse-reply .sc-chat-markdown h4,
+.muse-reply .sc-chat-markdown h5,
+.muse-reply .sc-chat-markdown h6 {
+  margin: 1.35em 0 0.4em;
+  font-size: 15.5px;
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: -0.005em;
+}
+.muse-reply .sc-chat-markdown ul,
+.muse-reply .sc-chat-markdown ol {
+  padding-left: 1.35em;
+}
+.muse-reply .sc-chat-markdown li + li {
+  margin-top: 0.4em;
+}
+.muse-reply .sc-chat-markdown li::marker {
+  color: var(--ink-3);
+}
+.muse-reply .sc-chat-markdown ol > li::marker {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+}
+.muse-reply .sc-chat-markdown strong {
+  font-weight: 600;
+}
+.muse-reply .sc-chat-markdown blockquote {
+  border-left: 2px solid var(--line);
+  padding-left: 14px;
+  color: var(--ink-2);
+}
+.muse-reply .sc-chat-markdown hr {
+  margin: 1.25em 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+.muse-reply .sc-chat-markdown code {
+  border: 0;
+  border-radius: 6px;
+  background: var(--bubble);
+  padding: 0.12em 0.36em;
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+.muse-reply .sc-chat-markdown pre {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bubble);
+  padding: 12px 14px;
+}
+.muse-reply .sc-chat-markdown pre code {
+  padding: 0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+/* The deck editor's inspector settles in from the edge it floats at. */
+@keyframes deck-inspector-in {
+  from {
+    opacity: 0;
+    transform: translateX(8px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* The ask box: a message box with a thin lit edge in the brand blue. Calm at rest, a touch
+   brighter on focus; while superchat works a soft highlight travels slowly around the edge. */
+@property --sc-ask-sweep {
+  syntax: "<angle>";
+  inherits: false;
+  initial-value: 0deg;
+}
+@keyframes sc-ask-travel {
+  to {
+    --sc-ask-sweep: 360deg;
+  }
+}
+.sc-ask {
+  border-radius: 17px;
+  padding: 1px;
+  background: color-mix(in srgb, var(--tint) 55%, transparent);
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--tint) 6%, transparent),
+    0 0 12px color-mix(in srgb, var(--tint) 14%, transparent);
+  transition:
+    box-shadow 160ms ease,
+    background-color 160ms ease;
+}
+.sc-ask:focus-within {
+  background: color-mix(in srgb, var(--tint) 75%, transparent);
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--tint) 9%, transparent),
+    0 0 14px color-mix(in srgb, var(--tint) 20%, transparent);
+}
+.sc-ask[data-state="editing"] {
+  background: conic-gradient(
+    from var(--sc-ask-sweep),
+    color-mix(in srgb, var(--tint) 22%, transparent) 0deg,
+    color-mix(in srgb, var(--tint) 22%, transparent) 240deg,
+    color-mix(in srgb, var(--tint) 65%, transparent) 320deg,
+    color-mix(in srgb, var(--tint) 22%, transparent) 360deg
+  );
+  box-shadow: 0 0 12px color-mix(in srgb, var(--tint) 12%, transparent);
+  animation: sc-ask-travel 6s linear infinite;
+}
+.sc-ask[data-state="updated"] {
+  background: color-mix(in srgb, var(--tint) 35%, transparent);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--tint) 8%, transparent);
+}
+.sc-ask > .sc-ask-body {
+  border-radius: 16px;
+  background-color: var(--popover);
+}
+@media (prefers-reduced-motion: reduce) {
+  .sc-ask[data-state="editing"] {
+    animation: none;
+    background: color-mix(in srgb, var(--tint) 45%, transparent);
+  }
+}
+
+/* Running work is lit (ADR 0023): the work strip under a reply (features/activity/WorkStrip.tsx)
+   and the "Working" pill in the conversation header. A slow conic edge in the tint family turns
+   while the turn or a Helper runs, with a soft blurred glow behind it; settled, the edge is a
+   hairline. Reduced motion keeps the lit edge, still. */
+@property --sc-work-angle {
+  syntax: "<angle>";
+  inherits: false;
+  initial-value: 0deg;
+}
+@keyframes sc-work-spin {
+  to {
+    --sc-work-angle: 360deg;
+  }
+}
+.sc-work {
+  position: relative;
+  isolation: isolate;
+  border-radius: 14px;
+  padding: 1.5px;
+}
+.sc-work::before,
+.sc-work::after {
+  content: "";
+  position: absolute;
+  pointer-events: none;
+}
+.sc-work::before {
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  background: var(--separator);
+}
+.sc-work[data-live]::before {
+  background: conic-gradient(
+    from var(--sc-work-angle),
+    color-mix(in srgb, var(--tint) 18%, transparent) 0 40%,
+    var(--tint) 62%,
+    var(--tint-2) 72%,
+    var(--tint-3) 80%,
+    color-mix(in srgb, var(--tint) 18%, transparent) 92%
+  );
+  animation: sc-work-spin 4s linear infinite;
+}
+.sc-work[data-live]::after {
+  inset: -6px;
+  z-index: -2;
+  border-radius: 18px;
+  background: conic-gradient(
+    from var(--sc-work-angle),
+    transparent 0 50%,
+    var(--tint) 66%,
+    var(--tint-2) 76%,
+    transparent 90%
+  );
+  filter: blur(14px);
+  opacity: 0.45;
+  animation: sc-work-spin 4s linear infinite;
+}
+/* Around a canvas a studio turn is changing: the canvas's corners, a firmer edge. */
+.sc-live-ring[data-shape="canvas"] {
+  border-radius: 14px;
+  padding: 1.5px;
+}
+.sc-live-ring {
+  position: absolute;
+  inset: -1px;
+  border-radius: 999px;
+  padding: 1px;
+  pointer-events: none;
+  background: conic-gradient(
+    from var(--sc-work-angle),
+    transparent 0 55%,
+    var(--tint) 70%,
+    var(--tint-2) 80%,
+    transparent 92%
+  );
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: sc-work-spin 3s linear infinite;
+}
+/* A settled strip's mark: the orb gone still and grey. */
+.sc-work-still {
+  background:
+    radial-gradient(circle at 34% 30%, rgb(255 255 255 / 0.9) 0 8%, transparent 30%),
+    conic-gradient(var(--ink-3), var(--ink-2), var(--ink-3));
+  opacity: 0.8;
+}
+/* A plan step the newest render added: it slides in on a tint wash; its tag fades late. */
+@keyframes sc-work-added {
+  from {
+    opacity: 0;
+    transform: translateX(-10px);
+    background: color-mix(in srgb, var(--tint) 18%, transparent);
+  }
+  60% {
+    background: color-mix(in srgb, var(--tint) 10%, transparent);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+    background: transparent;
+  }
+}
+@keyframes sc-work-fade-late {
+  0%,
+  75% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+@keyframes sc-work-in {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes sc-work-pop {
+  0% {
+    transform: scale(0.3);
+  }
+  70% {
+    transform: scale(1.15);
+  }
+}
+@keyframes sc-work-wait {
+  to {
+    background-position: -200% 0;
+  }
+}
+.sc-work-added {
+  animation: sc-work-added 0.7s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.sc-work-tag {
+  animation: sc-work-fade-late 3.5s forwards;
+}
+.sc-work-in {
+  animation: sc-work-in 0.25s ease-out;
+}
+.sc-work-pop {
+  animation: sc-work-pop 0.35s ease-out;
+}
+@keyframes sc-work-slide {
+  from {
+    opacity: 0;
+    transform: translateX(-10px);
+  }
+}
+.sc-work-flag {
+  animation: sc-work-slide 0.5s ease-out;
+}
+.sc-work-thumb[data-updating] {
+  border-color: var(--tint);
+  background:
+    linear-gradient(90deg, var(--bubble) 25%, var(--content) 50%, var(--bubble) 75%) 0 0 / 200% 100%;
+  animation: sc-work-wait 1.2s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sc-work[data-live]::before,
+  .sc-work[data-live]::after,
+  .sc-live-ring,
+  .sc-work-thumb[data-updating],
+  .sc-work-tag,
+  .sc-work-added,
+  .sc-work-flag,
+  .sc-work-in,
+  .sc-work-pop {
+    /* The edge stays, still. Without the fade the tag stays until the next render of the plan. */
+    animation: none;
+  }
+}
+
+/* Home's topics (ADR 0035, amended "Home tiles, status and tags"): one feature tile for what
+   needs the person, then a tile per topic, each washed in its own two hues (`--h1`, `--h2`, set
+   from the topic's key). The wash's lightness and saturation are the theme's; the vars sit on
+   the tile so a tile flown out of the row (a pick) keeps its colour. */
+.sc-tile {
+  --wash-l: 88%;
+  --wash-s: 78%;
+  --tile-btn: #1d1d1f;
+  --tile-btn-ink: #fff;
+  --tile-glow: rgb(255 255 255 / 0.55);
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+[data-theme="dark"] .sc-tile {
+  --wash-l: 30%;
+  --wash-s: 45%;
+  --tile-btn: #eef1f4;
+  --tile-btn-ink: #1d242c;
+  --tile-glow: rgb(255 255 255 / 0.09);
+}
+.sc-tile:focus-visible,
+.sc-tile-btn:focus-visible {
+  outline: 2px solid var(--tint);
+  outline-offset: 4px;
+  border-radius: 20px;
+}
+.sc-tile-btn:focus-visible {
+  border-radius: 999px;
+  outline-offset: 2px;
+}
+.sc-wash {
+  position: relative;
+  display: block;
+  height: 168px;
+  border-radius: 20px;
+  overflow: hidden;
+  background:
+    radial-gradient(
+      120% 90% at 15% 10%,
+      hsl(var(--h1) var(--wash-s) calc(var(--wash-l) + 4%)),
+      transparent 60%
+    ),
+    radial-gradient(
+      110% 100% at 90% 95%,
+      hsl(var(--h2) var(--wash-s) calc(var(--wash-l) - 8%)),
+      transparent 65%
+    ),
+    hsl(var(--h1) calc(var(--wash-s) - 20%) var(--wash-l));
+  transition:
+    transform 0.5s cubic-bezier(0.2, 0.8, 0.2, 1),
+    filter 0.5s;
+}
+.sc-tile:hover .sc-wash,
+.sc-tile:focus-visible .sc-wash {
+  transform: translateY(-4px);
+  filter: saturate(1.15);
+}
+.sc-tile-title {
+  font-size: 17px;
+  line-height: 1.25;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  text-wrap: balance;
+}
+.sc-tile-status {
+  /* Written short at the source; two lines at most, an ellipsis only as a last resort. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  font-size: 14px;
+  line-height: 1.35;
+  font-weight: 500;
+  color: var(--foreground);
+}
+.sc-tile-status.sc-needs-you::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin: 0 7px 1px 0;
+  border-radius: 50%;
+  background: var(--warn);
+}
+.sc-tile-tag {
+  position: absolute;
+  top: 12px;
+  inset-inline-start: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: calc(100% - 24px);
+  padding: 6px 10px 6px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--solid) 72%, transparent);
+  color: var(--foreground);
+  font-size: 12px;
+  line-height: 1;
+  font-weight: 600;
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+}
+.sc-tile-tag i {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: hsl(var(--h1) 70% 50%);
+}
+.sc-tile-tag-sm {
+  position: static;
+  flex: none;
+  background: hsl(var(--h1) 70% 50% / 0.12);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+.sc-tile.sc-feature {
+  min-height: 240px;
+  justify-content: flex-end;
+  border-radius: 24px;
+  overflow: hidden;
+}
+.sc-tile.sc-feature > .sc-wash {
+  position: absolute;
+  inset: 0;
+  height: auto;
+  border-radius: 24px;
+}
+.sc-tile.sc-feature:hover > .sc-wash {
+  transform: scale(1.02);
+}
+.sc-glow {
+  position: absolute;
+  top: -60px;
+  right: -60px;
+  width: 260px;
+  height: 260px;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--tile-glow), transparent 65%);
+  pointer-events: none;
+}
+.sc-feature-body {
+  position: relative;
+  display: grid;
+  gap: 8px;
+  padding: 22px 24px;
+}
+.sc-feature-body > .sc-tile-tag {
+  position: static;
+  justify-self: start;
+}
+.sc-feature-title {
+  font-size: clamp(24px, 2.6vw, 30px);
+  line-height: 1.1;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  text-wrap: balance;
+}
+.sc-feature-text {
+  max-width: 44ch;
+  font-size: 15px;
+  line-height: 1.45;
+  color: color-mix(in srgb, var(--foreground) 82%, transparent);
+}
+.sc-feature-text b {
+  font-weight: 600;
+  color: var(--foreground);
+}
+.sc-tile-btn {
+  padding: 10px 16px;
+  border-radius: 999px;
+  font-size: 13.5px;
+  line-height: 1;
+  font-weight: 600;
+  transition: transform 0.2s;
+}
+.sc-tile-btn:active {
+  transform: scale(0.97);
+}
+.sc-tile-btn-solid {
+  background: var(--tile-btn);
+  color: var(--tile-btn-ink);
+}
+.sc-tile-btn-ghost {
+  background: color-mix(in srgb, var(--solid) 70%, transparent);
+  color: var(--foreground);
+}
+/* Rows of four that always fill: a short last row stretches instead of leaving a gap. With a
+   feature, the first row is the feature and three tiles on five units (2fr 1fr 1fr 1fr). */
+.sc-tiles {
+  --gap: 16px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap);
+}
+.sc-tiles > .sc-tile {
+  flex: 1 1 calc((100% - 3 * var(--gap)) / 4);
+}
+.sc-tiles > .sc-tile.sc-tile-first {
+  flex: 1 1 calc((100% - 4 * var(--gap)) / 5);
+}
+.sc-tiles > .sc-tile.sc-feature {
+  flex: 2 1 calc((100% - 4 * var(--gap)) * 2 / 5 + var(--gap));
+}
+@media (max-width: 1080px) {
+  .sc-tiles > .sc-tile,
+  .sc-tiles > .sc-tile.sc-tile-first {
+    flex-basis: calc((100% - var(--gap)) / 2);
+  }
+  .sc-tiles > .sc-tile.sc-feature {
+    flex-basis: 100%;
+  }
+}
+@media (max-width: 560px) {
+  .sc-tiles > .sc-tile,
+  .sc-tiles > .sc-tile.sc-tile-first {
+    flex-basis: 100%;
+  }
+}
+/* The morning brief's panel under the tiles (ADR 0037, amended). */
+.sc-morning li b {
+  font-weight: 600;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sc-wash,
+  .sc-tile:hover .sc-wash,
+  .sc-tile:focus-visible .sc-wash,
+  .sc-tile.sc-feature:hover > .sc-wash,
+  .sc-tile-btn {
+    transition: none;
+    transform: none;
+  }
+}

@@ -1,0 +1,54 @@
+diff --git a/dist/aiden0z-pptx-renderer.es.js b/dist/aiden0z-pptx-renderer.es.js
+index 6de7e508a1674c2ff54cb7ea1341e474a9fc7497..03eaaf7de21b6cf9973682a5bd3186e960ac7d7d 100644
+--- a/dist/aiden0z-pptx-renderer.es.js
++++ b/dist/aiden0z-pptx-renderer.es.js
+@@ -19739,7 +19739,12 @@ function I$(t, e, n, i) {
+       h,
+       u,
+       _,
+-      n.map((K) => K.name),
++      S && n.length === 1
++        ? superchatPointLegend(c, (_name, index) => {
++            const point = A[0].data[index];
++            return point && typeof point === "object" && point.itemStyle?.color || v[index % v.length];
++          })
++        : n.map((K) => K.name),
+       f
+     ),
+     grid: {
+@@ -19879,6 +19884,23 @@ function Ka(t, e, n, i, o, r) {
+     series: b
+   };
+ }
++/* Superchat patch (pptx-renderer 1.3.0, legend swatch colours). The custom legend takes a swatch colour
++   from the legend entry, else from the series at the same position, else from the theme palette.
++   A pie/doughnut legend lists categories, and a varyColors bar chart's legend does too, but their
++   colours live on the data points (c:dPt), so the swatches showed palette colours instead of the
++   slice/bar colours. Entries now carry the colour of the point they stand for. */
++function superchatPointLegend(names, colorOf) {
++  return names.map((name, index) => {
++    const color = colorOf(name, index);
++    return typeof color === "string" ? { name, itemStyle: { color } } : name;
++  });
++}
++function superchatSliceColor(seriesList, name) {
++  for (const series of seriesList)
++    for (const point of series.data ?? [])
++      if (point && point.name === name && typeof point.itemStyle?.color === "string")
++        return point.itemStyle.color;
++}
+ function Qa(t, e, n, i, o) {
+   const r = pi(e, n, o, 12), s = ui(e, o), l = s == null ? void 0 : s.option, a = { fontSize: 10, ...(s == null ? void 0 : s.textStyle) ?? {} }, c = i ? n : n.slice(0, 1);
+   if (c.length === 0)
+@@ -19946,7 +19968,7 @@ function Qa(t, e, n, i, o) {
+         )
+       } : {}
+     },
+-    legend: fi(l, s, $, S, a),
++    legend: fi(l, s, $, superchatPointLegend(S, (name) => superchatSliceColor(g, name)), a),
+     series: g
+   };
+ }
+diff --git a/scripts/ooxml-geometry/README.md b/scripts/ooxml-geometry/README.md
+deleted file mode 100644
+index 65147000db94358b2b0a782b8d3bebb010835fc5..0000000000000000000000000000000000000000

@@ -1,0 +1,32 @@
+<!-- Portions modified from nexu-io/open-design design-templates/html-ppt/templates/single-page/chart-radar.html@802708f,
+     MIT (Copyright (c) 2026 lewis, see design-templates/html-ppt/LICENSE; the repository is Apache-2.0).
+     Changes: the <section> alone (Superchat supplies the deck around it); Superchat layout classes and data-superchat-id
+     on every element; a caption that cites the data source; a unique canvas id per slide; the colors are
+     read from the canvas' own CSS tokens (--accent, --accent-2, --accent-3, --muted, --line) so a slide
+     surface can recolor them; the chart is in a fixed-height container (data-report skill rule); the
+     script carries data-superchat-chart. The Chart.js options are otherwise as in the template. -->
+<section class="slide t-a l-chart" data-screen-label="07 Tool comparison" data-superchat-id="tools-radar">
+  <div class="kicker" data-superchat-id="tools-radar-kicker">Chart · radar</div>
+  <h2 class="title" data-superchat-id="tools-radar-title">Our tool against the alternative</h2>
+  <div class="chart" data-superchat-id="tools-radar-chart"><canvas id="tools-radar-canvas" data-superchat-id="tools-radar-canvas"></canvas></div>
+  <p class="source" data-superchat-id="tools-radar-source">Source: survey/scores.csv, mean score per criterion</p>
+  <script data-superchat-chart>
+    addEventListener('DOMContentLoaded',()=>{
+      const canvas=document.getElementById('tools-radar-canvas');
+      const css=getComputedStyle(canvas);
+      const a1=css.getPropertyValue('--accent').trim();
+      const a2=css.getPropertyValue('--accent-2').trim();
+      const text2=css.getPropertyValue('--muted').trim();
+      new Chart(canvas,{type:'radar',
+        data:{labels:['Ease','Looks','Custom','Speed','Export','Ecosystem'],
+          datasets:[
+            {label:'Ours',data:[9,9,10,10,9,6],borderColor:a1,backgroundColor:a1+'33',borderWidth:3,pointRadius:5},
+            {label:'Alternative',data:[8,7,9,8,8,10],borderColor:a2,backgroundColor:a2+'22',borderWidth:3,pointRadius:5}]},
+        options:{responsive:true,maintainAspectRatio:false,
+          plugins:{legend:{labels:{color:text2}}},
+          scales:{r:{suggestedMin:0,suggestedMax:10,ticks:{color:text2,backdropColor:'transparent'},
+                     pointLabels:{color:text2,font:{size:14}},grid:{color:'rgba(0,0,0,.08)'},angleLines:{color:'rgba(0,0,0,.08)'}}}}});
+    });
+  </script>
+  <div class="foot" data-superchat-id="tools-radar-foot"><span data-superchat-id="tools-radar-foot-left">Deck name</span><span data-superchat-id="tools-radar-foot-page">04</span></div>
+</section>

@@ -1,0 +1,365 @@
+"""Tests for the embedded-browser (``browser_*``) tool surface.
+
+Covers the runner-side half of the feature:
+
+- ``_execute_browser_tool``: the blocking ``server_client.post`` to the
+  server ``/browser/action_request`` route — correct URL / ``action`` /
+  ``args`` payload, verbatim JSON passthrough, and the clean timeout
+  error on ``httpx.ReadTimeout``.
+- Registration in ``omnigent.tools.builtins``: the five ``browser_*``
+  names are always registered.
+- Native-relay exposure: ``build_native_relay_tool_schemas`` surfaces the
+  five ``browser_*`` schemas when the spec declares them — native
+  harnesses see the relay as their only tool surface, so a miss here
+  means the feature is dead on the desktop app.
+"""
+
+from __future__ import annotations
+
+import json
+
+import httpx
+import pytest
+
+import omnigent.tools.builtins as builtins_mod
+from omnigent.runner.tool_dispatch import (
+    _BROWSER_TOOLS,
+    _execute_browser_tool,
+    strip_browser_tool_schemas,
+)
+from omnigent.spec.types import AgentSpec
+
+# ── Helpers ──────────────────────────────────────────────────────
+
+
+class _RecordingResponse:
+    """Minimal httpx response stub with a scripted body."""
+
+    def __init__(self, *, status_code: int = 200, body: dict[str, object] | None = None) -> None:
+        self.status_code = status_code
+        self._body = body if body is not None else {}
+
+    @property
+    def text(self) -> str:
+        """Return the JSON body as text (what the tool returns verbatim)."""
+        return json.dumps(self._body)
+
+
+class _RecordingClient:
+    """httpx.AsyncClient stub that records the POST and returns a script."""
+
+    def __init__(self, response: _RecordingResponse | None = None) -> None:
+        self.calls: list[tuple[str, dict[str, object], object]] = []
+        self._response = response or _RecordingResponse(body={"final_url": "https://x"})
+
+    async def post(
+        self,
+        url: str,
+        *,
+        json: dict[str, object] | None = None,
+        timeout: object = None,
+    ) -> _RecordingResponse:
+        """Record the call and return the scripted response."""
+        self.calls.append((url, json or {}, timeout))
+        return self._response
+
+
+class _TimeoutClient:
+    """httpx.AsyncClient stub whose POST raises ReadTimeout."""
+
+    async def post(self, url: str, **_: object) -> _RecordingResponse:
+        """Raise the read timeout the tool must translate to clean JSON."""
+        raise httpx.ReadTimeout("read timed out")
+
+
+class _ErrorClient:
+    """httpx.AsyncClient stub whose POST raises a generic HTTPError."""
+
+    async def post(self, url: str, **_: object) -> _RecordingResponse:
+        """Raise a connect error the tool must surface as an error string."""
+        raise httpx.ConnectError("connection refused")
+
+
+# ── _execute_browser_tool ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_browser_tool_posts_action_request_with_stripped_prefix() -> None:
+    """
+    The tool POSTs to the action_request route with ``action`` = tool
+    name minus ``browser_`` and forwards ``args`` verbatim.
+    """
+    client = _RecordingClient(_RecordingResponse(body={"final_url": "https://example.com"}))
+    out = await _execute_browser_tool(
+        "browser_navigate",
+        {"url": "https://example.com"},
+        server_client=client,
+        conversation_id="conv_abc",
+    )
+
+    assert len(client.calls) == 1
+    url, body, timeout = client.calls[0]
+    assert url == "/v1/sessions/conv_abc/browser/action_request"
+    assert body == {"action": "navigate", "args": {"url": "https://example.com"}}
+    # read budget MUST exceed the server await (30s) so the runner never
+    # severs the still-open POST first.
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.read == 60.0
+    # Result is the server JSON verbatim.
+    assert json.loads(out) == {"final_url": "https://example.com"}
+
+
+@pytest.mark.asyncio
+async def test_browser_tool_strips_prefix_for_every_action() -> None:
+    """Each of the five tools maps to the correct wire ``action``."""
+    expected = {
+        "browser_navigate": "navigate",
+        "browser_snapshot": "snapshot",
+        "browser_click": "click",
+        "browser_type": "type",
+        "browser_screenshot": "screenshot",
+    }
+    for tool_name, action in expected.items():
+        client = _RecordingClient()
+        await _execute_browser_tool(tool_name, {}, server_client=client, conversation_id="conv_x")
+        assert client.calls[0][1]["action"] == action
+
+
+@pytest.mark.asyncio
+async def test_browser_tool_read_timeout_returns_clean_json() -> None:
+    """
+    A runner-side ``httpx.ReadTimeout`` becomes the clean timeout-error
+    JSON, not an exception — so the LLM sees an actionable tool error.
+    """
+    out = await _execute_browser_tool(
+        "browser_snapshot",
+        {},
+        server_client=_TimeoutClient(),
+        conversation_id="conv_abc",
+    )
+    parsed = json.loads(out)
+    assert "timed out" in parsed["error"]
+    assert "Omnigent desktop app" in parsed["error"]
+
+
+@pytest.mark.asyncio
+async def test_browser_tool_http_error_returns_error_json() -> None:
+    """A generic HTTP error is surfaced as an error JSON, not raised."""
+    out = await _execute_browser_tool(
+        "browser_click",
+        {"ref": 3},
+        server_client=_ErrorClient(),
+        conversation_id="conv_abc",
+    )
+    parsed = json.loads(out)
+    assert "browser_click failed" in parsed["error"]
+
+
+@pytest.mark.asyncio
+async def test_browser_tool_4xx_returns_error_json() -> None:
+    """A >=400 response body is reported as an error string, not raised."""
+    client = _RecordingClient(_RecordingResponse(status_code=403, body={"detail": "nope"}))
+    out = await _execute_browser_tool(
+        "browser_type",
+        {"text": "hi"},
+        server_client=client,
+        conversation_id="conv_abc",
+    )
+    parsed = json.loads(out)
+    assert "browser_type returned 403" in parsed["error"]
+
+
+@pytest.mark.asyncio
+async def test_browser_tool_requires_server_and_session() -> None:
+    """Missing server_client or conversation_id fails loud with JSON."""
+    out_no_client = await _execute_browser_tool(
+        "browser_navigate", {"url": "u"}, server_client=None, conversation_id="conv"
+    )
+    assert "requires server access" in json.loads(out_no_client)["error"]
+
+    out_no_conv = await _execute_browser_tool(
+        "browser_navigate",
+        {"url": "u"},
+        server_client=_RecordingClient(),
+        conversation_id=None,
+    )
+    assert "requires a session id" in json.loads(out_no_conv)["error"]
+
+
+# ── Framework-owned registration (always on, no spec opt-in) ─────
+
+_EXPECTED_BROWSER_NAMES = {
+    "browser_navigate",
+    "browser_snapshot",
+    "browser_click",
+    "browser_type",
+    "browser_screenshot",
+}
+
+
+def test_browser_names_reserved_framework_owned() -> None:
+    """
+    The five ``browser_*`` names are reserved in the builtin registry so
+    user specs can't shadow them, but they are FRAMEWORK-OWNED — like
+    ``list_comments`` / ``update_comment``, they are NOT instantiable via
+    ``get_builtin_tool`` (registration is ToolManager's job). This pins
+    the single source of truth: ToolManager, not the registry factory.
+    """
+    browser = {n for n in builtins_mod.BUILTIN_NAMES if n.startswith("browser_")}
+    assert browser == _EXPECTED_BROWSER_NAMES
+    # Framework-owned → reserved but not user-instantiable.
+    assert not (_EXPECTED_BROWSER_NAMES & set(builtins_mod.INSTANTIABLE_BUILTINS))
+    for name in sorted(browser):
+        assert builtins_mod.get_builtin_tool(name) is None
+
+
+def test_toolmanager_always_registers_browser_tools() -> None:
+    """
+    EVERY session — even a spec with NO ``tools.builtins`` declared — has
+    all five ``browser_*`` tools registered on its ToolManager. This is
+    the invariant the earlier per-spec registration missed (agents fell
+    back to WebFetch because no shipped spec declared browser_*).
+    """
+    from omnigent.tools.manager import ToolManager
+
+    mgr = ToolManager(AgentSpec(spec_version=1))  # empty tools.builtins
+    for name in sorted(_EXPECTED_BROWSER_NAMES):
+        tool = mgr.get_tool(name)
+        assert tool is not None, f"{name} not registered on a bare spec"
+        schema = tool.get_schema()
+        assert schema["function"]["name"] == name
+        assert schema["function"]["description"]
+
+
+# ── Native-relay exposure ────────────────────────────────────────
+
+
+# ── Headless schema stripping ────────────────────────────────────────
+
+
+def test_strip_browser_tool_schemas_drops_nested_and_flat_shapes() -> None:
+    """
+    ``strip_browser_tool_schemas`` removes every ``browser_*`` schema in
+    both supported shapes (nested OpenAI ``{"function": {"name": ...}}``
+    and flat relay ``{"name": ...}``) and keeps everything else. This is
+    the per-turn filter applied to request-driven harnesses when the server
+    says no renderer is subscribed. Native harnesses use a session-scoped
+    relay and therefore retain their browser schemas.
+    """
+    nested_browser = {"type": "function", "function": {"name": "browser_navigate"}}
+    flat_browser = {"name": "browser_snapshot", "description": "", "parameters": {}}
+    nested_other = {"type": "function", "function": {"name": "sys_os_read"}}
+    flat_other = {"name": "load_skill", "description": "", "parameters": {}}
+    malformed = {"type": "function"}
+
+    kept = strip_browser_tool_schemas(
+        [nested_browser, flat_browser, nested_other, flat_other, malformed]
+    )
+    assert kept == [nested_other, flat_other, malformed]
+
+
+def test_strip_browser_tool_schemas_covers_every_browser_name() -> None:
+    """All five ``browser_*`` names are stripped, none survives."""
+    schemas = [{"type": "function", "function": {"name": n}} for n in sorted(_BROWSER_TOOLS)]
+    schemas.append({"type": "function", "function": {"name": "keepme"}})
+    kept = strip_browser_tool_schemas(schemas)
+    assert kept == [{"type": "function", "function": {"name": "keepme"}}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"ok": False, "error": "No browser open", "data_url": "data:image/png;base64,invalid"},
+        {"ok": True, "data_url": "data:image/png;base64,invalid"},
+        {"ok": True, "data_url": "data:image/svg+xml;base64,PHN2Zy8+"},
+        {"ok": True, "data_url": "https://example.com/image.png"},
+        {"ok": True, "data_url": "data:image/png,percent%20encoded"},
+        {"ok": True, "data_url": 123},
+        {"ok": True, "note": "No screenshot supplied"},
+    ],
+)
+async def test_screenshot_invalid_and_error_results_remain_lossless(
+    body: dict[str, object],
+) -> None:
+    response = _RecordingResponse(body=body)
+    output = await _execute_browser_tool(
+        "browser_screenshot",
+        {},
+        server_client=_RecordingClient(response),
+        conversation_id="image-session",
+    )
+    assert output == response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool", ["browser_snapshot", "browser_navigate", "browser_click", "browser_type"]
+)
+async def test_other_browser_results_do_not_interpret_image_shaped_json(tool: str) -> None:
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    response = _RecordingResponse(
+        body={"ok": True, "data_url": f"data:image/png;base64,{_TINY_PNG_BASE64}"}
+    )
+    output = await _execute_browser_tool(
+        tool, {}, server_client=_RecordingClient(response), conversation_id="image-session"
+    )
+    assert output == response.text
+
+
+@pytest.mark.asyncio
+async def test_screenshot_history_cap_keeps_metadata_and_explicit_image_omission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.runtime.tool_output as caps
+    from omnigent.runtime.tool_result_replay import tool_result_content_blocks
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    metadata = {"ok": True, "note": "Required late fact: amber"}
+    response = _RecordingResponse(
+        body={"data_url": f"data:image/png;base64,{_TINY_PNG_BASE64}", **metadata}
+    )
+    output = await _execute_browser_tool(
+        "browser_screenshot",
+        {},
+        server_client=_RecordingClient(response),
+        conversation_id="image-session",
+    )
+    # Force only the persisted mirror over its cap; live delivery stays intact.
+    monkeypatch.setattr(caps, "MAX_TOOL_OUTPUT_BYTES", len(output.encode()) - 1)
+    capped = caps.cap_tool_output(output)
+    assert len(capped.encode()) < len(output.encode())
+    replay = tool_result_content_blocks(capped)
+    assert replay.blocks is not None
+    assert json.loads(replay.blocks[0]["text"]) == metadata
+    assert "omitted" in replay.blocks[1]["text"]
+    assert _TINY_PNG_BASE64 not in capped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    [
+        {"error": "No browser"},
+        {"blocked": True},
+        {"cancelled": True},
+        {"result": {"error": "Nested failure"}},
+    ],
+)
+async def test_screenshot_never_overrides_existing_failure_status(
+    status: dict[str, object],
+) -> None:
+    from omnigent.harnesses.executor import classify_tool_result
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    body = {"ok": True, "data_url": f"data:image/png;base64,{_TINY_PNG_BASE64}", **status}
+    response = _RecordingResponse(body=body)
+    output = await _execute_browser_tool(
+        "browser_screenshot",
+        {},
+        server_client=_RecordingClient(response),
+        conversation_id="image-session",
+    )
+    assert output == response.text
+    assert classify_tool_result(json.loads(output)) == classify_tool_result(body)

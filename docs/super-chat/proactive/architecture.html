@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Proactive Layer Architecture</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+/* Layout: a design doc for engineers. Diagrams sit on a light "paper" panel in both themes (they are drawings); prose, tables and math use the theme tokens. Colour key: green = code, violet = LLM, blue = person-facing, amber = host. */
+:root{
+  --bg:#f4f5f7; --panel:#fff; --ink:#14171b; --ink-2:#5b636d; --line:#dde1e6; --soft:#eef0f3; --paper:#fbfbfa; --paper-ink:#14171b;
+  --code:#16795a; --code-bg:#e1f2ea; --llm:#6d3fc7; --llm-bg:#ece4fa; --you:#1c5bbd; --you-bg:#e2ebf8; --host:#9a5a12; --host-bg:#f7ebdc; --bad:#b03a2a; --bad-bg:#f8e4e0;
+  --sans:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#121519; --panel:#1a1e24; --ink:#e8ebef; --ink-2:#a2abb5; --line:#2c323a; --soft:#20252c; --paper:#f1f1ee; --paper-ink:#14171b;
+  --code:#5fd0a2; --code-bg:#18302a; --llm:#c2a0ff; --llm-bg:#2a2140; --you:#8fb8ff; --you-bg:#1c2a41; --host:#f0b264; --host-bg:#382a19; --bad:#ff9686; --bad-bg:#3b201c; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#121519; --panel:#1a1e24; --ink:#e8ebef; --ink-2:#a2abb5; --line:#2c323a; --soft:#20252c; --paper:#f1f1ee; --paper-ink:#14171b;
+  --code:#5fd0a2; --code-bg:#18302a; --llm:#c2a0ff; --llm-bg:#2a2140; --you:#8fb8ff; --you-bg:#1c2a41; --host:#f0b264; --host-bg:#382a19; --bad:#ff9686; --bad-bg:#3b201c; color-scheme:dark}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font:15px/1.55 var(--sans);padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:40px 80px}
+main{max-width:60rem;margin:0 auto;display:flex;flex-direction:column;gap:52px}
+h1{font-size:32px;line-height:1.15;letter-spacing:-.02em;margin:0;text-wrap:balance}
+h2{font-size:22px;letter-spacing:-.01em;margin:0;text-wrap:balance}
+h3{font-size:15.5px;margin:0}
+p{margin:0;max-width:70ch}
+.kicker{font:500 11.5px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--ink-2);margin-bottom:10px}
+.lede{color:var(--ink-2);font-size:16.5px;margin-top:10px}
+section{display:flex;flex-direction:column;gap:16px}
+.sub{color:var(--ink-2)}
+code,.mono{font-family:var(--mono);font-size:12.5px}
+.key{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
+.t{display:inline-flex;align-items:center;font:500 11.5px/1 var(--mono);border-radius:6px;padding:4px 8px;white-space:nowrap}
+.t-code{background:var(--code-bg);color:var(--code)} .t-llm{background:var(--llm-bg);color:var(--llm)} .t-you{background:var(--you-bg);color:var(--you)} .t-host{background:var(--host-bg);color:var(--host)} .t-bad{background:var(--bad-bg);color:var(--bad)}
+.paper{background:var(--paper);color:var(--paper-ink);border:1px solid var(--line);border-radius:14px;padding:18px;overflow-x:auto}
+.paper pre.mermaid{margin:0;background:transparent;font-family:var(--sans);min-width:44rem}
+.cap{font-size:13px;color:var(--ink-2)}
+.tw{overflow-x:auto;border:1px solid var(--line);border-radius:12px;background:var(--panel)}
+table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:40rem}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-2);font-weight:600;background:var(--soft)}
+tr:last-child td{border-bottom:0}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media (max-width:760px){.grid2{grid-template-columns:1fr}}
+.box{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:8px;min-width:0}
+.box ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px;font-size:14px}
+.alert{background:var(--bad-bg);border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:8px}
+.alert h3{color:var(--bad)}
+.alert ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px;font-size:14px}
+.math{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;font-family:var(--mono);font-size:13px;line-height:1.75;overflow-x:auto;white-space:pre}
+.math b{color:var(--llm);font-weight:600}
+.cells{display:grid;grid-template-columns:7rem repeat(4,minmax(0,1fr));gap:5px;font-size:12px}
+.cells .h{color:var(--ink-2);text-align:center;font-weight:600}
+.cells .r{color:var(--ink-2);display:flex;align-items:center}
+.cells .c{border-radius:7px;padding:8px 4px;text-align:center;font-family:var(--mono);font-size:11.5px;background:var(--soft)}
+.cells .c.y{background:var(--code-bg);color:var(--code);font-weight:600}
+.cells .c.n{background:var(--bad-bg);color:var(--bad);font-weight:600}
+.cells .c.u{background:var(--soft);color:var(--ink-2)}
+.ux{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+@media (max-width:820px){.ux{grid-template-columns:1fr 1fr}}
+@media (max-width:480px){.ux{grid-template-columns:1fr}}
+.ux .box b{font-size:14.5px}
+.ux .box span{font-size:13px;color:var(--ink-2)}
+
+/* hand-built diagrams */
+.sys{display:grid;grid-template-columns:minmax(0,.9fr) auto minmax(0,1.6fr) auto minmax(0,1fr);gap:10px;align-items:stretch}
+.mem{display:grid;grid-template-columns:minmax(0,1.2fr) auto minmax(0,.9fr) auto minmax(0,1.1fr);gap:10px;align-items:stretch}
+@media (max-width:860px){.sys,.mem{grid-template-columns:1fr}.flowarr{transform:rotate(90deg)}}
+.plane,.mcol{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:0}
+.plane.eng{border:1.5px solid var(--code)}
+.plane.hst{border:1.5px solid var(--host)}
+.ph{font:600 11.5px/1.3 var(--mono);letter-spacing:.05em;text-transform:uppercase;color:var(--ink-2);display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.flowarr{align-self:center;justify-self:center;color:var(--ink-2);font-size:20px}
+.pipe{display:flex;flex-direction:column;gap:0}
+.pipe .nd2{margin-bottom:16px;position:relative}
+.pipe .nd2:not(:last-child)::after{content:"↓";position:absolute;left:50%;bottom:-17px;transform:translateX(-50%);color:var(--ink-2);font-size:13px}
+.pipe .nd2:last-child{margin-bottom:0}
+.nd2{border-radius:10px;padding:8px 10px;font-size:13.5px;font-weight:600;border:1px solid var(--line);background:var(--soft);display:flex;flex-direction:column;gap:2px}
+.nd2 small{font-weight:400;color:var(--ink-2);font-size:12px;line-height:1.35}
+.nd2 em{font-style:normal;font-family:var(--mono);font-size:11.5px;font-weight:500;color:var(--ink-2)}
+.nd2 b{font-family:var(--mono);font-size:11px;color:var(--ink-2);margin-right:4px}
+.nd2 .bad{color:var(--bad);font-family:var(--sans);font-size:12px}
+.nd2.code{background:var(--code-bg);border-color:transparent}
+.nd2.llm{background:var(--llm-bg);border-color:transparent}
+.nd2.host{background:var(--host-bg);border-color:transparent}
+.nd2.you{background:var(--you-bg);border-color:transparent}
+.nd2.store{background:var(--panel);border-style:dashed;font-family:var(--mono);font-size:12.5px;font-weight:500}
+.stores{display:flex;flex-wrap:wrap;gap:6px;align-items:center;border-top:1px solid var(--line);padding-top:8px}
+.arrow-note{font-size:12px;color:var(--ink-2)}
+.feedback{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+table.seq{min-width:48rem;font-size:13px}
+table.seq td{text-align:center;vertical-align:middle}
+table.seq td:first-child{font-family:var(--mono);color:var(--ink-2);width:2rem}
+table.seq small{color:var(--ink-2);font-size:11.5px}
+.ev2{display:inline-block;border-radius:8px;padding:4px 9px;font-weight:600;font-size:12.5px}
+.ev2.code{background:var(--code-bg);color:var(--code)} .ev2.llm{background:var(--llm-bg);color:var(--llm)} .ev2.you{background:var(--you-bg);color:var(--you)}
+.arrowcell{color:var(--ink-2);font-size:12px;font-style:italic}
+footer{color:var(--ink-2);font-size:12.5px;border-top:1px solid var(--line);padding-top:14px}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="kicker">Design doc · Super Chat proactive layer · lookout-wave @ 5fd369af9 · 25 Oct 2026</div>
+    <h1>Proactive layer: architecture</h1>
+    <p class="lede">How the assistant decides, unasked, that something deserves the person's attention, and prepares the work. Event-driven, one decision run per wake, memory-aware, read-and-draft only. ADRs 0035–0040.</p>
+    <div class="key"><span class="t t-code">code (deterministic)</span><span class="t t-llm">LLM call</span><span class="t t-host">runs on the person's host</span><span class="t t-you">person-facing</span></div>
+  </header>
+
+  <section>
+    <h2>1 · System overview</h2>
+    <p class="sub">Two planes. The <b>engine</b> (one per deployment, Postgres) owns state, scheduling and every decision. The person's <b>host</b> (a container per person) runs agent loops and holds files and the search index. LLM calls happen in three places only: the Judge (engine, no tools), the wake run (host, with tools), and the background passes that write memory and topics.</p>
+    <div class="sys">
+      <div class="plane src"><div class="ph">Sources <span class="t t-code">code</span></div>
+        <div class="nd2 code">Mail poll<small>10 min in work hours, 60 min else</small></div>
+        <div class="nd2 code">Live page refresh<small>saved version, origin = update</small></div>
+        <div class="nd2 code">Dated promise<small>topic-write listener</small></div>
+      </div>
+      <div class="flowarr" aria-hidden="true">→</div>
+      <div class="plane eng"><div class="ph">Engine · Postgres · one per deployment</div>
+        <div class="pipe">
+          <div class="nd2 code"><b>1</b> Hard filter<small>noise · not to you · answered · mutes · stale</small></div>
+          <div class="nd2 store">lookout_signals</div>
+          <div class="nd2 llm"><b>2</b> Judge<small>batched LLM call, no tools</small></div>
+          <div class="nd2 code"><b>3</b> Rhythm + reach rules<small>timing gate</small></div>
+          <div class="nd2 store">work_jobs queue<small>SKIP LOCKED · 16 global · 3/person</small></div>
+          <div class="nd2 code"><b>5</b> Post result<small>message · outbox · topic · "sent"</small></div>
+        </div>
+        <div class="stores"><span class="nd2 store">memory_claims + profile</span><span class="nd2 store">topics</span><span class="nd2 store">rhythm + reach_rules</span><span class="arrow-note">feed the Judge, the gate and the run</span></div>
+      </div>
+      <div class="flowarr" aria-hidden="true">⇄</div>
+      <div class="plane hst"><div class="ph">Person's host · runner <span class="t t-host">container</span></div>
+        <div class="nd2 llm"><b>4</b> Wake run<small>agent loop with tools: read thread, files, recall · writes a draft file</small></div>
+        <div class="nd2 host">Knowledge index<small>FTS5 + vectors</small></div>
+        <div class="nd2 host">Files · journal · STATE.md</div>
+      </div>
+    </div>
+    <div class="feedback"><span class="nd2 you">Super Chat web: message + draft card, Home tiles</span><span class="arrow-note">→ reports shown · opened · acted_on back to the rhythm (step 3)</span></div>
+    <p class="cap">One Lookout per person, woken only by a signal (never on a timer). Global queue limit 16 runs, 3 per person, 1 while the person is chatting.</p>
+  </section>
+
+  <section>
+    <h2>2 · Life of a signal</h2>
+    <div class="tw"><table class="seq">
+      <thead><tr><th>#</th><th>Source</th><th>Lookout</th><th>Judge</th><th>Rhythm</th><th>Wake run</th><th>Person</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><span class="ev2 code">add_signal</span></td><td class="arrowcell">→ stored, deduped</td><td></td><td></td><td></td><td></td></tr>
+        <tr><td>2</td><td></td><td><span class="ev2 code">settle 2 min</span><br><small>drop stale · noise · muted</small></td><td></td><td></td><td></td><td></td></tr>
+        <tr><td>3</td><td></td><td class="arrowcell">signals + topics + memory + last-day messages →</td><td><span class="ev2 llm">score</span><br><small>relevance · topic · urgency · why</small></td><td></td><td></td><td></td></tr>
+        <tr><td>4</td><td></td><td><span class="ev2 code">&lt; 40 → hold for brief</span></td><td></td><td></td><td></td><td></td></tr>
+        <tr><td>5</td><td></td><td class="arrowcell">per topic →</td><td></td><td><span class="ev2 code">good_moment?</span><br><small>no → next_good_slot, sleep</small></td><td></td><td></td></tr>
+        <tr><td>6</td><td></td><td class="arrowcell">one job, ≤12 signals + scores + memory + voice →</td><td></td><td></td><td><span class="ev2 llm">read · recall · draft</span></td><td></td></tr>
+        <tr><td>7</td><td></td><td><span class="ev2 code">post</span><br><small>≤4 sentences + draft card, or nothing</small></td><td></td><td></td><td class="arrowcell">← result</td><td><span class="ev2 you">sees message</span></td></tr>
+        <tr><td>8</td><td></td><td></td><td></td><td><span class="ev2 code">learn</span></td><td></td><td class="arrowcell">← shown · opened · acted_on</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>3 · Long-term memory: primitives</h2>
+    <p class="sub">Memory existed before this wave and the Conversation used it every turn. The proactive layer reads it from today: the Judge, the wake run and the brief get a memory pack.</p>
+    <div class="tw"><table>
+      <thead><tr><th>Primitive</th><th>Where</th><th>What it is</th></tr></thead>
+      <tbody>
+        <tr><td><b>memory_claims</b></td><td><span class="t t-code">engine PG</span></td><td>Typed facts: preference, instruction, fact, decision, person, project, working_style, commitment. Stated (conf 0.9) or inferred (0.4), +0.05 per reinforcement, supersedes chain, optional expiry. Searched via a txtai index (BM25 + embeddings).</td></tr>
+        <tr><td><b>Profile</b> (standing memory)</td><td><span class="t t-code">derived</span></td><td>Every kind except <i>person</i> with confidence ≥ 0.75; decisions drop after 30 days; capped at 6,000 chars.</td></tr>
+        <tr><td><b>Memory pack / voice</b> <span class="t t-llm">new</span></td><td><span class="t t-code">derived</span></td><td>Pack = profile + up to 40 <i>person</i> claims. Voice = working_style + preferences about mail, tone, sign-offs.</td></tr>
+        <tr><td><b>Identity</b></td><td><span class="t t-code">derived</span></td><td>The person's own organisation and domain, from fact claims. Used to ignore "everywhere" words.</td></tr>
+        <tr><td><b>Checkpoint / working list</b></td><td><span class="t t-code">engine PG</span></td><td>The fold's summary when the context fills; tagged lines (tasks, decisions, open items, preferences).</td></tr>
+        <tr><td><b>Journal, STATE.md</b></td><td><span class="t t-host">host files</span></td><td>Written from checkpoints, Rounds and daily notes. Searchable through recall.</td></tr>
+        <tr><td><b>Knowledge index</b></td><td><span class="t t-host">host SQLite</span></td><td>FTS5 + sqlite-vec over files, journal, retired conversation and claims. Behind the <code>recall</code> tool.</td></tr>
+        <tr><td><b>Daily notes</b></td><td><span class="t t-code">engine PG</span></td><td>One per person per day, written by the quiet pass.</td></tr>
+        <tr><td><b>Topics</b></td><td><span class="t t-code">engine PG</span></td><td>What the person is working on: where it stands, open lines (with ids, dates, starters), watch list, status line. 7-day window.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>4 · Memory: who writes, who reads</h2>
+    <div class="mem">
+      <div class="mcol"><div class="ph">Writers <span class="t t-llm">LLM</span></div>
+        <div class="nd2 llm">Memory upkeep<small>hourly + after a fold, ≥ 3 new messages · extract, then classify per candidate</small><em>→ claims</em></div>
+        <div class="nd2 llm">The Conversation<small>memory_remember / forget, when the person says so</small><em>→ claims</em></div>
+        <div class="nd2 llm">Quiet pass<small>20 min idle, ≤ 4/day, + 22:00</small><em>→ claims · daily notes · topics</em></div>
+        <div class="nd2 llm">Dreaming + People<small>nightly · <b class="bad">dead until today</b></small><em>→ working_style · person claims</em></div>
+        <div class="nd2 llm">Fold<small>when the context fills</small><em>→ checkpoint → journal → index</em></div>
+      </div>
+      <div class="flowarr" aria-hidden="true">→</div>
+      <div class="mcol"><div class="ph">Stores</div>
+        <div class="nd2 store">claims → profile, pack, voice, identity</div>
+        <div class="nd2 store">daily notes</div>
+        <div class="nd2 store">topics</div>
+        <div class="nd2 store">checkpoint</div>
+        <div class="nd2 host">journal · knowledge index</div>
+      </div>
+      <div class="flowarr" aria-hidden="true">→</div>
+      <div class="mcol"><div class="ph">Readers</div>
+        <div class="nd2 you">Every chat turn<small>profile block, resent when it changes</small></div>
+        <div class="nd2 you">Chat tools<small>recall (files, journal, chat, claims) · memory_search · context_brief · session_history</small></div>
+        <div class="nd2 you">Morning brief<small>memory pack + topics + notes</small></div>
+        <div class="nd2 you">Judge + wake run <span class="t t-llm">new</span><small>pack + voice + topics + last-day messages</small></div>
+      </div>
+    </div>
+    <div class="alert">
+      <h3>Found and fixed today: memory was invisible to background code</h3>
+      <ul>
+        <li>The server never registered its memory service in the runtime (only tests did). The chat itself was fine: its profile block, tools and upkeep get the service passed explicitly.</li>
+        <li>Everything that read the global got nothing: <b>Dreaming and People nightly passes never ran</b> (since at least 17 Oct), the person's own organisation was always empty, the brief and the Lookout had no memory, account deletion left the claim search index stale.</li>
+        <li>Fixed in <code>judge-memory</code> (3b58c11fb): registered at server start, cleared at shutdown. Deployed to the train stack.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section>
+    <h2>5 · Relevance: hard filter, then the Judge</h2>
+    <div class="grid2">
+      <div class="box"><h3><span class="t t-code">code</span> Hard filter: things that can never matter</h3>
+        <ul>
+          <li>Own mail; no-reply / bounce sender; <code>List-Id</code>, <code>List-Unsubscribe</code>, <code>Precedence: bulk|list|junk</code>; auto-reply headers or subject; calendar accept with no text</li>
+          <li>Person not in To/Cc; the person replied last in the thread; older than 14 days</li>
+          <li>"Not useful" mutes (topic, or sender on a topic); stale (mail: end of next working day; promise: its date)</li>
+          <li>Word/person matching still runs, as a <b>hint</b> only: strong (shared thread/file/meeting) · medium (watched person + ≥1 term) · weak (≥2 terms, or watched sender). Terms in ≥5% of the person's mail, on ≥3 topics, or the own org don't count.</li>
+        </ul></div>
+      <div class="box"><h3><span class="t t-llm">LLM</span> Judge (ADR 0040)</h3>
+        <ul>
+          <li>One batched call per wake (25 signals per call) on the <b>Conversation's model</b> (its pin, else Foundation pick), over its own connection; no tools.</li>
+          <li>Input, fenced as data: signals + code hint · open topics (where it stands, dated open lines, watch list) · memory pack · the person's own messages from the last 24 h (≤2,000 chars).</li>
+          <li>Output per signal: <code>relevance</code> 0–100 · <code>topic</code> · <code>urgency</code> now|today|later · <code>why</code>.</li>
+          <li>&lt; 40 → never starts a message, waits for the brief. <code>now</code> → skips learned timing only.</li>
+          <li>Model down or unreadable → fallback from the hint: 70 / 55 / 40 / 20.</li>
+          <li>Live, 22:30: sales pitch <b>8</b> "cold pitch, no link to open work"; Dana's translator quote <b>82 today</b> "approve before Friday".</li>
+        </ul></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>6 · "A good time": the timing model</h2>
+    <p class="sub">Decided per topic, by code, every wake. Hard ceilings first, then what was learned from behaviour. Never from ratings.</p>
+    <div class="math">good(t, topic) =
+    reach_rules.allow(t, topic, senders)          <span style="color:var(--ink-2)"># pause · mute · only-for (the person's words)</span>
+  ∧ in_window(t)                                  <span style="color:var(--ink-2)"># hours rule, else outside quiet hours, else Mon–Fri 08–18</span>
+  ∧ sent_today &lt; cap(level)                       <span style="color:var(--ink-2)"># off 0 · low 1 · normal 3 · high 6 · brief not counted</span>
+  ∧ no message on topic in last 3 h
+  ∧ ( urgent ∨ ¬learned ∨ rate(cell) unknown ∨ rate(cell) ≥ <b>0.35</b>
+      ∨ (exploring ∧ rate(cell) ≥ best rate) )
+
+cell     = day_part × weekday|weekend × chatting|not      <span style="color:var(--ink-2)"># 4 × 2 × 2 = 16; night 23–06 has none</span>
+outcome  = acted_on (or topic picked ≤3 h) → yes 1 · opened → yes ½ · unseen 24 h → no ½ · else 0
+weight   = 0.5 ^ (age / 14 days)
+overall  = (Σyes + 1) / (Σyes + Σno + 2)
+rate     = (yes + 2·overall) / (yes + no + 2)   if yes + no ≥ 1, else unknown
+learned  = events on ≥ 4 distinct days;  exploring = nothing sent for 3 working days</div>
+    <div class="grid2">
+      <div class="box"><h3>Worked example (overall rate 0.6)</h3>
+        <div class="cells">
+          <div></div><div class="h">evidence</div><div class="h">rate</div><div class="h">≥ 0.35?</div><div class="h">result</div>
+          <div class="r">Weekday morning</div><div class="c">3 acted · 1 unseen</div><div class="c">(3+1.2)/(3.5+2) = .76</div><div class="c y">yes</div><div class="c y">speak</div>
+          <div class="r">Weekday evening</div><div class="c">2 unseen</div><div class="c">(0+1.2)/(1+2) = .40</div><div class="c y">yes</div><div class="c y">speak</div>
+          <div class="r">Weekend morning</div><div class="c">3 unseen</div><div class="c">1.2/(1.5+2) = .34</div><div class="c n">no</div><div class="c n">wait</div>
+          <div class="r">Weekday midday</div><div class="c">none</div><div class="c">unknown</div><div class="c u">–</div><div class="c y">speak</div>
+        </div></div>
+      <div class="box"><h3>Properties to know</h3>
+        <ul>
+          <li><b>Optimistic</b>: an unknown cell passes. It takes about three ignored messages in one cell before it closes.</li>
+          <li>"Shown" and "seen without action" add nothing; only acting, opening and ignoring move a cell.</li>
+          <li>"Chatting" = a turn is running right now (read live, no presence history stored).</li>
+          <li>Held → <code>next_good_slot</code> scans 15-minute steps up to 8 days; a reach-rule change re-wakes held signals at once.</li>
+        </ul></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>7 · Cost and model calls per person per day</h2>
+    <div class="tw"><table>
+      <thead><tr><th>Day</th><th>LLM calls</th><th>Which</th></tr></thead>
+      <tbody>
+        <tr><td>Quiet, nothing arrives</td><td>1</td><td>Morning brief. Lookout, Judge, quiet passes and upkeep all gated off.</td></tr>
+        <tr><td>Quiet + one relevant mail</td><td>3</td><td>Brief + Judge + one wake run (Judge and run on the Conversation's model; no per-run cap since ADR 0040).</td></tr>
+        <tr><td>Normal chat day</td><td>~10–15</td><td>Up to 4 quiet passes + 22:00, Dreaming, People, hourly upkeep (extract + classify), folds, brief, plus wakes.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>8 · What the person sees</h2>
+    <div class="ux">
+      <div class="box"><b>Message + draft</b><span>One message of ≤ 4 sentences, the draft as a file card. Never sent for them.</span></div>
+      <div class="box"><b>Home tiles</b><span>Topics with a status line; the feature tile leads with an unseen draft or a promise due today.</span></div>
+      <div class="box"><b>Pick-up card</b><span>Where it stands, one Next row, Also open, and "Work through all" (parallel runs, one joined reply).</span></div>
+      <div class="box"><b>Reach rules</b><span>"Don't bother me today", "only if Dana writes": said in chat, saved as rules, beat the learned timing.</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>9 · Known gaps</h2>
+    <div class="grid2">
+      <div class="box"><h3>Memory</h3><ul>
+        <li><i>commitment</i> claims have no dedicated writer; no proactive part reads commitments, projects or decisions directly.</li>
+        <li>Journal and STATE.md are never read by the proactive layer (only via recall).</li>
+        <li>Daily notes never reach the Conversation.</li>
+        <li>The claim search index has no rebuild path outside tests.</li>
+      </ul></div>
+      <div class="box"><h3>Decision</h3><ul>
+        <li>Topic grouping is the quiet pass's call; no merge of near-duplicate topics.</li>
+        <li>Timing is optimistic on unknown cells; "seen, no action" teaches nothing.</li>
+        <li>No urgent signal kinds yet (meetings soon need the calendar source).</li>
+        <li>Mail is a dev file mailbox; Microsoft 365 / Google connectors are ADR 0039, not built.</li>
+      </ul></div>
+    </div>
+  </section>
+
+  <footer>Sources: ADRs 0035–0040 and code on branch lookout-wave (lookout/, rhythm/, mail/, topics/, memory/, brief/, daily_notes/quiet_moment.py, runner/memory/). Train stack runs this build; example names are made up.</footer>
+</main>
+</body>
+</html>

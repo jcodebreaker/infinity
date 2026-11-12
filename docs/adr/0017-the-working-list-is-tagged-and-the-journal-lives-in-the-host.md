@@ -1,0 +1,33 @@
+# The working list is tagged, code keeps it whole, and the journal lives in the host
+
+One person keeps one Conversation open for a year or more, on `claude-sdk` or `pi`. History is bounded by compaction: past a threshold Omnigent asks a summarizer to rewrite the state file from the previous one plus the turns since, keeps a short tail, and posts a `compaction` item. Before this change the state file was free text rewritten every time, with no check that an entry survived; an idle return rewrote it with no context pressure; every compaction and cold start read the whole record from item 1; a cold start dropped every tool call; and nothing durable recorded what was done. Over a year that is hundreds of rewrites, each a chance to lose something with no trace. We decided Omnigent owns compaction for every harness, the working list carries tags that code checks after each rewrite, and what happened is written to dated files in the person's host. The full design was `docs/super-chat/context-memory-plan.md`, now merged into [context.md](../context.md); recall over the result is [0016](0016-recall-is-a-bounded-hint-and-a-deep-pull-over-one-index.md).
+
+- **Omnigent owns compaction, the harness is a loop.** The harness's own compaction is off; `/compact` runs Omnigent's. Every reader (compaction and each cold start) reads the record from the latest checkpoint's anchor, so reads per turn grow with the epoch, never with the Conversation's age. A cold start replays tool calls as one digest line each, framed as tool output, not as the person's words.
+- **Tagged entries.** Every entry carries a kind, a stable tag and a last-touched date: `- [d-finance-eur · 2026-09-02] …`. Kinds: `t-` topic, `d-` decision, `o-` open loop, `p-` preference (how the person wants things done). The summarizer keeps tags, marks an entry `closed` or `merged into [tag]` instead of dropping it, and writes one entry per rule (never the same rule as a decision and a preference).
+- **Repair, not reject.** After each rewrite code compares the tag sets. An entry missing without a close or merge is copied back word for word, and the rewrite is accepted; each repair is counted on the compaction item. Rejecting would let a model that keeps failing never compact. Dates the model leaves out are carried forward.
+- **A close is deterministic.** `state_close(tag, reason)` records the close on the session; code applies it at the next compaction before the tag check and writes it to the journal with its reason. The person's "forget that" does not depend on the summarizer noticing.
+- **A budget, and eviction writes first.** The rendered list is budgeted at 4k tokens. Over budget, entries are written word for word to today's journal and to the compaction payload, then dropped: closed and merged first, oldest first; then open entries longest untouched; open preferences last.
+- **Old is marked, not removed.** An open entry untouched for 30 days renders `stale?` (a rendering, never stored). A preference never does: it holds until the person changes it.
+- **The journal is a file per day in the host.** The same summarizer call returns 3 to 10 dated lines of what happened; they are stored on the compaction item and appended to `~/workspace/memory/journal/YYYY-MM-DD.md`. A Helper result, a Fork added to the Conversation, a close and a hand edit of an artifact each add one line. Side chats and Forks write to the same file, each line naming its origin. Code writes the files, artifacts, Project, Helpers and chats a window touched into each line's trailing comment (0016 C5). `STATE.md` beside it is the current list written out for people to read.
+- **The engine never reads the folder back as truth.** The compaction item is the only source for the next checkpoint; a lost or edited folder is rebuilt from the payloads with no model call. A journal or digest line reaching the model is fenced as data. Nothing in the folder becomes a claim about the person: the journal is the assistant's text.
+- **An idle return is not a rewrite.** After 12 hours the next turn cold-starts from the stored checkpoint with one line naming the gap; the summarizer runs only when the turns since exceed the tail. Per-turn prefix blocks are sent in full only on a cold start or when they change.
+- **A turn never waits or overflows.** At 95 % of the window the turn starts from the previous checkpoint plus the newest whole turns that fit, and the compaction is rescheduled.
+
+## Considered options
+
+- **Keep the harness's own compaction.** Rejected: each harness compacts differently, a model switch would change what is remembered, and the state lives inside a process we restart.
+- **Reject a rewrite that loses an entry.** Rejected: a summarizer that keeps failing would never compact, and the 95 % trim would then drop turns with no summary.
+- **State file as JSON with patch operations.** Deferred: build it when repairs average more than 0.5 per compaction over real Conversations.
+- **An open-source memory system or a vector store for the state.** Rejected: each brings its own loop or store; a tagged text file, a counter and one daily file need neither.
+- **Keep the journal in the engine's database.** Rejected: the person's files and their index live in the host (0014); the payloads in the engine are enough to rebuild.
+
+## Consequences
+
+- The host image and the engine need a rebuild; existing Conversations get tags at their next compaction.
+- Repairs per compaction is the health number to watch.
+- Every journal line of one window carries that window's references, not its own; filtering one object's history by reference is coarse until lines are attributed individually.
+- The newest turn is always kept whole, so one very large message can leave the next turn close to the threshold.
+
+## Amendments
+
+**Amended 2026-10-19 (fix wave).** A cold start is a reader like the idle return: when the runner reloads the record (a restart, a dropped warm client) and the turns since the checkpoint no longer fit the kept tail, the checkpoint is written before the turn, with the same summarizer, journal and recall indexing, and the turn replays it plus its tail. Before this, the load kept only the tail and the older turns were in no summary and not in recall until the next size rollover. Rollover still acts only between turns, so one Helper turn is bounded inside the turn: past 300,000 tokens of context (`OMNIGENT_HELPER_TURN_CONTEXT_CEILING`) Omnigent steers one message asking the job to save its work and end the turn with what is done and what is left, and stops the turn at 1.25 times the ceiling. The harness's own compaction stays off ([ADR 0006](0006-omnigent-owns-everything.md)); the Conversation keeps its between-turn rule.

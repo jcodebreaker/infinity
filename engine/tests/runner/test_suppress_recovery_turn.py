@@ -1,0 +1,668 @@
+"""Tests for suppress_recovery_turn in the session-init protocol.
+
+Regression coverage for the race where a server-persisted message appears in
+the runner's history load during create_session, causes a recovery turn to
+start, and the subsequent message-forward is then buffered (and optionally
+double-processed).
+
+The race is exercised via two paths:
+1. SDK harness: the server calls session-init *after* persisting the message
+   (the managed-sandbox-wake / relaunch path) and then forwards the message.
+   Without suppress_recovery_turn the runner would start a recovery turn from
+   history, see _active_turns occupied when the forward arrives, buffer it,
+   and process it a second time once the recovery turn finishes.
+2. The fix: suppress_recovery_turn=True in the session-init envelope causes
+   the runner to skip the recovery-turn check, leaving _active_turns empty so
+   the forward triggers the turn exactly once.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+import pytest
+from fastapi import FastAPI
+
+from omnigent.runner import create_runner_app
+from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runner.session_init_protocol import (
+    build_runner_session_init_payload,
+)
+from omnigent.spec.types import AgentSpec
+from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
+from tests.runner.conftest import (
+    _FakeProcessManager,
+    _runner_client,
+    _ScriptedHarnessClient,
+    _sse,
+)
+
+# ── helpers ────────────────────────────────────────────────────────────
+
+
+AGENT_ID = "ag_recover_test"
+SESSION_ID = "conv_recover_test"
+
+_PENDING_USER_MESSAGE = {
+    "id": "msg_001",
+    "type": "message",
+    "role": "user",
+    "content": [{"type": "input_text", "text": "hello from history"}],
+}
+_ITEMS_PAGE = {
+    "object": "list",
+    "data": [_PENDING_USER_MESSAGE],
+    "has_more": False,
+}
+
+
+class _HistoryServerClient:
+    """Returns one pre-persisted user message from GET /items.
+
+    Simulates the server state after the message has been persisted to DB
+    but before the forward reaches the runner — exactly the window that
+    causes the recovery-turn race.
+    """
+
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self._payload = payload
+
+        def json(self) -> dict[str, Any]:
+            return self._payload
+
+        def raise_for_status(self) -> None:
+            pass
+
+    async def get(self, url: str, **kwargs: Any) -> _Resp:
+        del kwargs
+        if url.rstrip("/").endswith("/items"):
+            return self._Resp(_ITEMS_PAGE)
+        return self._Resp({})
+
+    async def post(self, url: str, **kwargs: Any) -> _Resp:
+        del url, kwargs
+        return self._Resp({})
+
+    async def patch(self, url: str, **kwargs: Any) -> _Resp:
+        del url, kwargs
+        return self._Resp({})
+
+
+class _CatchUpServerClient(_HistoryServerClient):
+    """Return no history until the test exposes a missed user item."""
+
+    def __init__(self) -> None:
+        self.expose_item = False
+
+    async def get(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
+        del kwargs
+        if url.rstrip("/").endswith(f"/sessions/{SESSION_ID}/items"):
+            page = _ITEMS_PAGE if self.expose_item else {"data": [], "has_more": False}
+            return self._Resp(page)
+        if url.rstrip("/").endswith("/items"):
+            return self._Resp({"data": [], "has_more": False})
+        return self._Resp({})
+
+
+def _build_sdk_app(
+    server_client: Any,
+    resource_registry: SessionResourceRegistry | None = None,
+) -> tuple[FastAPI, _FakeProcessManager, _ScriptedHarnessClient]:
+    spec = AgentSpec(spec_version=1, name="t")
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse({"type": "response.output_text.delta", "delta": "hi"}),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    harness_client = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        resource_registry=resource_registry,
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    return app, pm, harness_client
+
+
+def _session_init_payload(
+    *,
+    suppress_recovery_turn: bool,
+    server_version: str = "0.0.0-test",
+    model_override: str | None = None,
+) -> dict[str, Any]:
+    from omnigent.entities import Conversation
+
+    conv = Conversation(
+        id=SESSION_ID,
+        agent_id=AGENT_ID,
+        runner_id="runner_test",
+        created_at=0,
+        updated_at=0,
+        root_conversation_id=SESSION_ID,
+        model_override=model_override,
+    )
+    return build_runner_session_init_payload(
+        conv,
+        server_version=server_version,
+        suppress_recovery_turn=suppress_recovery_turn,
+    )
+
+
+def _assert_browser_tools_hidden(body: dict[str, Any]) -> None:
+    tool_names = {
+        function["name"]
+        for tool in body.get("tools", [])
+        if isinstance(tool, dict)
+        and isinstance((function := tool.get("function")), dict)
+        and isinstance(function.get("name"), str)
+    }
+    assert tool_names, "expected non-browser framework tools to remain advertised"
+    assert tool_names.isdisjoint(BROWSER_TOOL_NAMES), (
+        "headless internal turn advertised browser tools: "
+        f"{sorted(tool_names & BROWSER_TOOL_NAMES)}"
+    )
+
+
+def _init_rows(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    """Return the ``runner_session_initialized`` attributes in emission order."""
+    return [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_session_initialized"
+    ]
+
+
+# ── tests ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_suppress_recovery_turn_prevents_recovery_turn_from_history(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """suppress_recovery_turn=True: create_session must not start a recovery turn.
+
+    When the runner loads history and finds a pending user message, it would
+    normally start a crash-recovery turn.  With suppress_recovery_turn set the
+    turn must be suppressed so the server's subsequent message-forward can
+    trigger it cleanly.
+
+    Asserts:
+    - No turn is running after the session-init POST returns.
+    - A subsequent message-forward triggers exactly one turn.
+    """
+    app, _pm, harness = _build_sdk_app(_HistoryServerClient())
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions",
+            json=_session_init_payload(suppress_recovery_turn=True),
+        )
+        assert init_resp.status_code == 201, init_resp.text
+
+        # Give the event loop a turn — a recovery turn (if started) would now
+        # be scheduled and could have updated _active_turns.
+        await asyncio.sleep(0)
+
+        # Session must be idle: suppress_recovery_turn suppressed the turn.
+        get_resp = await client.get(f"/v1/sessions/{SESSION_ID}")
+        assert get_resp.status_code == 200, get_resp.text
+        assert get_resp.json().get("status") == "idle", (
+            "Session must be idle after session-init with suppress_recovery_turn=True; "
+            "a recovery turn was started from history instead."
+        )
+        (init_row,) = _init_rows(caplog)
+        assert init_row["recovery_turn"] == "none"
+        assert init_row["suppress_recovery_turn"] is True
+        assert init_row["history_len"] == 1
+
+        # Now forward the message — this should trigger exactly one turn.
+        forward_resp = await client.post(
+            f"/v1/sessions/{SESSION_ID}/events",
+            params={"stream": "true"},
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": AGENT_ID,
+                "content": [{"type": "input_text", "text": "hello"}],
+                "persisted_item_id": "msg_001",
+            },
+        )
+        assert forward_resp.status_code == 200, (
+            f"Message forward returned {forward_resp.status_code}: {forward_resp.text}"
+        )
+        _ = forward_resp.text  # drain the streaming response
+
+        assert len(harness.posted_bodies) == 1, (
+            f"Expected exactly one harness call (one turn); got {len(harness.posted_bodies)}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_without_suppress_recovery_turn_starts_recovery_turn_from_history(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Without suppress_recovery_turn the runner starts a recovery turn from history.
+
+    When the session-init envelope does NOT carry suppress_recovery_turn=True
+    (the tunnel-reconnect hook), the runner sees the persisted user message in
+    history and answers it with a recovery turn. The server's later forward of
+    that same item (``persisted_item_id``) is already answered: it must not
+    start a second turn.
+    """
+    app, _pm, harness = _build_sdk_app(_HistoryServerClient())
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions",
+            json=_session_init_payload(suppress_recovery_turn=False),
+        )
+        assert init_resp.status_code == 201, init_resp.text
+
+        # Let the recovery turn run and complete.
+        await asyncio.sleep(0.1)
+
+        # The recovery turn consumed the history message — harness was called once.
+        assert len(harness.posted_bodies) == 1, (
+            "Expected recovery turn to call the harness once after create_session "
+            f"without suppress_recovery_turn; got {len(harness.posted_bodies)}"
+        )
+        _assert_browser_tools_hidden(harness.posted_bodies[0])
+        assert _init_rows(caplog)[0]["recovery_turn"] == "history_resume"
+
+        forward_resp = await client.post(
+            f"/v1/sessions/{SESSION_ID}/events",
+            params={"stream": "true"},
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": AGENT_ID,
+                "content": [{"type": "input_text", "text": "hello"}],
+                "persisted_item_id": "msg_001",
+            },
+        )
+        assert forward_resp.status_code == 202, forward_resp.text
+        assert forward_resp.json()["status"] == "already_running"
+        await asyncio.sleep(0.1)
+
+        assert len(harness.posted_bodies) == 1, (
+            "the forward of the message the recovery turn answered ran a second turn"
+        )
+
+
+class _RecordedCardServerClient(_HistoryServerClient):
+    """A record that ends in a card the engine recorded outside any turn (a picked-up topic)."""
+
+    async def get(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
+        del kwargs
+        if not url.rstrip("/").endswith("/items"):
+            return self._Resp({})
+        recorded = "recorded_topic_1"
+        return self._Resp(
+            {
+                "data": [
+                    {**_PENDING_USER_MESSAGE, "response_id": "resp_1"},
+                    {
+                        "id": "msg_002",
+                        "type": "message",
+                        "role": "assistant",
+                        "response_id": "resp_1",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    },
+                    {
+                        "id": "fc_1",
+                        "type": "function_call",
+                        "response_id": recorded,
+                        "name": "render_card",
+                        "arguments": "{}",
+                        "call_id": "call_topic_1",
+                    },
+                    {
+                        "id": "fo_1",
+                        "type": "function_call_output",
+                        "response_id": recorded,
+                        "call_id": "call_topic_1",
+                        "output": "{}",
+                    },
+                ],
+                "has_more": False,
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_recorded_card_at_the_end_of_the_record_starts_no_recovery_turn(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A card the engine recorded between turns ends the record but is no unfinished turn."""
+    app, _pm, harness = _build_sdk_app(_RecordedCardServerClient())
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions", json=_session_init_payload(suppress_recovery_turn=False)
+        )
+        assert init_resp.status_code == 201, init_resp.text
+        await asyncio.sleep(0.1)
+        assert harness.posted_bodies == []
+        assert _init_rows(caplog)[0]["recovery_turn"] == "none"
+
+
+class _CardAfterUnansweredServerClient(_HistoryServerClient):
+    """A card recorded between turns lands after a message no turn answered yet."""
+
+    async def get(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
+        del kwargs
+        if not url.rstrip("/").endswith("/items"):
+            return self._Resp({})
+        recorded = "recorded_topic_1"
+        return self._Resp(
+            {
+                "data": [
+                    {**_PENDING_USER_MESSAGE, "response_id": "resp_1"},
+                    {
+                        "id": "fc_1",
+                        "type": "function_call",
+                        "response_id": recorded,
+                        "name": "render_card",
+                        "arguments": "{}",
+                        "call_id": "call_topic_1",
+                    },
+                    {
+                        "id": "fo_1",
+                        "type": "function_call_output",
+                        "response_id": recorded,
+                        "call_id": "call_topic_1",
+                        "output": "{}",
+                    },
+                ],
+                "has_more": False,
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_recorded_card_after_an_unanswered_message_still_resumes_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Recovery decides on the newest item a turn wrote, not on a card recorded after it."""
+    app, _pm, harness = _build_sdk_app(_CardAfterUnansweredServerClient())
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions", json=_session_init_payload(suppress_recovery_turn=False)
+        )
+        assert init_resp.status_code == 201, init_resp.text
+        await asyncio.sleep(0.1)
+        assert len(harness.posted_bodies) == 1
+        assert _init_rows(caplog)[0]["recovery_turn"] == "history_resume"
+        # The resumed item is the message, not the card: its forward is already answered.
+        forward_resp = await client.post(
+            f"/v1/sessions/{SESSION_ID}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": AGENT_ID,
+                "content": [{"type": "input_text", "text": "hello from history"}],
+                "persisted_item_id": "msg_001",
+            },
+        )
+        assert forward_resp.status_code == 202, forward_resp.text
+        assert forward_resp.json()["status"] == "already_running"
+        await asyncio.sleep(0.1)
+        assert len(harness.posted_bodies) == 1
+
+
+@pytest.mark.asyncio
+async def test_forward_during_recovery_turn_is_not_replayed_after_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live double reply: the forward lands while the recovery turn runs.
+
+    A cold-started runner's reconnect init starts a recovery turn for the
+    trailing user message; the server's forward of that same message arrives
+    mid-turn. It must not be buffered and replayed as a second turn once the
+    recovery turn ends. A different message arriving later still runs.
+    """
+    started, release = asyncio.Event(), asyncio.Event()
+    original = _ScriptedHarnessClient._StreamHandle.aiter_text
+
+    async def gated_stream(handle: Any) -> Any:
+        started.set()
+        await release.wait()
+        async for frame in original(handle):
+            yield frame
+
+    monkeypatch.setattr(_ScriptedHarnessClient._StreamHandle, "aiter_text", gated_stream)
+    app, _pm, harness = _build_sdk_app(_HistoryServerClient())
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions", json=_session_init_payload(suppress_recovery_turn=False)
+        )
+        assert init_resp.status_code == 201, init_resp.text
+        await asyncio.wait_for(started.wait(), timeout=5)
+        turn = app.state.active_turns[SESSION_ID]
+        try:
+            forward_resp = await client.post(
+                f"/v1/sessions/{SESSION_ID}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": AGENT_ID,
+                    "content": [{"type": "input_text", "text": "hello from history"}],
+                    "persisted_item_id": "msg_001",
+                },
+            )
+            assert forward_resp.status_code == 202, forward_resp.text
+            assert forward_resp.json()["status"] == "already_running"
+        finally:
+            release.set()
+        await asyncio.wait_for(turn, timeout=5)
+        await asyncio.sleep(0.1)
+        assert len(harness.posted_bodies) == 1, "the recovered message was answered twice"
+
+        newer = await client.post(
+            f"/v1/sessions/{SESSION_ID}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": AGENT_ID,
+                "content": [{"type": "input_text", "text": "a newer message"}],
+                "persisted_item_id": "msg_002",
+            },
+        )
+        assert newer.status_code == 202, newer.text
+        assert newer.json().get("status") != "already_running"
+        next_turn = app.state.active_turns.get(SESSION_ID)
+        if next_turn is not None:
+            await asyncio.wait_for(next_turn, timeout=5)
+        assert len(harness.posted_bodies) == 2
+
+
+@pytest.mark.asyncio
+async def test_catch_up_turn_hides_browser_tools_without_renderer_evidence() -> None:
+    """Reconnect catch-up fails closed when no renderer hint accompanies the item."""
+    from omnigent.runner.app import _session_histories_ref
+
+    server_client = _CatchUpServerClient()
+    app, _pm, harness = _build_sdk_app(server_client)
+
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions",
+            json=_session_init_payload(suppress_recovery_turn=True),
+        )
+        assert init_resp.status_code == 201, init_resp.text
+
+        _session_histories_ref[SESSION_ID] = []
+        server_client.expose_item = True
+        try:
+            await app.state.catch_up_scan()
+            for _ in range(100):
+                if harness.posted_bodies:
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            _session_histories_ref.pop(SESSION_ID, None)
+
+    assert len(harness.posted_bodies) == 1, "catch-up scan did not start one harness turn"
+    _assert_browser_tools_hidden(harness.posted_bodies[0])
+
+
+@pytest.mark.asyncio
+async def test_suppressed_reinitialization_preserves_active_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connected parent's Retry handshake must preserve its in-flight context."""
+    from omnigent.runner.app import _session_histories_ref
+
+    started, release = asyncio.Event(), asyncio.Event()
+    original = _ScriptedHarnessClient._StreamHandle.aiter_text
+
+    async def gated_stream(handle: Any) -> Any:
+        started.set()
+        await release.wait()
+        async for frame in original(handle):
+            yield frame
+
+    monkeypatch.setattr(_ScriptedHarnessClient._StreamHandle, "aiter_text", gated_stream)
+    app, _pm, harness = _build_sdk_app(_HistoryServerClient())
+    async with _runner_client(app) as client:
+        payload = _session_init_payload(suppress_recovery_turn=True)
+        assert (await client.post("/v1/sessions", json=payload)).status_code == 201
+        forwarded = await client.post(
+            f"/v1/sessions/{SESSION_ID}/events",
+            json={
+                "type": "message",
+                "agent_id": AGENT_ID,
+                "content": [{"type": "input_text", "text": "new in-flight message"}],
+            },
+        )
+        assert forwarded.status_code == 202, forwarded.text
+        await asyncio.wait_for(started.wait(), timeout=5)
+        turn = app.state.active_turns[SESSION_ID]
+        history = _session_histories_ref[SESSION_ID]
+        assert "new in-flight message" in str(history)
+        try:
+            result = await client.post("/v1/sessions", json=payload)
+            assert result.status_code == 201
+            assert result.json()["status"] == "running"
+            assert app.state.active_turns[SESSION_ID] is turn
+            assert not turn.done()
+            assert _session_histories_ref[SESSION_ID] is history
+        finally:
+            release.set()
+            await asyncio.wait_for(turn, timeout=5)
+        assert len(harness.posted_bodies) == 1
+        assert (await client.get(f"/v1/sessions/{SESSION_ID}")).json()["status"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_explicit_recovery_deduplicates_history_heuristic(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Retrying a continuation must not also replay a trailing user item."""
+    app, _pm, harness = _build_sdk_app(_HistoryServerClient())
+    caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    payload = _session_init_payload(suppress_recovery_turn=False)
+    payload["session_init"].update(resume_interrupted_turn=True, recovery_id="same-interruption")
+    async with _runner_client(app) as client:
+        for _ in range(2):
+            response = await client.post("/v1/sessions", json=payload)
+            assert response.status_code == 201
+            turn = app.state.active_turns.get(SESSION_ID)
+            if turn is not None:
+                await asyncio.wait_for(turn, timeout=5)
+    assert len(harness.posted_bodies) == 1
+    content = str(harness.posted_bodies[0]["content"])
+    assert "hello from history" in content
+    assert "Continue the existing task" in content
+    # The first init started the continuation; the retry saw the consumed
+    # recovery id and started nothing.
+    rows = _init_rows(caplog)
+    assert [row["recovery_turn"] for row in rows] == ["recovery_prompt", "none"]
+    assert [row["recovery_id"] for row in rows] == ["same-interruption"] * 2
+
+
+@pytest.mark.asyncio
+async def test_newer_turn_finishing_during_initialization_supersedes_recovery() -> None:
+    """A completed newer turn must not be followed by a stale recovery prompt."""
+    from omnigent.runner.app import _session_histories_ref
+
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class PausedHistoryServer(_HistoryServerClient):
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            response = await super().get(url, **kwargs)
+            if url.endswith(f"/{SESSION_ID}/items") and not entered.is_set():
+                entered.set()
+                await release.wait()
+            return response
+
+    app, _pm, harness = _build_sdk_app(PausedHistoryServer())
+    payload = _session_init_payload(suppress_recovery_turn=False)
+    payload["session_init"].update(resume_interrupted_turn=True, recovery_id="interrupted-task")
+    async with _runner_client(app) as client:
+        recovery = asyncio.create_task(client.post("/v1/sessions", json=payload))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        try:
+            response = await client.post(
+                f"/v1/sessions/{SESSION_ID}/events",
+                params={"stream": "true"},
+                json={
+                    "type": "message",
+                    "agent_id": AGENT_ID,
+                    "content": [{"type": "input_text", "text": "newer instruction"}],
+                },
+            )
+            assert response.status_code == 200, response.text
+            assert len(harness.posted_bodies) == 1
+            assert SESSION_ID not in app.state.active_turns
+            history = _session_histories_ref[SESSION_ID]
+        finally:
+            release.set()
+        assert (await recovery).status_code == 201
+        turn = app.state.active_turns.get(SESSION_ID)
+        if turn is not None:
+            await asyncio.wait_for(turn, timeout=5)
+        assert len(harness.posted_bodies) == 1, "recovery repeated a completed newer turn"
+        assert _session_histories_ref[SESSION_ID] is history
+        await client.post("/v1/sessions", json=payload)
+        assert len(harness.posted_bodies) == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_turn_runs_on_the_session_model_override() -> None:
+    """The history-resume turn started by init carries the persisted /model override.
+
+    Without it the first turn after a switch-agent + override ran on the bundle's model
+    (the live 400 "claude-sonnet-5-5 is not a valid model ID") and respawned onto the override
+    on the next turn.
+    """
+    app, _pm, harness = _build_sdk_app(_HistoryServerClient())
+
+    async with _runner_client(app) as client:
+        init_resp = await client.post(
+            "/v1/sessions",
+            json=_session_init_payload(
+                suppress_recovery_turn=False, model_override="openai/gpt-test"
+            ),
+        )
+        assert init_resp.status_code == 201, init_resp.text
+        await asyncio.sleep(0.1)
+
+    assert len(harness.posted_bodies) == 1
+    assert harness.posted_bodies[0].get("model_override") == "openai/gpt-test"

@@ -1,0 +1,515 @@
+"""Unit tests for :mod:`omnigent.tools.builtins.session_history`.
+
+Builds a real :class:`SqlAlchemyConversationStore` over a temp SQLite DB
+(same pattern as ``test_sys_session.py``) so the FTS-backed ``search``
+action and the item-store-backed ``read`` action run against real store
+behavior, not mocks.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Iterator
+from dataclasses import dataclass
+
+import pytest
+
+from omnigent.context.labels import CONTEXT_MODE_LABEL, SCHEDULED_HELPER_LABEL_KEY
+from omnigent.entities.conversation import (
+    FunctionCallData,
+    FunctionCallOutputData,
+    MessageData,
+    NewConversationItem,
+    ReasoningData,
+)
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.tools.base import ToolContext
+from omnigent.tools.builtins.session_history import (
+    SessionHistoryTool,
+    group_into_turns,
+    status_from_labels,
+)
+
+
+@dataclass
+class _Fixture:
+    """Bundle of store + two independent sessions + a ctx scoped to the first."""
+
+    conv_store: SqlAlchemyConversationStore
+    conv_id: str
+    other_conv_id: str
+    ctx: ToolContext
+
+
+def _user_msg(text: str) -> NewConversationItem:
+    return NewConversationItem(
+        type="message",
+        response_id="resp_1",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+    )
+
+
+def _assistant_msg(text: str) -> NewConversationItem:
+    return NewConversationItem(
+        type="message",
+        response_id="resp_1",
+        data=MessageData(
+            role="assistant", content=[{"type": "output_text", "text": text}], agent="test-agent"
+        ),
+    )
+
+
+@pytest.fixture()
+def session_fixture(db_uri: str, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Fixture]:
+    """Two independent top-level conversations; ``ctx`` is scoped to the first."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation(kind="default")
+    other_conv = conv_store.create_conversation(kind="default")
+
+    conv_store.append(other_conv.id, [_user_msg("this belongs to the OTHER session")])
+
+    monkeypatch.setattr("omnigent.runtime.get_conversation_store", lambda: conv_store)
+
+    ctx = ToolContext(task_id="task_test", agent_id="agent_test", conversation_id=conv.id)
+    yield _Fixture(conv_store=conv_store, conv_id=conv.id, other_conv_id=other_conv.id, ctx=ctx)
+
+
+# ── Scoping: id comes from context only ─────────────────────
+
+
+def test_read_ignores_conversation_id_in_arguments(session_fixture: _Fixture) -> None:
+    """A ``conversation_id`` smuggled into arguments never redirects the read."""
+    session_fixture.conv_store.append(
+        session_fixture.conv_id, [_user_msg("my own session's first message")]
+    )
+    tool = SessionHistoryTool()
+    result = json.loads(
+        tool.invoke(
+            json.dumps({"action": "read", "conversation_id": session_fixture.other_conv_id}),
+            session_fixture.ctx,
+        )
+    )
+    texts = [m["content"] for turn in result["turns"] for m in turn["messages"]]
+    assert any("my own session's first message" in t for t in texts)
+    assert not any("OTHER session" in t for t in texts)
+
+
+def test_search_is_scoped_to_calling_session(session_fixture: _Fixture) -> None:
+    """search() never returns hits from a different conversation."""
+    session_fixture.conv_store.append(
+        session_fixture.conv_id, [_user_msg("uniquemarker in own session")]
+    )
+    session_fixture.conv_store.append(
+        session_fixture.other_conv_id, [_user_msg("uniquemarker in other session")]
+    )
+    tool = SessionHistoryTool()
+    result = json.loads(
+        tool.invoke(json.dumps({"action": "search", "query": "uniquemarker"}), session_fixture.ctx)
+    )
+    assert len(result["results"]) == 1
+    assert "own session" in result["results"][0]["content"]
+
+
+def test_invoke_without_conversation_id_in_context_errors() -> None:
+    """No ``ctx.conversation_id`` at all — refuse rather than guess a session."""
+    tool = SessionHistoryTool()
+    ctx = ToolContext(task_id="task_test", agent_id="agent_test", conversation_id=None)
+    result = json.loads(tool.invoke(json.dumps({"action": "read"}), ctx))
+    assert "error" in result
+
+
+# ── read: turns, paging, limits ─────────────────────────────
+
+
+def test_read_groups_into_full_turns_newest_first(session_fixture: _Fixture) -> None:
+    """Each turn is a user message plus its reply; turns come back newest first."""
+    session_fixture.conv_store.append(
+        session_fixture.conv_id,
+        [
+            _user_msg("first question"),
+            _assistant_msg("first answer"),
+            _user_msg("second question"),
+            _assistant_msg("second answer"),
+        ],
+    )
+    tool = SessionHistoryTool()
+    result = json.loads(
+        tool.invoke(json.dumps({"action": "read", "limit": 5}), session_fixture.ctx)
+    )
+    assert len(result["turns"]) == 2
+    newest, oldest = result["turns"]
+    assert [m["content"] for m in newest["messages"]] == ["second question", "second answer"]
+    assert [m["content"] for m in oldest["messages"]] == ["first question", "first answer"]
+    assert result["next_cursor"] is None
+
+
+def test_read_hides_reasoning_items(session_fixture: _Fixture) -> None:
+    """The model's reasoning never comes back through recall."""
+    reasoning = NewConversationItem(
+        type="reasoning",
+        response_id="resp_1",
+        data=ReasoningData(
+            agent="test-agent",
+            summary=[],
+            content=[{"type": "reasoning_text", "text": "SECRET-THOUGHT"}],
+        ),
+    )
+    session_fixture.conv_store.append(
+        session_fixture.conv_id,
+        [_user_msg("question"), reasoning, _assistant_msg("answer")],
+    )
+    raw = SessionHistoryTool().invoke(
+        json.dumps({"action": "read", "limit": 5}), session_fixture.ctx
+    )
+    assert "SECRET-THOUGHT" not in raw
+    (turn,) = json.loads(raw)["turns"]
+    assert [m["content"] for m in turn["messages"]] == ["question", "answer"]
+
+
+def test_group_into_turns_skips_hidden_items_without_losing_the_cursor() -> None:
+    """A page made only of hidden items still pages on to the older turns."""
+    desc = [
+        {"id": "4", "type": "hidden"},
+        {"id": "3", "type": "hidden"},
+        {"id": "2", "type": "text", "role": "assistant"},
+        {"id": "1", "type": "text", "role": "user"},
+    ]
+
+    def fetch_page(before: str | None) -> tuple[list[dict], bool]:
+        start = (
+            0 if before is None else next(i for i, it in enumerate(desc) if it["id"] == before) + 1
+        )
+        return desc[start : start + 2], (start + 2) < len(desc)
+
+    turns, next_cursor = group_into_turns(fetch_page, limit=5)
+    assert [[m["id"] for m in t] for t in turns] == [["1", "2"]]
+    assert next_cursor is None
+
+
+def test_read_pages_backward_with_cursor(session_fixture: _Fixture) -> None:
+    """limit=1 pages one turn at a time; next_cursor resumes at the next-older turn."""
+    session_fixture.conv_store.append(
+        session_fixture.conv_id,
+        [
+            _user_msg("q1"),
+            _assistant_msg("a1"),
+            _user_msg("q2"),
+            _assistant_msg("a2"),
+        ],
+    )
+    tool = SessionHistoryTool()
+    page1 = json.loads(
+        tool.invoke(json.dumps({"action": "read", "limit": 1}), session_fixture.ctx)
+    )
+    assert [m["content"] for m in page1["turns"][0]["messages"]] == ["q2", "a2"]
+    assert page1["next_cursor"] is not None
+
+    page2 = json.loads(
+        tool.invoke(
+            json.dumps({"action": "read", "limit": 1, "cursor": page1["next_cursor"]}),
+            session_fixture.ctx,
+        )
+    )
+    assert [m["content"] for m in page2["turns"][0]["messages"]] == ["q1", "a1"]
+    assert page2["next_cursor"] is None
+
+
+def test_read_tool_call_rides_along_with_its_turn(session_fixture: _Fixture) -> None:
+    """A tool call/result between a user message and the reply stays in that turn."""
+    session_fixture.conv_store.append(
+        session_fixture.conv_id,
+        [
+            _user_msg("run a search"),
+            NewConversationItem(
+                type="function_call",
+                response_id="resp_1",
+                data=FunctionCallData(
+                    agent="test-agent", name="web_search", arguments="{}", call_id="call_1"
+                ),
+            ),
+            NewConversationItem(
+                type="function_call_output",
+                response_id="resp_1",
+                data=FunctionCallOutputData(call_id="call_1", output="results"),
+            ),
+            _assistant_msg("here is what I found"),
+        ],
+    )
+    tool = SessionHistoryTool()
+    result = json.loads(tool.invoke(json.dumps({"action": "read"}), session_fixture.ctx))
+    assert len(result["turns"]) == 1
+    kinds = [m["type"] for m in result["turns"][0]["messages"]]
+    assert kinds == ["text", "tool_call", "tool_result", "text"]
+
+
+def test_read_default_and_max_limit() -> None:
+    """Default limit is 5 turns; an oversized limit is clamped to 20."""
+    schema = SessionHistoryTool().get_schema()
+    description = schema["function"]["parameters"]["properties"]["limit"]["description"]
+    assert "default 5" in description
+    assert "max 20" in description
+
+
+@pytest.mark.parametrize("limit", [0, -1, "3", True])
+def test_read_rejects_invalid_limit(session_fixture: _Fixture, limit: object) -> None:
+    tool = SessionHistoryTool()
+    result = json.loads(
+        tool.invoke(json.dumps({"action": "read", "limit": limit}), session_fixture.ctx)
+    )
+    assert "error" in result
+
+
+def test_read_empty_session_returns_no_turns(session_fixture: _Fixture) -> None:
+    tool = SessionHistoryTool()
+    result = json.loads(tool.invoke(json.dumps({"action": "read"}), session_fixture.ctx))
+    assert result["turns"] == []
+    assert result["next_cursor"] is None
+
+
+# ── group_into_turns: paging algorithm ──────────────────────
+
+
+def test_group_into_turns_caps_at_limit_and_resumes() -> None:
+    """Unit-level check of the shared pagination algorithm (no store involved)."""
+    chrono = [
+        {"id": "1", "type": "text", "role": "user"},
+        {"id": "2", "type": "text", "role": "assistant"},
+        {"id": "3", "type": "text", "role": "user"},
+        {"id": "4", "type": "text", "role": "assistant"},
+        {"id": "5", "type": "text", "role": "user"},
+        {"id": "6", "type": "text", "role": "assistant"},
+    ]
+    desc = list(reversed(chrono))
+
+    def fetch_page(before: str | None) -> tuple[list[dict], bool]:
+        start = (
+            0 if before is None else next(i for i, it in enumerate(desc) if it["id"] == before) + 1
+        )
+        batch = desc[start : start + 2]
+        return batch, (start + 2) < len(desc)
+
+    turns, next_cursor = group_into_turns(fetch_page, limit=2)
+    assert [t[0]["id"] for t in turns] == ["5", "3"]
+    assert next_cursor == "3"
+
+    turns2, next_cursor2 = group_into_turns(fetch_page, limit=2, start_cursor=next_cursor)
+    assert [t[0]["id"] for t in turns2] == ["1"]
+    assert next_cursor2 is None
+
+
+# ── search: limits ───────────────────────────────────────────
+
+
+def test_search_requires_query(session_fixture: _Fixture) -> None:
+    tool = SessionHistoryTool()
+    result = json.loads(tool.invoke(json.dumps({"action": "search"}), session_fixture.ctx))
+    assert "error" in result
+
+
+def test_search_caps_limit(session_fixture: _Fixture) -> None:
+    tool = SessionHistoryTool()
+    result = json.loads(
+        tool.invoke(
+            json.dumps({"action": "search", "query": "x", "limit": 1000}), session_fixture.ctx
+        )
+    )
+    assert "error" not in result
+
+
+# ── status: fallback + computed fields ───────────────────────
+
+
+def test_status_from_labels_omits_unknown_fields() -> None:
+    """No usage labels at all -> only the (documented-default) trigger is reported."""
+    result = status_from_labels({})
+    assert result == {"rollover_trigger_tokens": 100_000}
+
+
+def test_status_from_labels_computes_headroom_and_percent() -> None:
+    result = status_from_labels(
+        {
+            "omnigent.last_context_tokens": "5000",
+            "omnigent.last_context_window": "10000",
+            "omnigent.context.rollover_at_tokens": "8000",
+        }
+    )
+    assert result["current_context_tokens"] == 5000
+    assert result["context_window_tokens"] == 10000
+    assert result["rollover_trigger_tokens"] == 8000
+    assert result["tokens_remaining_to_rollover"] == 3000
+    assert result["context_used_percent"] == 50.0
+    assert result["source"] == "reported"
+
+
+def test_status_action_reads_session_labels(session_fixture: _Fixture) -> None:
+    session_fixture.conv_store.set_labels(
+        session_fixture.conv_id, {"omnigent.last_context_tokens": "42"}
+    )
+    tool = SessionHistoryTool()
+    result = json.loads(tool.invoke(json.dumps({"action": "status"}), session_fixture.ctx))
+    assert result["current_context_tokens"] == 42
+
+
+# ── list_chats: what a Helper may read ──────────────────────
+
+
+def _scheduled_helper(fx: _Fixture) -> ToolContext:
+    """A scheduled Helper of the fixture's session, and a ctx scoped to it."""
+    helper = fx.conv_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=fx.conv_id,
+        title="analyst:Daily note",
+        labels={SCHEDULED_HELPER_LABEL_KEY: "t1"},
+    )
+    return ToolContext(task_id="task_test", agent_id="agent_test", conversation_id=helper.id)
+
+
+@pytest.fixture()
+def single_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+
+
+def test_list_chats_finds_a_scheduled_helpers_parent(
+    session_fixture: _Fixture, single_user: None
+) -> None:
+    """A scheduled Helper sees the Conversation it works for, with a preview."""
+    store = session_fixture.conv_store
+    store.append(session_fixture.conv_id, [_user_msg("main chat question")])
+    ctx = _scheduled_helper(session_fixture)
+
+    result = json.loads(SessionHistoryTool().invoke(json.dumps({"action": "list_chats"}), ctx))
+    [found] = result["chats"]
+    assert found["id"] == session_fixture.conv_id
+    assert found["last_message_preview"] == "main chat question"
+
+
+def test_list_chats_is_empty_for_a_top_level_chat_and_a_plain_subagent(
+    session_fixture: _Fixture, single_user: None
+) -> None:
+    store = session_fixture.conv_store
+    plain = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=session_fixture.conv_id, title="analyst:other"
+    )
+    plain_ctx = ToolContext(task_id="task_test", agent_id="agent_test", conversation_id=plain.id)
+
+    tool = SessionHistoryTool()
+    top = json.loads(tool.invoke(json.dumps({"action": "list_chats"}), session_fixture.ctx))
+    assert top["chats"] == []
+    sub = json.loads(tool.invoke(json.dumps({"action": "list_chats"}), plain_ctx))
+    assert sub["chats"] == []
+
+
+def test_list_chats_excludes_another_users_parent(session_fixture: _Fixture, db_uri: str) -> None:
+    """A parent owned by a different user never surfaces as readable."""
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    perms.ensure_user("alice@example.com")
+    perms.ensure_user("mallory@example.com")
+    perms.grant("mallory@example.com", session_fixture.conv_id, LEVEL_OWNER)
+    ctx = _scheduled_helper(session_fixture)
+    perms.grant("alice@example.com", ctx.conversation_id, LEVEL_OWNER)
+
+    result = json.loads(SessionHistoryTool().invoke(json.dumps({"action": "list_chats"}), ctx))
+    assert result["chats"] == []
+
+
+# ── read / search: chat_id ───────────────────────────────────
+
+
+def test_read_with_chat_id_reads_the_parent(session_fixture: _Fixture, single_user: None) -> None:
+    store = session_fixture.conv_store
+    store.append(session_fixture.conv_id, [_user_msg("main chat first message")])
+    ctx = _scheduled_helper(session_fixture)
+
+    result = json.loads(
+        SessionHistoryTool().invoke(
+            json.dumps({"action": "read", "chat_id": session_fixture.conv_id}), ctx
+        )
+    )
+    texts = [m["content"] for turn in result["turns"] for m in turn["messages"]]
+    assert any("main chat first message" in t for t in texts)
+
+
+def test_search_with_chat_id_searches_the_parent(
+    session_fixture: _Fixture, single_user: None
+) -> None:
+    store = session_fixture.conv_store
+    store.append(session_fixture.conv_id, [_user_msg("uniquemarker in main chat")])
+    ctx = _scheduled_helper(session_fixture)
+
+    result = json.loads(
+        SessionHistoryTool().invoke(
+            json.dumps(
+                {"action": "search", "query": "uniquemarker", "chat_id": session_fixture.conv_id}
+            ),
+            ctx,
+        )
+    )
+    assert len(result["results"]) == 1
+
+
+def test_read_with_unrelated_chat_id_is_denied(session_fixture: _Fixture) -> None:
+    """chat_id must be in list_chats (or the caller's own id) — other_conv_id isn't."""
+    tool = SessionHistoryTool()
+    result = json.loads(
+        tool.invoke(
+            json.dumps({"action": "read", "chat_id": session_fixture.other_conv_id}),
+            session_fixture.ctx,
+        )
+    )
+    assert "error" in result
+
+
+def test_read_with_own_id_as_chat_id_is_allowed(session_fixture: _Fixture) -> None:
+    """Passing the caller's own id as chat_id is a no-op, not an error."""
+    session_fixture.conv_store.append(session_fixture.conv_id, [_user_msg("own message")])
+    tool = SessionHistoryTool()
+    result = json.loads(
+        tool.invoke(
+            json.dumps({"action": "read", "chat_id": session_fixture.conv_id}),
+            session_fixture.ctx,
+        )
+    )
+    assert "error" not in result
+
+
+def test_read_rejects_non_string_chat_id(session_fixture: _Fixture) -> None:
+    tool = SessionHistoryTool()
+    result = json.loads(
+        tool.invoke(json.dumps({"action": "read", "chat_id": 123}), session_fixture.ctx)
+    )
+    assert "error" in result
+
+
+# ── Schema shape ─────────────────────────────────────────────
+
+
+def test_schema_shape() -> None:
+    schema = SessionHistoryTool().get_schema()
+    func = schema["function"]
+    assert func["name"] == "session_history"
+    props = func["parameters"]["properties"]
+    assert set(props) == {"action", "cursor", "limit", "query", "chat_id"}
+    assert props["action"]["enum"] == ["list_chats", "read", "search", "status"]
+    assert func["parameters"]["required"] == ["action"]
+
+
+def test_invoke_rejects_unknown_action(session_fixture: _Fixture) -> None:
+    tool = SessionHistoryTool()
+    result = json.loads(tool.invoke(json.dumps({"action": "delete"}), session_fixture.ctx))
+    assert "error" in result
+
+
+def test_invoke_rejects_malformed_arguments(session_fixture: _Fixture) -> None:
+    tool = SessionHistoryTool()
+    result = json.loads(tool.invoke("{", session_fixture.ctx))
+    assert "error" in result
+
+
+# ── CONTEXT_MODE_LABEL sanity ────────────────────────────────
+
+
+def test_context_mode_label_constant() -> None:
+    assert CONTEXT_MODE_LABEL == "omnigent.context.mode"

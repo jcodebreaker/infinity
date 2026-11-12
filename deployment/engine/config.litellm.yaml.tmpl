@@ -1,0 +1,46 @@
+# Omnigent server config for a Superchat engine whose model calls all go through an existing
+# LiteLLM proxy (for example a company gateway). start.sh selects it when LITELLM_BASE_URL is
+# set. NON-SECRET: start.sh fills __NAME__ from the environment; ${...} is expanded by the engine.
+#
+# The engine reads LITELLM_BASE_URL (the proxy's root URL, no /v1) and LITELLM_API_KEY from its
+# own environment. The key never enters a host: each harness calls the engine's model proxy
+# with its host's launch token, and the engine adds the key (a person's or the
+# organization's saved LiteLLM key wins over it). No model is named here: the pickers list the
+# proxy's chat models, and an admin picks the default, fast and strong models in
+# Settings > Models.
+hosts:
+  provider: docker
+  # Where the runner inside each host dials back.
+  server_url: __ENGINE_PUBLIC_URL__
+  # NAMES only. Resolved from this service's environment and handed to each host's runner.
+  runner_env:
+    - OMNIGENT_BROWSER_BACKEND
+    - OMNIGENT_SUBAGENT_MAX_CONCURRENT
+    - OMNIGENT_LLM_TRACE_DIR
+    - OMNIGENT_PROMPT_CACHE_1H
+    - OTEL_EXPORTER_OTLP_ENDPOINT
+    - OMNIGENT_TELEMETRY_ENABLED
+    - OTEL_EXPORTER_OTLP_PROTOCOL
+    - OTEL_METRICS_EXPORTER
+    - OTEL_LOGS_EXPORTER
+    - OMNIGENT_OTEL_CAPTURE_CONTENT
+  host_config:
+    providers:
+      # A model connection: claude-sdk (and pi) reach LiteLLM's /v1/messages and pi its
+      # /v1/chat/completions, both through the engine's model proxy (/v1/model/litellm). Only
+      # the LiteLLM upstream: every call goes through the proxy.
+      litellm:
+        kind: gateway
+        display_name: LiteLLM
+        connection: model
+        upstreams: [litellm]
+        anthropic:
+          # Model limits pi is told (it otherwise assumes 128k context / 16k output).
+          context_window: 1000000
+          max_output_tokens: 32000
+    inference:
+      harnesses:
+        claude-sdk:
+          provider: litellm
+        pi:
+          provider: litellm

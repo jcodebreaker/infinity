@@ -1,0 +1,11 @@
+/* Design derived from nexu-io/open-design design-templates/html-ppt/assets/themes/japanese-minimal.css@802708f (https://github.com/lewislulu/html-ppt-skill),
+   MIT, Copyright (c) 2026 lewis <sudolewis@gmail.com>; the license is kept in ../LICENSE. Changes: palette, type and motifs
+   kept; rewritten for Superchat's fixed 1920x1080 canvas (px units, no vw/vh or clamp()), expressed as
+   tokens (tokens.css) plus the three surface classes of the shared layouts (../../layouts.css);
+   web fonts replaced by static Latin-subset TTFs embedded at assembly (../../fonts, SIL OFL 1.1,
+   license texts alongside); gradients and shadows dropped (they cannot become PowerPoint shapes). */
+/* Japanese Minimal: t-a = ivory, t-b = ink, t-c = warm ivory. */
+.slide.t-a { background: #fafaf5; color: #1a1a18; }
+.slide.t-b { background: #1a1a18; color: #fafaf5; --fg: #fafaf5; --muted: #b8b2a5; --accent: #ee6a57; --surface: #262623; --line: #45443f; }
+.slide.t-c { background: #f2f0e6; color: #1a1a18; --fg: #1a1a18; --muted: #5c564c; --accent: #c62f20; --surface: #fafaf5; --line: #ddd9cb; }
+.kicker { letter-spacing: 0.2em; }

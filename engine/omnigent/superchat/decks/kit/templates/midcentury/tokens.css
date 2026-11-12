@@ -1,0 +1,18 @@
+      --bg: #f3ead8;
+      --fg: #201810;
+      --muted: #5a4830;
+      --accent: #23696e;
+      --surface: #f9f2e0;
+      --shell: #08090d;
+      --line: #cdbd9c;
+      --radius: 2px;
+      --font-display: "Playfair Display", Georgia, "Times New Roman", serif;
+      --font-body: "Inter", "Helvetica Neue", Arial, sans-serif;
+      --font-mono: "Inter", "Helvetica Neue", Arial, sans-serif;
+      --display-weight: 600;
+      --display-tracking: -0.01em;
+      --accent-2: #c98618;
+      --accent-3: #b94a25;
+      --good: #5a7a3a;
+      --warn: #a8700f;
+      --font-serif: var(--font-display);

@@ -1,0 +1,24 @@
+.git
+.github
+.vercel
+.cache
+.DS_Store
+.env
+.env.*
+node_modules
+**/node_modules
+**/dist
+**/build
+**/out
+coverage
+data
+artifacts
+backups
+PRODUCT_PLAN.md
+test-results
+*.log
+
+# Local tooling state: agent worktrees are full repo copies, and the code index is local only.
+.claude
+.codegraph
+docs

@@ -1,0 +1,41 @@
+{
+  "id": "magazine-mono",
+  "name": "Magazine Mono",
+  "tagline": "Monochrome and quiet",
+  "description": "Ink on paper, one calm serif voice; monochrome and quiet.",
+  "best_for": "narratives, research readouts, strategy and thought-leadership decks",
+  "category": "editorial",
+  "mode": "light",
+  "upstream": "https://github.com/op7418/guizang-ppt-skill",
+  "license": "MIT (see LICENSE); fonts SIL OFL 1.1 (see ../../fonts/OFL-*.txt)",
+  "fonts": [
+    {
+      "family": "Newsreader",
+      "weight": 600,
+      "style": "normal",
+      "file": "Newsreader-600.ttf",
+      "license": "OFL-newsreader.txt"
+    },
+    {
+      "family": "Newsreader",
+      "weight": 400,
+      "style": "italic",
+      "file": "Newsreader-400-italic.ttf",
+      "license": "OFL-newsreader.txt"
+    },
+    {
+      "family": "Inter",
+      "weight": 400,
+      "style": "normal",
+      "file": "Inter-400.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "JetBrains Mono",
+      "weight": 500,
+      "style": "normal",
+      "file": "JetBrainsMono-500.ttf",
+      "license": "OFL-jetbrainsmono.txt"
+    }
+  ]
+}

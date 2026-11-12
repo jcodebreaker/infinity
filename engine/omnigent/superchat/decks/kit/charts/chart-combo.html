@@ -1,0 +1,30 @@
+<!-- Superchat original (no upstream): a bar and a line sharing one chart on two value axes, the shape of
+     "volume and rate". Chart.js draws it from per-dataset `type` and `yAxisID`; the export turns it into
+     one PowerPoint combo chart with a secondary axis. -->
+<section class="slide t-a l-chart" data-screen-label="08 Orders and conversion" data-superchat-id="orders-combo">
+  <div class="kicker" data-superchat-id="orders-combo-kicker">Chart · bar and line</div>
+  <h2 class="title" data-superchat-id="orders-combo-title">Orders grew while conversion held</h2>
+  <div class="chart" data-superchat-id="orders-combo-chart"><canvas id="orders-combo-canvas" data-superchat-id="orders-combo-canvas"></canvas></div>
+  <p class="source" data-superchat-id="orders-combo-source">Source: sales/orders.csv, columns orders and conversion_pct, by month</p>
+  <script data-superchat-chart>
+    addEventListener('DOMContentLoaded',()=>{
+      const canvas=document.getElementById('orders-combo-canvas');
+      const css=getComputedStyle(canvas);
+      const accent=css.getPropertyValue('--accent').trim();
+      const acc2=css.getPropertyValue('--accent-2').trim();
+      const text2=css.getPropertyValue('--muted').trim();
+      const border=css.getPropertyValue('--line').trim();
+      new Chart(canvas,{type:'bar',
+        data:{labels:['Jan','Feb','Mar','Apr','May','Jun'],
+          datasets:[
+            {type:'bar',label:'Orders',data:[820,910,1040,980,1180,1320],backgroundColor:accent,yAxisID:'y'},
+            {type:'line',label:'Conversion %',data:[2.1,2.2,2.2,2.4,2.5,2.5],borderColor:acc2,backgroundColor:acc2,borderWidth:3,pointRadius:4,yAxisID:'y1'}]},
+        options:{responsive:true,maintainAspectRatio:false,
+          plugins:{legend:{labels:{color:text2}}},
+          scales:{x:{ticks:{color:text2},grid:{color:border}},
+                  y:{position:'left',ticks:{color:text2,format:{useGrouping:true}},grid:{color:border}},
+                  y1:{position:'right',ticks:{color:text2,format:{minimumFractionDigits:1}},grid:{drawOnChartArea:false}}}}});
+    });
+  </script>
+  <div class="foot" data-superchat-id="orders-combo-foot"><span data-superchat-id="orders-combo-foot-left">Deck name</span><span data-superchat-id="orders-combo-foot-page">08</span></div>
+</section>

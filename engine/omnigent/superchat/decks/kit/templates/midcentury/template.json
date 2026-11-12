@@ -1,0 +1,35 @@
+{
+  "id": "midcentury",
+  "name": "Midcentury",
+  "tagline": "Retro geometric warmth",
+  "description": "Cream, teal, mustard and burnt orange with sharp geometry and Playfair titles.",
+  "best_for": "design history, retro-flavoured brands, warm storytelling",
+  "category": "bold",
+  "mode": "light",
+  "upstream": "https://github.com/lewislulu/html-ppt-skill",
+  "source": "nexu-io/open-design design-templates/html-ppt/assets/themes/midcentury.css@802708f",
+  "license": "MIT (see LICENSE); fonts SIL OFL 1.1 (see ../../fonts/OFL-*.txt)",
+  "fonts": [
+    {
+      "family": "Inter",
+      "weight": 400,
+      "style": "normal",
+      "file": "Inter-400.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Inter",
+      "weight": 600,
+      "style": "normal",
+      "file": "Inter-600.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Playfair Display",
+      "weight": 600,
+      "style": "normal",
+      "file": "PlayfairDisplay-600.ttf",
+      "license": "OFL-playfairdisplay.txt"
+    }
+  ]
+}

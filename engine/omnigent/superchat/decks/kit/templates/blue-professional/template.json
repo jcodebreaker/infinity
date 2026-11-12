@@ -1,0 +1,41 @@
+{
+  "id": "blue-professional",
+  "name": "Blue Professional",
+  "tagline": "Cobalt on cream",
+  "description": "Cream paper with electric cobalt accents; clean, modern, trustworthy.",
+  "best_for": "business reviews, proposals, internal updates, anything decision-grade",
+  "category": "professional",
+  "mode": "light",
+  "upstream": "https://github.com/zarazhangrui/beautiful-html-templates/tree/main/templates/blue-professional",
+  "license": "MIT (see LICENSE); fonts SIL OFL 1.1 (see ../../fonts/OFL-*.txt)",
+  "fonts": [
+    {
+      "family": "Space Grotesk",
+      "weight": 700,
+      "style": "normal",
+      "file": "SpaceGrotesk-700.ttf",
+      "license": "OFL-spacegrotesk.txt"
+    },
+    {
+      "family": "Space Grotesk",
+      "weight": 500,
+      "style": "normal",
+      "file": "SpaceGrotesk-500.ttf",
+      "license": "OFL-spacegrotesk.txt"
+    },
+    {
+      "family": "Inter",
+      "weight": 400,
+      "style": "normal",
+      "file": "Inter-400.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Inter",
+      "weight": 600,
+      "style": "normal",
+      "file": "Inter-600.ttf",
+      "license": "OFL-inter.txt"
+    }
+  ]
+}

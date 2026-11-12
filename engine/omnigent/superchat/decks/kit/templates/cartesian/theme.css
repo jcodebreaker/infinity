@@ -1,0 +1,11 @@
+/* Design derived from nexu-io/open-design design-templates/html-ppt-zhangzara-cartesian@802708f (https://github.com/zarazhangrui/beautiful-html-templates/tree/main/templates/cartesian),
+   MIT, Copyright (c) 2026 Zara Zhang; the license is kept in ../LICENSE. Changes: palette, type and motifs
+   kept; rewritten for Superchat's fixed 1920x1080 canvas (px units, no vw/vh or clamp()), expressed as
+   tokens (tokens.css) plus the three surface classes of the shared layouts (../../layouts.css);
+   web fonts replaced by static Latin-subset TTFs embedded at assembly (../../fonts, SIL OFL 1.1,
+   license texts alongside); gradients and shadows dropped (they cannot become PowerPoint shapes). */
+/* Cartesian: t-a = taupe paper, t-b = charcoal, t-c = deeper taupe. */
+.slide.t-a { background: #ede8e0; color: #1a1a1a; }
+.slide.t-b { background: #1a1a1a; color: #ede8e0; --fg: #ede8e0; --muted: #b8b0a4; --accent: #ede8e0; --surface: #262626; --line: #4a4a4a; }
+.slide.t-c { background: #e2dbd1; color: #1a1a1a; --fg: #1a1a1a; --muted: #5a5a5a; --accent: #6b6359; --surface: #ede8e0; --line: #b8b0a4; }
+.point, .col .panel, .l-chart .panel { border-width: 1px; }

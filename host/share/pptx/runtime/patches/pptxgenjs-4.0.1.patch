@@ -1,0 +1,124 @@
+Superchat's fixes to PptxGenJS 4.0.1 (MIT), applied by ../install.sh to dist/pptxgen.cjs.js (the
+package "main") and dist/pptxgen.es.js ("module"). The browser bundles (bundle, min) are not used
+in the host and are left as published. Each change is the upstream fix, ported from src/ to
+the built files:
+
+  1. gitbrent/PptxGenJS#1531, PR #1537: a category chart's embedded workbook wrote its table
+     ref as "A1:C5'" (stray apostrophe). Keynote and Quick Look drop the whole chart when the
+     workbook does not parse. The bubble chart's table ref also used the column count for its
+     last row; it now uses the row count.
+  2. PR #1540: 2D charts (bar, line, area, radar) listed a series axis id they never define,
+     which makes PowerPoint offer to repair the file. Only BAR3D keeps its series axis.
+  3. #1531, "secondary nit": a data value of 0 was written to the workbook as an empty cell
+     (<v></v>) by "value || ''"; Edit Data showed a blank. It is now written as 0.
+
+Remove this patch (and the grep marker in ../install.sh) when PptxGenJS ships all three.
+
+--- a/dist/pptxgen.cjs.js
++++ b/dist/pptxgen.cjs.js
+@@ -3054,7 +3054,7 @@
+             {
+                 let strTableXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+                 if (chartObject.opts._type === CHART_TYPE.BUBBLE || chartObject.opts._type === CHART_TYPE.BUBBLE3D) {
+-                    strTableXml += `<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Table1" displayName="Table1" ref="A1:${getExcelColName(intBubbleCols)}${intBubbleCols}" totalsRowShown="0">`;
++                    strTableXml += `<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Table1" displayName="Table1" ref="A1:${getExcelColName(intBubbleCols)}${data[0].values.length + 1}" totalsRowShown="0">`;
+                     strTableXml += `<tableColumns count="${intBubbleCols}">`;
+                     let idxColLtr = 1;
+                     data.forEach((obj, idx) => {
+@@ -3076,7 +3076,7 @@
+                     });
+                 }
+                 else {
+-                    strTableXml += `<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Table1" displayName="Table1" ref="A1:${getExcelColName(data.length + data[0].labels.length)}${data[0].labels[0].length + 1}'" totalsRowShown="0">`;
++                    strTableXml += `<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Table1" displayName="Table1" ref="A1:${getExcelColName(data.length + data[0].labels.length)}${data[0].labels[0].length + 1}" totalsRowShown="0">`;
+                     strTableXml += `<tableColumns count="${data.length + data[0].labels.length}">`;
+                     data[0].labels.forEach((_labelsGroup, idx) => {
+                         strTableXml += `<tableColumn id="${idx + 1}" name="Column${idx + 1}"/>`;
+@@ -3138,10 +3138,10 @@
+                         let idxColLtr = 2;
+                         for (let idy = 1; idy < data.length; idy++) {
+                             // y-value
+-                            strSheetXml += `<c r="${getExcelColName(idxColLtr)}${idx + 2}"><v>${data[idy].values[idx] || ''}</v></c>`;
++                            strSheetXml += `<c r="${getExcelColName(idxColLtr)}${idx + 2}"><v>${data[idy].values[idx] || data[idy].values[idx] === 0 ? data[idy].values[idx] : ''}</v></c>`;
+                             idxColLtr++;
+                             // y-size
+-                            strSheetXml += `<c r="${getExcelColName(idxColLtr)}${idx + 2}"><v>${data[idy].sizes[idx] || ''}</v></c>`;
++                            strSheetXml += `<c r="${getExcelColName(idxColLtr)}${idx + 2}"><v>${data[idy].sizes[idx] || data[idy].sizes[idx] === 0 ? data[idy].sizes[idx] : ''}</v></c>`;
+                             idxColLtr++;
+                         }
+                         strSheetXml += '</row>';
+@@ -3226,7 +3226,7 @@
+                                 strSheetXml += '</c>';
+                             }
+                             for (let idy = 0; idy < data.length; idy++) {
+-                                strSheetXml += `<c r="${getExcelColName(data[0].labels.length + idy + 1)}${idx + 2}"><v>${data[idy].values[idx] || ''}</v></c>`;
++                                strSheetXml += `<c r="${getExcelColName(data[0].labels.length + idy + 1)}${idx + 2}"><v>${data[idy].values[idx] || data[idy].values[idx] === 0 ? data[idy].values[idx] : ''}</v></c>`;
+                             }
+                             strSheetXml += '</row>';
+                         });
+@@ -3843,7 +3843,10 @@
+                 strXml += '  <c:marker val="1"/>';
+             }
+             // 5: Add axisId (NOTE: order matters! (category comes first))
+-            strXml += `<c:axId val="${catAxisId}"/><c:axId val="${valAxisId}"/><c:axId val="${AXIS_ID_SERIES_PRIMARY}"/>`;
++            strXml += `<c:axId val="${catAxisId}"/><c:axId val="${valAxisId}"/>`;
++            // Only 3D bar charts use a series axis (PptxGenJS #1540).
++            if (chartType === CHART_TYPE.BAR3D)
++                strXml += `<c:axId val="${AXIS_ID_SERIES_PRIMARY}"/>`;
+             // 6: Close Chart tag
+             strXml += `</c:${chartType}Chart>`;
+             // end switch
+--- a/dist/pptxgen.es.js
++++ b/dist/pptxgen.es.js
+@@ -3052,7 +3052,7 @@
+             {
+                 let strTableXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+                 if (chartObject.opts._type === CHART_TYPE.BUBBLE || chartObject.opts._type === CHART_TYPE.BUBBLE3D) {
+-                    strTableXml += `<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Table1" displayName="Table1" ref="A1:${getExcelColName(intBubbleCols)}${intBubbleCols}" totalsRowShown="0">`;
++                    strTableXml += `<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Table1" displayName="Table1" ref="A1:${getExcelColName(intBubbleCols)}${data[0].values.length + 1}" totalsRowShown="0">`;
+                     strTableXml += `<tableColumns count="${intBubbleCols}">`;
+                     let idxColLtr = 1;
+                     data.forEach((obj, idx) => {
+@@ -3074,7 +3074,7 @@
+                     });
+                 }
+                 else {
+-                    strTableXml += `<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Table1" displayName="Table1" ref="A1:${getExcelColName(data.length + data[0].labels.length)}${data[0].labels[0].length + 1}'" totalsRowShown="0">`;
++                    strTableXml += `<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="1" name="Table1" displayName="Table1" ref="A1:${getExcelColName(data.length + data[0].labels.length)}${data[0].labels[0].length + 1}" totalsRowShown="0">`;
+                     strTableXml += `<tableColumns count="${data.length + data[0].labels.length}">`;
+                     data[0].labels.forEach((_labelsGroup, idx) => {
+                         strTableXml += `<tableColumn id="${idx + 1}" name="Column${idx + 1}"/>`;
+@@ -3136,10 +3136,10 @@
+                         let idxColLtr = 2;
+                         for (let idy = 1; idy < data.length; idy++) {
+                             // y-value
+-                            strSheetXml += `<c r="${getExcelColName(idxColLtr)}${idx + 2}"><v>${data[idy].values[idx] || ''}</v></c>`;
++                            strSheetXml += `<c r="${getExcelColName(idxColLtr)}${idx + 2}"><v>${data[idy].values[idx] || data[idy].values[idx] === 0 ? data[idy].values[idx] : ''}</v></c>`;
+                             idxColLtr++;
+                             // y-size
+-                            strSheetXml += `<c r="${getExcelColName(idxColLtr)}${idx + 2}"><v>${data[idy].sizes[idx] || ''}</v></c>`;
++                            strSheetXml += `<c r="${getExcelColName(idxColLtr)}${idx + 2}"><v>${data[idy].sizes[idx] || data[idy].sizes[idx] === 0 ? data[idy].sizes[idx] : ''}</v></c>`;
+                             idxColLtr++;
+                         }
+                         strSheetXml += '</row>';
+@@ -3224,7 +3224,7 @@
+                                 strSheetXml += '</c>';
+                             }
+                             for (let idy = 0; idy < data.length; idy++) {
+-                                strSheetXml += `<c r="${getExcelColName(data[0].labels.length + idy + 1)}${idx + 2}"><v>${data[idy].values[idx] || ''}</v></c>`;
++                                strSheetXml += `<c r="${getExcelColName(data[0].labels.length + idy + 1)}${idx + 2}"><v>${data[idy].values[idx] || data[idy].values[idx] === 0 ? data[idy].values[idx] : ''}</v></c>`;
+                             }
+                             strSheetXml += '</row>';
+                         });
+@@ -3841,7 +3841,10 @@
+                 strXml += '  <c:marker val="1"/>';
+             }
+             // 5: Add axisId (NOTE: order matters! (category comes first))
+-            strXml += `<c:axId val="${catAxisId}"/><c:axId val="${valAxisId}"/><c:axId val="${AXIS_ID_SERIES_PRIMARY}"/>`;
++            strXml += `<c:axId val="${catAxisId}"/><c:axId val="${valAxisId}"/>`;
++            // Only 3D bar charts use a series axis (PptxGenJS #1540).
++            if (chartType === CHART_TYPE.BAR3D)
++                strXml += `<c:axId val="${AXIS_ID_SERIES_PRIMARY}"/>`;
+             // 6: Close Chart tag
+             strXml += `</c:${chartType}Chart>`;
+             // end switch

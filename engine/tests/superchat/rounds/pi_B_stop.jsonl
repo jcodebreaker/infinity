@@ -1,0 +1,51 @@
+{"t": 0.198, "round_id": "r1", "kind": "round.opened", "actor": "person", "text": "Make a 5-slide deck about Uruguay."}
+{"t": 0.198, "round_id": "r1", "kind": "turn.started", "actor": "assistant"}
+{"t": 1.079, "round_id": "r1", "kind": "words", "actor": "assistant", "text": "I"}
+{"t": 1.552, "round_id": "r1", "kind": "words", "actor": "assistant", "text": "'ll put"}
+{"t": 1.556, "round_id": "r1", "kind": "words", "actor": "assistant", "text": " together a 5-slide de"}
+{"t": 1.557, "round_id": "r1", "kind": "words", "actor": "assistant", "text": "ck about Uruguay cov"}
+{"t": 1.557, "round_id": "r1", "kind": "words", "actor": "assistant", "text": "ering its over"}
+{"t": 1.557, "round_id": "r1", "kind": "words", "actor": "assistant", "text": "view, history, econom"}
+{"t": 1.557, "round_id": "r1", "kind": "words", "actor": "assistant", "text": "y, culture, and trav"}
+{"t": 1.557, "round_id": "r1", "kind": "words", "actor": "assistant", "text": "el high"}
+{"t": 1.557, "round_id": "r1", "kind": "words", "actor": "assistant", "text": "lights."}
+{"t": 1.619, "round_id": "r1", "kind": "tool.started", "actor": "assistant", "call_id": "c1", "name": "start_helper"}
+{"t": 1.619, "round_id": "r1", "kind": "tool.input", "actor": "assistant", "call_id": "c1", "name": "start_helper", "bytes": 0}
+{"t": 2.666, "round_id": "r1", "kind": "tool.input", "actor": "assistant", "call_id": "c1", "name": "start_helper", "bytes": 299}
+{"t": 3.666, "round_id": "r1", "kind": "tool.input", "actor": "assistant", "call_id": "c1", "name": "start_helper", "bytes": 579}
+{"t": 4.666, "round_id": "r1", "kind": "tool.input", "actor": "assistant", "call_id": "c1", "name": "start_helper", "bytes": 834}
+{"t": 5.716, "round_id": "r1", "kind": "tool.input", "actor": "assistant", "call_id": "c1", "name": "start_helper", "bytes": 1144}
+{"t": 6.764, "round_id": "r1", "kind": "tool.input", "actor": "assistant", "call_id": "c1", "name": "start_helper", "bytes": 1309}
+{"t": 7.765, "round_id": "r1", "kind": "tool.input", "actor": "assistant", "call_id": "c1", "name": "start_helper", "bytes": 1554}
+{"t": 8.815, "round_id": "r1", "kind": "tool.input", "actor": "assistant", "call_id": "c1", "name": "start_helper", "bytes": 1790}
+{"t": 9.185, "round_id": "r1", "kind": "tool.result", "actor": "assistant", "call_id": "c1", "name": "start_helper", "ok": true}
+{"t": 9.185, "round_id": "r1", "kind": "helper.started", "actor": "assistant", "helper_id": "h1", "title": "5-slide Uruguay deck"}
+{"t": 9.877, "round_id": "r1", "kind": "words", "actor": "assistant", "text": "Working on your"}
+{"t": 9.877, "round_id": "r1", "kind": "words", "actor": "assistant", "text": " Uruguay deck now"}
+{"t": 9.877, "round_id": "r1", "kind": "words", "actor": "assistant", "text": "."}
+{"t": 9.877, "round_id": "r1", "kind": "turn.ended", "actor": "assistant", "status": "done"}
+{"t": 14.355, "round_id": "r1", "kind": "tool.started", "actor": "helper", "helper_id": "h1", "call_id": "c2", "name": "artifact_save"}
+{"t": 14.356, "round_id": "r1", "kind": "tool.input", "actor": "helper", "helper_id": "h1", "call_id": "c2", "name": "artifact_save", "bytes": 0}
+{"t": 15.397, "round_id": "r1", "kind": "tool.input", "actor": "helper", "helper_id": "h1", "call_id": "c2", "name": "artifact_save", "bytes": 339}
+{"t": 16.399, "round_id": "r1", "kind": "tool.input", "actor": "helper", "helper_id": "h1", "call_id": "c2", "name": "artifact_save", "bytes": 573}
+{"t": 17.399, "round_id": "r1", "kind": "tool.input", "actor": "helper", "helper_id": "h1", "call_id": "c2", "name": "artifact_save", "bytes": 802}
+{"t": 17.879, "round_id": "r1", "kind": "stop.requested", "actor": "person", "scope": "round"}
+{"t": 17.88, "round_id": "r1", "kind": "helper.finished", "actor": "helper", "helper_id": "h1", "status": "stopped", "result": "Pi process ended without response."}
+{"t": 17.892, "round_id": "r2", "kind": "round.opened", "actor": "person", "text": "Did it finish?"}
+{"t": 17.892, "round_id": "r2", "kind": "turn.started", "actor": "assistant"}
+{"t": 19.684, "round_id": "r2", "kind": "words", "actor": "assistant", "text": "No, it didn't fin"}
+{"t": 19.684, "round_id": "r2", "kind": "words", "actor": "assistant", "text": "ish. You stopped it before"}
+{"t": 19.684, "round_id": "r2", "kind": "words", "actor": "assistant", "text": " it was"}
+{"t": 19.685, "round_id": "r2", "kind": "words", "actor": "assistant", "text": " done, so no deck was sa"}
+{"t": 19.685, "round_id": "r2", "kind": "words", "actor": "assistant", "text": "ved. I can start it again wh"}
+{"t": 19.685, "round_id": "r2", "kind": "words", "actor": "assistant", "text": "enever you want,"}
+{"t": 19.685, "round_id": "r2", "kind": "words", "actor": "assistant", "text": " either"}
+{"t": 19.685, "round_id": "r2", "kind": "words", "actor": "assistant", "text": " as"}
+{"t": 19.685, "round_id": "r2", "kind": "words", "actor": "assistant", "text": " plan"}
+{"t": 19.685, "round_id": "r2", "kind": "words", "actor": "assistant", "text": "ned or with chang"}
+{"t": 19.685, "round_id": "r2", "kind": "words", "actor": "assistant", "text": "es."}
+{"t": 19.685, "round_id": "r2", "kind": "tool.started", "actor": "assistant", "call_id": "c3", "name": "suggest_follow_ups"}
+{"t": 19.686, "round_id": "r2", "kind": "tool.input", "actor": "assistant", "call_id": "c3", "name": "suggest_follow_ups", "bytes": 0}
+{"t": 20.299, "round_id": "r2", "kind": "tool.result", "actor": "assistant", "call_id": "c3", "name": "suggest_follow_ups", "ok": true}
+{"t": 20.299, "round_id": "r2", "kind": "chips", "actor": "assistant", "items": ["Start the Uruguay deck again", "Make it a travel-focused deck instead", "Change the slide topics first"]}
+{"t": 20.898, "round_id": "r2", "kind": "turn.ended", "actor": "assistant", "status": "done"}

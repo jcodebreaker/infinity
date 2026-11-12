@@ -1,0 +1,31 @@
+<!-- Portions modified from nexu-io/open-design design-templates/html-ppt/templates/single-page/chart-bar.html@802708f,
+     MIT (Copyright (c) 2026 lewis, see design-templates/html-ppt/LICENSE; the repository is Apache-2.0).
+     Changes: the <section> alone (Superchat supplies the deck around it); Superchat layout classes and data-superchat-id
+     on every element; a caption that cites the data source; a unique canvas id per slide; the colors are
+     read from the canvas' own CSS tokens (--accent, --accent-2, --accent-3, --muted, --line) so a slide
+     surface can recolor them; the chart is in a fixed-height container (data-report skill rule); the
+     script carries data-superchat-chart. The Chart.js options are otherwise as in the template. -->
+<section class="slide t-a l-chart" data-screen-label="04 MRR by quarter" data-superchat-id="mrr-bar">
+  <div class="kicker" data-superchat-id="mrr-bar-kicker">Chart · bar</div>
+  <h2 class="title" data-superchat-id="mrr-bar-title">Quarterly MRR</h2>
+  <div class="chart" data-superchat-id="mrr-bar-chart"><canvas id="mrr-bar-canvas" data-superchat-id="mrr-bar-canvas"></canvas></div>
+  <p class="source" data-superchat-id="mrr-bar-source">Source: finance/mrr.csv, column mrr_k, summed by quarter</p>
+  <script data-superchat-chart>
+    addEventListener('DOMContentLoaded',()=>{
+      const canvas=document.getElementById('mrr-bar-canvas');
+      const css=getComputedStyle(canvas);
+      const accent=css.getPropertyValue('--accent').trim();
+      const text2=css.getPropertyValue('--muted').trim();
+      const border=css.getPropertyValue('--line').trim();
+      new Chart(canvas,{type:'bar',
+        data:{labels:['Q1','Q2','Q3','Q4','Q1 +1','Q2 +1','Q3 +1','Q4 +1'],
+          datasets:[{label:'MRR (K)',data:[42,58,73,96,124,158,204,261],
+            backgroundColor:accent,borderRadius:8,barThickness:36}]},
+        options:{responsive:true,maintainAspectRatio:false,
+          plugins:{legend:{labels:{color:text2}}},
+          scales:{x:{ticks:{color:text2},grid:{color:border}},
+                  y:{ticks:{color:text2},grid:{color:border}}}}});
+    });
+  </script>
+  <div class="foot" data-superchat-id="mrr-bar-foot"><span data-superchat-id="mrr-bar-foot-left">Deck name</span><span data-superchat-id="mrr-bar-foot-page">04</span></div>
+</section>

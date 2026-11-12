@@ -1,0 +1,2439 @@
+"""Tests for runner-side environment filesystem endpoints (Phase 3)."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import shutil
+import subprocess
+import sys
+from collections.abc import AsyncIterator
+from pathlib import Path
+from types import SimpleNamespace
+
+import httpx
+import pytest
+from fastapi import FastAPI
+
+from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+from omnigent.entities.environment_filesystem import FilesystemPathNotFound
+from omnigent.harnesses.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.harnesses.os_env import create_os_environment
+from omnigent.runner import create_runner_app
+from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
+from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
+from tests.runner.helpers import NullServerClient
+
+
+@pytest.fixture
+def workspace(tmp_path: Path) -> Path:
+    """Create a workspace with test files."""
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / "hello.txt").write_text("hello world")
+    (ws / "src").mkdir()
+    (ws / "src" / "main.py").write_text("print('hi')")
+    # A binary file (PNG signature + a NUL) that is not valid UTF-8, used to
+    # exercise the base64 binary-read path.
+    (ws / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x01\x02\xff")
+    return ws
+
+
+@pytest.fixture
+def registry(workspace: Path) -> SessionResourceRegistry:
+    """Registry with a real CallerProcessOSEnvironment."""
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+    assert os_env is not None
+    reg = SessionResourceRegistry()
+    reg._primary_envs["conv_test"] = os_env
+    return reg
+
+
+@pytest.fixture
+def app(registry: SessionResourceRegistry, workspace: Path) -> FastAPI:
+    """Runner app with the registry."""
+    return create_runner_app(
+        resource_registry=registry,
+        runner_workspace=workspace,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+
+@pytest.fixture
+async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    """httpx client for the runner app."""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://runner",
+    ) as c:
+        yield c
+
+
+@pytest.mark.asyncio
+async def test_list_environment_root(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET /filesystem lists root directory entries."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "list"
+    names = {e["name"] for e in body["data"]}
+    assert "hello.txt" in names
+    assert "src" in names
+
+
+@pytest.mark.asyncio
+async def test_list_environment_root_with_broken_symlink(
+    tmp_path: Path,
+) -> None:
+    """GET /filesystem succeeds even when the workspace contains a broken symlink.
+
+    Broken symlinks are common in large repos (e.g. Bazel convenience symlinks
+    like bazel-out/bazel-bin pointing to a cleaned or absent cache).  The old
+    os.stat()-based implementation would raise FileNotFoundError and fail the
+    entire listing; the new implementation uses os.lstat() so broken symlinks
+    are listed as file-type entries rather than crashing the whole request.
+    """
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / "real.txt").write_text("hello")
+    # Create a symlink that points to a non-existent target.
+    (ws / "broken_link").symlink_to(ws / "does_not_exist")
+
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    reg = SessionResourceRegistry()
+    reg._primary_envs["conv_broken"] = os_env
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=ws,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
+        resp = await c.get(
+            f"/v1/sessions/conv_broken/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["object"] == "list"
+    names = {e["name"] for e in body["data"]}
+    # The real file is visible.
+    assert "real.txt" in names
+    # Broken symlinks are listed as file-type entries via the lstat fallback
+    # rather than being silently skipped or crashing. Size is None because
+    # os.stat() (which follows symlinks) fails and lstat() on the symlink
+    # itself doesn't reflect the target's size.
+    assert "broken_link" in names
+    broken_entry = next(e for e in body["data"] if e["name"] == "broken_link")
+    assert broken_entry["type"] == "file"
+    assert broken_entry["bytes"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_subdirectory(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET /filesystem/src lists the src directory."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem/src"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    names = {e["name"] for e in body["data"]}
+    assert "main.py" in names
+
+
+@pytest.mark.asyncio
+async def test_read_file_content(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET /filesystem/hello.txt returns file content."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/hello.txt"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "session.environment.filesystem.file_content"
+    assert body["content"] == "hello world"
+    assert body["encoding"] == "utf-8"
+    assert body["bytes"] == 11
+
+
+@pytest.mark.asyncio
+async def test_read_binary_file_content(
+    client: httpx.AsyncClient,
+) -> None:
+    """A non-UTF-8 file is returned whole as base64, not truncated text."""
+    import base64
+
+    raw = b"\x89PNG\r\n\x1a\n\x00\x01\x02\xff"
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/logo.png"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["encoding"] == "base64"
+    assert body["content_type"] == "image/png"
+    # The base64 payload round-trips to the exact original bytes — no
+    # UTF-8 replacement-char corruption.
+    assert base64.b64decode(body["content"]) == raw
+    assert body["bytes"] == len(raw)
+    assert body["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_read_text_byte_cap_truncates_on_utf8_boundary(
+    workspace: Path,
+) -> None:
+    """A byte cap that lands mid-codepoint still yields decodable UTF-8.
+
+    Slicing the raw UTF-8 byte string at an arbitrary cap can split a
+    multi-byte codepoint, leaving invalid bytes that raise
+    ``UnicodeDecodeError`` (500) when the response path later decodes them.
+    The read path must truncate on a valid boundary instead.
+    """
+    # "é" is 2 bytes (0xC3 0xA9) in UTF-8; on "aé" a 2-byte cap keeps the "a"
+    # and lands mid-codepoint inside "é".
+    (workspace / "accents.txt").write_text("aé")
+
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+
+    content = await fs.read("accents.txt", max_bytes=2)
+    assert content.truncated is True
+    # The partial trailing codepoint is dropped, leaving decodable bytes.
+    assert content.data.decode("utf-8") == "a"
+
+
+@pytest.mark.asyncio
+async def test_write_file(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """PUT /filesystem/new.txt creates a file."""
+    resp = await client.put(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/new.txt",
+        json={"content": "new content", "encoding": "utf-8"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "session.environment.filesystem.write_result"
+    assert body["created"] is True
+    assert body["bytes_written"] == 11
+    assert (workspace / "new.txt").read_text() == "new content"
+
+
+@pytest.mark.asyncio
+async def test_write_file_with_if_exists_fail_never_overwrites(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """``if_exists: "fail"`` is an exclusive create: the second writer of a name gets 409."""
+    url = (
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/up/report.txt"
+    )
+    first, second = await asyncio.gather(
+        client.put(url, json={"content": "one", "encoding": "utf-8", "if_exists": "fail"}),
+        client.put(url, json={"content": "two", "encoding": "utf-8", "if_exists": "fail"}),
+    )
+    assert sorted([first.status_code, second.status_code]) == [200, 409]
+    winner = "one" if first.status_code == 200 else "two"
+    assert (workspace / "up" / "report.txt").read_text() == winner
+    # a plain PUT still replaces, as before
+    again = await client.put(url, json={"content": "three", "encoding": "utf-8"})
+    assert again.status_code == 200
+    assert (workspace / "up" / "report.txt").read_text() == "three"
+
+
+@pytest.mark.asyncio
+async def test_edit_file(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """PATCH /filesystem/hello.txt edits a file."""
+    resp = await client.patch(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/hello.txt",
+        json={"old_text": "hello", "new_text": "goodbye"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "session.environment.filesystem.edit_result"
+    assert body["replacements"] == 1
+    assert (workspace / "hello.txt").read_text() == "goodbye world"
+
+
+@pytest.mark.asyncio
+async def test_delete_file(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """DELETE /filesystem/hello.txt deletes a file."""
+    resp = await client.delete(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/hello.txt"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "session.environment.filesystem.delete_result"
+    assert body["deleted"] is True
+    assert not (workspace / "hello.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_nonempty_directory_requires_recursive(
+    client: httpx.AsyncClient,
+) -> None:
+    """DELETE /filesystem/src without recursive=true returns 409."""
+    resp = await client.delete(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem/src"
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "directory_not_empty"
+
+
+@pytest.mark.asyncio
+async def test_delete_directory_recursive(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """DELETE /filesystem/src?recursive=true deletes the directory."""
+    resp = await client.delete(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/src?recursive=true"
+    )
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] is True
+    assert not (workspace / "src").exists()
+
+
+# ── shell-injection regression for stat/_stat_via_shell/_check_dir_empty ──
+
+
+@pytest.mark.asyncio
+async def test_delete_path_with_command_substitution_does_not_execute(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """A DELETE path containing ``$(...)`` must not execute the substituted command.
+
+    Regression test: the DELETE handler reaches ``_stat_via_shell``
+    and ``_check_dir_empty``, which used to interpolate the caller-controlled
+    path into a double-quoted ``python3 -c`` script. The shell expanded
+    ``$(...)`` before python ran, giving arbitrary command execution.
+
+    The payload ``inj$(touch PWNED)x`` would, on the vulnerable code, run
+    ``touch PWNED`` in the workspace (cwd of the helper). With the path
+    embedded as a Python literal via ``json.dumps`` and the whole script
+    shell-quoted, the string is statted verbatim — no command runs.
+    """
+    import urllib.parse
+
+    # The marker the injected command would create if substitution fired.
+    marker = workspace / "PWNED"
+    assert not marker.exists(), "Precondition: marker must not exist before the request."
+
+    payload = "inj$(touch PWNED)x"
+    encoded = urllib.parse.quote(payload, safe="")
+    resp = await client.delete(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/{encoded}"
+    )
+
+    # The literal path does not exist, so the stat fails and the endpoint
+    # returns 404 — on BOTH old and new code the HTTP status is 404 (the
+    # substituted command produced empty output, leaving "injx"). The marker
+    # is the discriminator: it is created only if the injection executed.
+    assert resp.status_code == 404, (
+        f"Expected 404 for a non-existent literal path, got {resp.status_code}. Body: {resp.text}"
+    )
+    assert not marker.exists(), (
+        "Injected command executed: the 'PWNED' marker was created. The path "
+        "reached a shell-interpreted context (shell-injection regression)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_real_file_with_command_substitution_name(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """A real file whose name literally contains ``$(...)`` can be deleted.
+
+    Usability guard for the shell-injection fix: embedding the path as a Python
+    literal must treat shell metacharacters as ordinary filename bytes, so a
+    legitimately (if unusually) named file is statted and removed correctly.
+
+    If the path were still shell-interpreted, ``$(whoami)`` would expand and
+    ``os.stat`` would receive a *different* string (``data<user>.txt``), the
+    stat would miss, and the real file would be left on disk — surfacing as a
+    404 and a surviving file. Asserting a successful delete of the real file
+    proves the verbatim path made it through.
+    """
+    import urllib.parse
+
+    weird_name = "data$(whoami).txt"
+    target = workspace / weird_name
+    target.write_text("payload-bytes")
+    assert target.exists(), "Precondition: the metacharacter-named file must exist."
+
+    encoded = urllib.parse.quote(weird_name, safe="")
+    resp = await client.delete(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/{encoded}"
+    )
+
+    assert resp.status_code == 200, (
+        f"Expected 200 deleting a real metacharacter-named file, got "
+        f"{resp.status_code}. A non-200 means the literal path was not used. "
+        f"Body: {resp.text}"
+    )
+    body = resp.json()
+    assert body["deleted"] is True, "The endpoint must report the file as deleted."
+    assert body["type"] == "file", "The metacharacter-named entry is a regular file."
+    # The verbatim-named file is gone — proves stat + rm both used the literal path.
+    assert not target.exists(), (
+        f"File {weird_name!r} still on disk after a reported delete; the rm "
+        "did not target the literal path."
+    )
+
+
+@pytest.mark.asyncio
+async def test_stat_path_with_command_substitution_does_not_execute(
+    workspace: Path,
+) -> None:
+    """``CallerProcessFilesystem.stat`` must not execute ``$(...)`` in the path.
+
+    ``stat`` shares the same shell-injection flaw but is not wired to a GET route, so it
+    is exercised here through its public method. A non-existent literal path
+    containing a command substitution must raise ``FilesystemPathNotFound``
+    without creating the marker the substituted command would produce.
+    """
+    from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+
+    marker = workspace / "PWNED_STAT"
+    assert not marker.exists(), "Precondition: stat marker must not exist."
+
+    with pytest.raises(FilesystemPathNotFound):
+        await fs.stat("inj$(touch PWNED_STAT)x")
+
+    assert not marker.exists(), (
+        "stat executed the injected command: 'PWNED_STAT' marker was created "
+        "(shell-injection regression in stat())."
+    )
+
+
+@pytest.mark.asyncio
+async def test_stat_real_file_with_command_substitution_name(
+    workspace: Path,
+) -> None:
+    """``CallerProcessFilesystem.stat`` returns correct metadata for a file whose
+    name literally contains ``$(...)``.
+
+    Usability guard: the verbatim filename must be statted, returning a
+    file-type entry with the real byte size. A shell-interpreted path would
+    stat a different string and raise instead.
+    """
+    from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+
+    weird_name = "report$(id).txt"
+    contents = "twelve bytes"
+    (workspace / weird_name).write_text(contents)
+
+    entry = await fs.stat(weird_name)
+
+    # type/name/bytes prove the literal path was statted, not a shell-expanded
+    # variant (which would have raised FilesystemPathNotFound instead).
+    assert entry.type == "file", f"Expected a file entry, got type={entry.type!r}."
+    assert entry.name == weird_name, (
+        f"Expected name {weird_name!r}, got {entry.name!r}; the path was not passed verbatim."
+    )
+    assert entry.bytes == len(contents.encode("utf-8")), (
+        f"Expected {len(contents.encode('utf-8'))} bytes, got {entry.bytes}; "
+        "stat read the wrong path."
+    )
+
+
+@pytest.mark.asyncio
+async def test_path_traversal_rejected(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET /filesystem with traversal component returns 400."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/" + "..%2F..%2Fetc%2Fpasswd"
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_path"
+
+
+@pytest.mark.asyncio
+async def test_read_nonexistent_file_returns_404(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET /filesystem/nope.txt returns 404."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/nope.txt"
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "path_not_found"
+
+
+@pytest.mark.asyncio
+async def test_download_returns_complete_file_past_read_cap(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """``?download=true`` streams the whole file where the read path truncates."""
+    from omnigent.runner.environment_filesystem import _MAX_READ_BYTES
+
+    payload = os.urandom(_MAX_READ_BYTES + 1)
+    (workspace / "big.bin").write_bytes(payload)
+    url = (
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/big.bin"
+    )
+
+    read = await client.get(url)
+    assert read.status_code == 200
+    assert read.json()["truncated"] is True
+
+    resp = await client.get(url, params={"download": "true"})
+    assert resp.status_code == 200
+    assert resp.content == payload
+    assert resp.headers["content-length"] == str(len(payload))
+    assert resp.headers["content-type"] == "application/octet-stream"
+    assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert resp.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "status", "code"),
+    [("src", 400, "invalid_path"), ("nope.bin", 404, "path_not_found")],
+)
+async def test_download_rejects_directory_and_missing_path(
+    client: httpx.AsyncClient,
+    path: str,
+    status: int,
+    code: str,
+) -> None:
+    """A directory has no raw bytes to serve, and a missing path stays a 404."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem/{path}",
+        params={"download": "true"},
+    )
+    assert resp.status_code == status
+    assert resp.json()["error"]["code"] == code
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SANDBOX_BACKENDS = [
+    pytest.param(
+        "linux_bwrap",
+        marks=pytest.mark.skipif(
+            not (sys.platform.startswith("linux") and shutil.which("bwrap")),
+            reason="linux_bwrap requires Linux + bwrap on PATH",
+        ),
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sandbox_type", _SANDBOX_BACKENDS)
+async def test_download_under_real_sandbox_refuses_masked_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_type: str,
+) -> None:
+    """A confined helper's view gates the download.
+
+    A masked dotfile is refused and its bytes never leave, while a plain
+    file streams intact. bwrap masks by binding ``/dev/null`` over the file
+    (stat succeeds on another inode) and Seatbelt by denying the read (stat
+    succeeds, the read fails); both must be caught.
+    """
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / ".env").write_text("OMNI_TEST_SECRET=super-secret-value-12345")
+    payload = os.urandom(256 * 1024)
+    (ws / "plain.bin").write_bytes(payload)
+    # The helper imports omnigent from this checkout, which the sandbox
+    # must be allowed to read.
+    monkeypatch.setenv("PYTHONPATH", f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(ws),
+            sandbox=OSEnvSandboxSpec(type=sandbox_type, read_paths=[str(_REPO_ROOT)]),
+        )
+    )
+    assert os_env is not None
+    reg = SessionResourceRegistry()
+    reg._primary_envs["conv_test"] = os_env
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=ws,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            masked = await client.get(f"{base}/.env", params={"download": "true"})
+            assert masked.status_code == 404
+            assert b"super-secret-value-12345" not in masked.content
+
+            plain = await client.get(f"{base}/plain.bin", params={"download": "true"})
+            assert plain.status_code == 200
+            assert plain.content == payload
+    finally:
+        os_env.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "helper_view",
+    [
+        pytest.param(
+            lambda st: {"r": False, "dev": st.st_dev, "ino": st.st_ino}, id="read-denied"
+        ),
+        pytest.param(lambda st: {"r": False, "dev": 0, "ino": 0}, id="dev-null-bind"),
+        pytest.param(
+            lambda st: {"r": True, "dev": st.st_dev, "ino": st.st_ino + 1}, id="other-inode"
+        ),
+        pytest.param(lambda st: None, id="stat-denied"),
+    ],
+)
+async def test_download_refuses_what_the_helper_cannot_read(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    helper_view: object,
+) -> None:
+    """Each way a sandbox can hide a file from the helper refuses the download.
+
+    The fixture's ``none`` sandbox hides nothing, so the helper's answer is
+    stood in for with the signatures the real backends produce, plus a
+    file replaced under the check.
+    """
+    secret = workspace / ".env"
+    secret.write_text("SECRET=1")
+    view = helper_view(secret.stat())  # type: ignore[operator]
+    consulted: list[str] = []
+
+    async def _stat(self: CallerProcessFilesystem, target: str, *, probe_read: bool = False):
+        del self, probe_read
+        consulted.append(target)
+        return view
+
+    monkeypatch.setattr(CallerProcessFilesystem, "_helper_stat", _stat)
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem/.env",
+        params={"download": "true"},
+    )
+    assert resp.status_code == 404
+    assert b"SECRET" not in resp.content
+    assert consulted == [".env"]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_session_without_agent_id_returns_typed_404(
+    registry: SessionResourceRegistry,
+) -> None:
+    """
+    Missing ``agent_id`` in a session snapshot returns a typed 404.
+
+    :param registry: Registry with a real caller-process environment.
+    """
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Return a malformed session snapshot with no ``agent_id``.
+
+        :param request: Runner request for the session snapshot.
+        :returns: HTTP response with malformed session JSON.
+        """
+        assert request.url.path == "/v1/sessions/conv_test"
+        return httpx.Response(200, json={"id": "conv_test"})
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> None:
+        """
+        Fail if the runner tries to resolve a missing agent id.
+
+        :param agent_id: Agent id requested by the runner.
+        """
+        raise AssertionError(f"unexpected resolver call for {agent_id}")
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server",
+    )
+    app = create_runner_app(
+        resource_registry=registry,
+        server_client=server_client,
+        spec_resolver=_resolver,
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with (
+        server_client,
+        httpx.AsyncClient(
+            transport=transport,
+            base_url="http://runner",
+        ) as client,
+    ):
+        resp = await client.get(
+            f"/v1/sessions/conv_test/resources/environments"
+            f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/hello.txt"
+        )
+
+    assert resp.status_code == 404
+    body = resp.json()
+    assert body["error"]["code"] == "not_found"
+    assert body["error"]["message"] == (
+        "session spec resolver: session 'conv_test' has no agent_id"
+    )
+
+
+@pytest.mark.asyncio
+async def test_filesystem_missing_session_agent_returns_typed_410(
+    registry: SessionResourceRegistry,
+) -> None:
+    """
+    Missing session agent spec returns a typed 410 ``session_agent_missing``.
+
+    A session that still references an ``agent_id`` whose bundle no longer
+    resolves is a session-lifecycle condition (the agent was deleted or
+    rebound), not a plain ``not_found``. The shared session spec resolver
+    raises ``SESSION_AGENT_MISSING`` (HTTP 410 Gone), so every endpoint that
+    lets the resolver error propagate — including this filesystem read —
+    reports 410 rather than 404: retrying cannot recreate the deleted agent.
+
+    :param registry: Registry with a real caller-process environment.
+    """
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        """
+        Return a session snapshot with an unresolved ``agent_id``.
+
+        :param request: Runner request for the session snapshot.
+        :returns: HTTP response with an agent reference.
+        """
+        assert request.url.path == "/v1/sessions/conv_test"
+        return httpx.Response(200, json={"id": "conv_test", "agent_id": "ag_missing"})
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> None:
+        """
+        Return no spec for the requested agent id.
+
+        :param agent_id: Agent id requested by the runner.
+        :returns: ``None`` to indicate no spec was found.
+        """
+        assert agent_id == "ag_missing"
+        return
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://server",
+    )
+    app = create_runner_app(
+        resource_registry=registry,
+        server_client=server_client,
+        spec_resolver=_resolver,
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with (
+        server_client,
+        httpx.AsyncClient(
+            transport=transport,
+            base_url="http://runner",
+        ) as client,
+    ):
+        resp = await client.get(
+            f"/v1/sessions/conv_test/resources/environments"
+            f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/hello.txt"
+        )
+
+    assert resp.status_code == 410
+    body = resp.json()
+    assert body["error"]["code"] == "session_agent_missing"
+    assert body["error"]["message"] == (
+        "session spec resolver: agent 'ag_missing' for session 'conv_test' was not found"
+    )
+
+
+# ── Phase 5: shell endpoint ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_shell_echo(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /shell runs a command and returns structured output."""
+    resp = await client.post(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/shell",
+        json={"command": "echo hello"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "session.environment.shell_result"
+    assert body["stdout"].strip() == "hello"
+    assert body["exit_code"] == 0
+    assert body["timed_out"] is False
+
+
+@pytest.mark.asyncio
+async def test_shell_nonzero_exit(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /shell returns non-zero exit code on failure."""
+    resp = await client.post(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/shell",
+        json={"command": "exit 42"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["exit_code"] == 42
+
+
+@pytest.mark.asyncio
+async def test_shell_timeout_returns_structured_result(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /shell returns the timeout result instead of raising."""
+    resp = await client.post(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/shell",
+        json={"command": "sleep 2", "timeout": 1},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "session.environment.shell_result"
+    assert body["stdout"] == ""
+    assert body["stderr"] == ""
+    assert body["exit_code"] is None
+    assert body["timed_out"] is True
+    assert body["cwd"] is not None
+
+
+@pytest.mark.asyncio
+async def test_shell_missing_command_returns_400(
+    client: httpx.AsyncClient,
+) -> None:
+    """POST /shell without command returns 400."""
+    resp = await client.post(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/shell",
+        json={},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+
+@pytest.mark.asyncio
+async def test_read_file_content_type_python(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET /filesystem/src/main.py includes content_type for Python files."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/src/main.py"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "session.environment.filesystem.file_content"
+    # mimetypes.guess_type returns text/x-python or text/plain for .py
+    assert body["content_type"] is not None
+    assert "python" in body["content_type"] or "text" in body["content_type"]
+
+
+@pytest.mark.asyncio
+async def test_read_file_content_type_text(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET /filesystem/hello.txt includes content_type for .txt files."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/hello.txt"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["content_type"] == "text/plain"
+
+
+@pytest.fixture
+def app_with_registry(
+    registry: SessionResourceRegistry,
+    workspace: Path,
+) -> FastAPI:
+    """Runner app whose internal filesystem registry is pre-seeded with changes.
+
+    The runner always owns its registry; tests reach it via
+    ``app.state.filesystem_registry`` and inject events directly so
+    the watchdog observer does not need to be started.
+
+    :param registry: Session resource registry with the test environment.
+    :param workspace: Test workspace directory passed as runner_workspace
+        so the registry watches the right root.
+    :returns: FastAPI runner app with seeded change events.
+    """
+    app = create_runner_app(
+        resource_registry=registry,
+        runner_workspace=workspace,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    reg = app.state.filesystem_registry
+    # Seed change events via the public API: hello.txt modified, gone.py deleted.
+    reg.record_change("hello.txt", "modified", "conv_test")
+    reg.record_change("gone.py", "deleted", "conv_test")
+    return app
+
+
+@pytest.fixture
+async def client_with_registry(
+    app_with_registry: FastAPI,
+) -> AsyncIterator[httpx.AsyncClient]:
+    """httpx client for the registry-backed runner app.
+
+    :param app_with_registry: The runner app with filesystem registry.
+    :returns: Async HTTP client.
+    """
+    transport = httpx.ASGITransport(app=app_with_registry)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://runner",
+    ) as c:
+        yield c
+
+
+@pytest.mark.asyncio
+async def test_filesystem_changes_modified(
+    client_with_registry: httpx.AsyncClient,
+) -> None:
+    """The /changes endpoint returns modified files.
+
+    The registry has hello.txt seeded as 'modified'; the changes
+    endpoint must return it with status='modified'.
+    """
+    resp = await client_with_registry.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "list"
+    entries_by_path = {e["path"]: e for e in body["data"]}
+    assert "hello.txt" in entries_by_path, "Modified file must appear in changes"
+    assert entries_by_path["hello.txt"]["status"] == "modified"
+    # Line-count fields are always serialized; null in non-git (agent-edit)
+    # mode since those records carry no counts (see .get() in the endpoint).
+    entry = entries_by_path["hello.txt"]
+    assert entry["lines_added"] is None
+    assert entry["lines_removed"] is None
+
+
+@pytest.mark.asyncio
+async def test_filesystem_changes_deleted(
+    client_with_registry: httpx.AsyncClient,
+) -> None:
+    """The /changes endpoint returns deleted files.
+
+    gone.py was deleted during the session; it must appear in the
+    changes list with status='deleted' even though it's absent on disk.
+    """
+    resp = await client_with_registry.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    entries_by_path = {e["path"]: e for e in body["data"]}
+    assert "gone.py" in entries_by_path, "Deleted file must appear in changes"
+    assert entries_by_path["gone.py"]["status"] == "deleted"
+
+
+@pytest.mark.asyncio
+async def test_filesystem_changes_no_events_returns_empty(
+    client: httpx.AsyncClient,
+) -> None:
+    """A session with no seeded change events returns an empty list.
+
+    The baseline client fixture uses a runner app whose filesystem registry
+    has no events recorded for the session; the endpoint must return 200
+    with an empty data array rather than an error.
+    """
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "list"
+    assert body["data"] == [], "No registry means no changes"
+
+
+# ── _require_os_env guard: all Phase-3 endpoints ────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method,path_suffix,json_body",
+    [
+        ("GET", "/filesystem", None),
+        ("GET", "/changes", None),
+        ("GET", "/filesystem/hello.txt", None),
+        ("PUT", "/filesystem/new.txt", {"content": "x", "encoding": "utf-8"}),
+        (
+            "PATCH",
+            "/filesystem/hello.txt",
+            {"edits": [{"old_text": "hello world", "new_text": "bye"}]},
+        ),
+        ("DELETE", "/filesystem/hello.txt", None),
+        ("POST", "/shell", {"command": "echo hi"}),
+        ("GET", "/diff/hello.txt", None),
+        ("GET", "/search?q=hello", None),
+    ],
+    ids=[
+        "list_root",
+        "list_changes",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "delete_file",
+        "shell_exec",
+        "diff_file",
+        "search_files",
+    ],
+)
+async def test_filesystem_endpoints_return_404_when_spec_has_no_os_env(
+    registry: SessionResourceRegistry,
+    method: str,
+    path_suffix: str,
+    json_body: dict | None,
+) -> None:
+    """All Phase-3 filesystem/shell endpoints return 404 when the agent spec
+    has no os_env.
+
+    The ``_require_os_env`` guard in the runner must fire before any
+    environment resolution so no synthetic filesystem is exposed.  A 404
+    is the correct status: the resource conceptually does not exist for
+    this session.
+
+    :param registry: Registry with a real caller-process environment
+        (the guard fires before the registry is consulted).
+    :param method: HTTP method for the endpoint under test.
+    :param path_suffix: URL suffix after the environment id segment.
+    :param json_body: Optional JSON request body.
+    """
+
+    async def _session_handler(request: httpx.Request) -> httpx.Response:
+        """Return a session snapshot pointing at a no-os_env agent."""
+        assert request.url.path == "/v1/sessions/conv_test"
+        return httpx.Response(200, json={"id": "conv_test", "agent_id": "ag_no_env"})
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> object:
+        """Return a spec with no os_env for the agent under test."""
+        assert agent_id == "ag_no_env"
+        return SimpleNamespace(os_env=None)
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_session_handler),
+        base_url="http://server",
+    )
+    app = create_runner_app(
+        resource_registry=registry,
+        server_client=server_client,
+        spec_resolver=_resolver,
+    )
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    async with (
+        server_client,
+        httpx.AsyncClient(transport=transport, base_url="http://runner") as client,
+    ):
+        resp = await client.request(method, base + path_suffix, json=json_body)
+
+    # 404 — the guard fires before any env resolution; the resource does
+    # not exist for a spec with no os_env.  Any other status (200/500)
+    # would mean the guard was bypassed.
+    assert resp.status_code == 404, (
+        f"{method} {path_suffix} returned {resp.status_code}, "
+        f"expected 404 from _require_os_env guard. "
+        f"Body: {resp.text}"
+    )
+    # The detail message must mention os_env so callers can diagnose the issue.
+    assert "no os_env" in resp.json().get("detail", ""), (
+        f"Expected 'no os_env' in detail, got: {resp.json()}"
+    )
+
+
+# ── diff endpoint ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_diff_endpoint_returns_before_and_after_for_modified_file(
+    app_with_registry: FastAPI,
+) -> None:
+    """GET /diff/hello.txt returns before=snapshot and after=current-disk-content for
+    a modified file.
+
+    :param app_with_registry: Runner app with hello.txt seeded as 'modified'.
+    """
+
+    reg = app_with_registry.state.filesystem_registry
+    # Seed the pre-modification snapshot so get_baseline has something to return.
+    # This simulates what the PUT/PATCH handlers do before overwriting the file.
+    reg.seed_snapshot("hello.txt", "before content")
+
+    transport = httpx.ASGITransport(app=app_with_registry)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        resp = await client.get(
+            f"/v1/sessions/conv_test/resources/environments"
+            f"/{DEFAULT_ENVIRONMENT_ID}/diff/hello.txt"
+        )
+
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}. Body: {resp.text}"
+    body = resp.json()
+    # Confirm the response carries the correct object type.
+    assert body["object"] == "session.environment.filesystem.file_diff", (
+        f"Expected object 'session.environment.filesystem.file_diff', got {body['object']!r}."
+    )
+    # before must be the snapshot we seeded — proves get_baseline returns the snapshot.
+    assert body["before"] == "before content", (
+        f"Expected before='before content', got {body['before']!r}. "
+        "seed_snapshot or get_baseline is not wiring the snapshot through."
+    )
+    # after must be the current on-disk content — proves the endpoint reads from disk.
+    assert body["after"] == "hello world", (
+        f"Expected after='hello world', got {body['after']!r}. "
+        "The diff endpoint is not reading current file content from disk."
+    )
+
+
+@pytest.mark.asyncio
+async def test_diff_endpoint_returns_null_before_for_new_file(
+    registry: SessionResourceRegistry,
+    workspace: Path,
+) -> None:
+    """GET /diff/hello.txt returns before=None when the file is new (created event, no snapshot).
+
+    A 'created' event with no seed_snapshot means no baseline exists;
+    ``get_baseline`` should return ``None`` which flows through as ``before: null``.
+
+    :param registry: Session resource registry backed by the test workspace.
+    :param workspace: Test workspace; hello.txt on disk contains 'hello world'.
+    """
+    app = create_runner_app(
+        resource_registry=registry,
+        runner_workspace=workspace,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reg = app.state.filesystem_registry
+    # Inject a 'created' event but deliberately skip seed_snapshot so before=None.
+    reg.record_change("hello.txt", "created", "conv_test")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        resp = await client.get(
+            f"/v1/sessions/conv_test/resources/environments"
+            f"/{DEFAULT_ENVIRONMENT_ID}/diff/hello.txt"
+        )
+
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}. Body: {resp.text}"
+    body = resp.json()
+    # No snapshot → before must be null; a non-null value means a phantom
+    # baseline was produced.
+    assert body["before"] is None, (
+        f"Expected before=None for a new file with no snapshot, got {body['before']!r}."
+    )
+    # File exists on disk → after must be its content.
+    assert body["after"] == "hello world", f"Expected after='hello world', got {body['after']!r}."
+
+
+@pytest.mark.asyncio
+async def test_diff_endpoint_returns_null_after_for_deleted_file(
+    client_with_registry: httpx.AsyncClient,
+) -> None:
+    """GET /diff/gone.py returns after=None for a deleted file.
+
+    ``app_with_registry`` seeds gone.py with a 'deleted' event; the
+    endpoint must set after=None rather than trying to read a file that
+    no longer exists.
+
+    :param client_with_registry: HTTP client backed by the registry-seeded app.
+    """
+    resp = await client_with_registry.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/diff/gone.py"
+    )
+
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}. Body: {resp.text}"
+    body = resp.json()
+    # Deleted file → after must be null; a non-null value means the endpoint
+    # tried to read a file that no longer exists instead of short-circuiting.
+    assert body["after"] is None, f"Expected after=None for deleted file, got {body['after']!r}."
+
+
+@pytest.mark.asyncio
+async def test_diff_endpoint_returns_404_when_file_not_in_registry(
+    client_with_registry: httpx.AsyncClient,
+) -> None:
+    """GET /diff/not_changed.txt returns 404 when the path has no change event.
+
+    The registry has no event for 'not_changed.txt'; the endpoint must
+    return 404 with error.code='not_found' before attempting any file read.
+
+    :param client_with_registry: HTTP client backed by the registry-seeded app.
+    """
+    resp = await client_with_registry.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/diff/not_changed.txt"
+    )
+
+    assert resp.status_code == 404, (
+        f"Expected 404 for a file not in the registry, got {resp.status_code}. Body: {resp.text}"
+    )
+    body = resp.json()
+    # error.code must be 'not_found' — confirms the typed error path fires.
+    assert body["error"]["code"] == "not_found", (
+        f"Expected error.code='not_found', got {body['error']['code']!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_diff_endpoint_returns_full_after_for_large_file(
+    registry: SessionResourceRegistry,
+    workspace: Path,
+) -> None:
+    """GET /diff/<large_file> returns the complete file content in ``after``,
+    not just the first 2 000 lines.
+
+    Regression test: the original implementation read ``after`` via
+    ``CallerProcessFilesystem.read`` without a ``limit`` argument, which defaulted
+    to ``_DEFAULT_READ_LIMIT = 2 000`` lines — the cap that protects LLM context
+    windows from unbounded files.  That cap is wrong for diff rendering (the UI
+    needs the whole file).  The fix passes ``limit=None`` to
+    ``CallerProcessFilesystem.read``, which now means "no line cap".
+
+    This test fails when the 2 000-line cap is re-introduced: ``returned_lines``
+    would be 2 000 instead of 3 000.
+
+    :param registry: Session resource registry backed by the test workspace.
+    :param workspace: Test workspace directory (not a git repo, so
+        ``AgentEditFilesystemRegistry`` is used).
+    """
+    # 3 000 lines — comfortably above the 2 000-line agent-tool cap.
+    total_lines = 3_000
+    large_content = "\n".join(f"line {i}" for i in range(1, total_lines + 1)) + "\n"
+    (workspace / "large.py").write_text(large_content)
+
+    app = create_runner_app(
+        resource_registry=registry,
+        runner_workspace=workspace,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reg = app.state.filesystem_registry
+    reg.record_change("large.py", "modified", "conv_test")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        resp = await client.get(
+            f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/diff/large.py"
+        )
+
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}. Body: {resp.text}"
+    body = resp.json()
+    after = body["after"]
+    assert after is not None, "Expected after to be non-null for an existing file on disk."
+    returned_lines = len(after.splitlines())
+    # The file has 3 000 lines. If the old 2 000-line cap is still applied,
+    # this would be 2 000. The fix must return all 3 000.
+    assert returned_lines == total_lines, (
+        f"Expected after to contain all {total_lines} lines, got {returned_lines}. "
+        f"If {returned_lines} == 2000, the agent-tool line cap from "
+        "CallerProcessFilesystem.read is still being applied to the diff endpoint."
+    )
+    # Verify the last line is present to rule out off-by-one coincidences.
+    assert f"line {total_lines}" in after, (
+        f"Expected 'line {total_lines}' to appear in after, "
+        "but the content was cut off before the end of the file."
+    )
+
+
+# ── /search endpoint ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "q,expected_path,failure_hint",
+    [
+        (
+            "main",
+            "src/main.py",
+            "Search endpoint not walking subdirectories (q='main' should find src/main.py).",
+        ),
+        (
+            "hell",
+            "hello.txt",
+            "Filename substring matching is broken (q='hell' should find hello.txt).",
+        ),
+        (
+            "src/main",
+            "src/main.py",
+            "Full-path substring matching is broken (q='src/main' should find src/main.py).",
+        ),
+        (
+            "HELLO",
+            "hello.txt",
+            "Search must be case-insensitive (q='HELLO' should find hello.txt).",
+        ),
+    ],
+    ids=["subdir_walk", "filename_substring", "path_substring", "case_insensitive"],
+)
+async def test_search_matches(
+    client: httpx.AsyncClient,
+    q: str,
+    expected_path: str,
+    failure_hint: str,
+) -> None:
+    """GET /search?q=<q> returns the expected file.
+
+    Covers four distinct matching requirements in one parametrized test:
+    recursive walk into subdirectories, filename substring, full-path
+    substring, and case-insensitive matching.
+
+    :param client: httpx client for the runner app.
+    :param q: Search query to send.
+    :param expected_path: Relative path that must appear in the results.
+    :param failure_hint: Explanation surfaced when the assertion fails.
+    """
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search?q={q}"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "list"
+    paths = {e["path"] for e in body["data"]}
+    assert expected_path in paths, (
+        f"Expected {expected_path!r} in search results for q={q!r}, got: {paths}. {failure_hint}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_no_matches_returns_empty_list(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET /search?q=zzznotfound returns an empty data array, not an error."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search?q=zzznotfound"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["object"] == "list"
+    # No files match — the endpoint must return empty data, not 404 or 500.
+    assert body["data"] == [], (
+        f"Expected empty data for a query with no matches, got: {body['data']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_returns_matching_directories(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET /search returns directory entries whose name/path matches the query.
+
+    The workspace has a 'src' directory; a query matching it by name must
+    surface it as a directory-type entry so the UI can reveal the folder,
+    alongside any files under it.
+    """
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search?q=src"
+    )
+    assert resp.status_code == 200
+    entries = resp.json()["data"]
+    src = next((e for e in entries if e["path"] == "src"), None)
+    assert src is not None, f"Expected the 'src' directory in results, got: {entries}"
+    assert src["type"] == "directory", (
+        f"Expected 'src' to be a directory-type entry, got type={src['type']!r}."
+    )
+    # A directory has no byte size; bytes must be null for it.
+    assert src["bytes"] is None, "A directory entry must report null bytes."
+
+
+@pytest.mark.asyncio
+async def test_search_result_entry_shape(
+    client: httpx.AsyncClient,
+) -> None:
+    """Each /search result entry carries the expected fields for the UI."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search?q=hello"
+    )
+    assert resp.status_code == 200
+    entries = resp.json()["data"]
+    entry = next(e for e in entries if e["path"] == "hello.txt")
+    # object type must be the standard filesystem entry marker so the frontend
+    # can deserialize it with the same mapper as listing responses.
+    assert entry["object"] == "session.environment.filesystem.entry"
+    assert entry["name"] == "hello.txt"
+    assert entry["type"] == "file"
+    # bytes and modified_at must be present (non-null) — the UI uses both for
+    # display.  A None bytes would mean the stat call failed silently.
+    assert entry["bytes"] is not None, (
+        "bytes must be populated for an existing file; None means stat failed."
+    )
+    assert entry["modified_at"] is not None, (
+        "modified_at must be populated for an existing file; None means stat failed."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url_suffix,description",
+    [
+        # q is required: a missing q must fail even when include is supplied —
+        # include/exclude only narrow a query, they never search on their own.
+        ("/search", "missing q"),
+        ("/search?include=*.ts", "include without q"),
+        # A provided-but-whitespace q is caught by the pattern validator.
+        ("/search?q=%20%20%20", "whitespace-only q"),
+    ],
+    ids=["missing_q", "include_without_q", "whitespace_q"],
+)
+async def test_search_invalid_q_returns_422(
+    client: httpx.AsyncClient,
+    url_suffix: str,
+    description: str,
+) -> None:
+    """GET /search requires a non-whitespace q and returns 422 otherwise.
+
+    Whitespace-only queries (e.g. q=%20%20%20) would strip to "" in
+    search_files() and match every file.  The API-layer required/pattern
+    validator catches a missing or whitespace-only q before the handler runs,
+    returning 422 — and an include glob alone is not a substitute for q.
+
+    :param client: httpx client for the runner app.
+    :param url_suffix: URL suffix including the (possibly invalid) query string.
+    :param description: Human-readable description for assertion messages.
+    """
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    resp = await client.get(base + url_suffix)
+    # FastAPI query-param validation fires before any handler code; a missing
+    # or whitespace-only q returns 422, not 400 or 500.
+    assert resp.status_code == 422, (
+        f"Expected 422 for {description}, got {resp.status_code}. Body: {resp.text}"
+    )
+
+
+# ── /search include / exclude glob filters ───────────────────────────────────
+
+
+@pytest.fixture
+def glob_workspace(tmp_path: Path) -> Path:
+    """Workspace with assorted file types/depths for glob filter tests.
+
+    Layout::
+
+        app.ts
+        app.test.ts
+        readme.md
+        src/index.ts
+        src/util.js
+        src/deep/core.ts
+        node_modules/pkg/index.ts
+
+    :param tmp_path: pytest temp directory.
+    :returns: Path to the populated workspace root.
+    """
+    ws = tmp_path / "globws"
+    ws.mkdir()
+    (ws / "app.ts").write_text("export const a = 1;")
+    (ws / "app.test.ts").write_text("test('a', () => {});")
+    (ws / "readme.md").write_text("# readme")
+    (ws / "src").mkdir()
+    (ws / "src" / "index.ts").write_text("export {};")
+    (ws / "src" / "util.js").write_text("module.exports = {};")
+    (ws / "src" / "deep").mkdir()
+    (ws / "src" / "deep" / "core.ts").write_text("export {};")
+    nm = ws / "node_modules" / "pkg"
+    nm.mkdir(parents=True)
+    (nm / "index.ts").write_text("export {};")
+    return ws
+
+
+@pytest.fixture
+async def glob_client(glob_workspace: Path) -> AsyncIterator[httpx.AsyncClient]:
+    """httpx client for a runner app backed by ``glob_workspace``.
+
+    :param glob_workspace: The populated workspace root.
+    :returns: Async HTTP client for the runner app.
+    """
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(glob_workspace),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+    assert os_env is not None
+    reg = SessionResourceRegistry()
+    reg._primary_envs["conv_test"] = os_env
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=glob_workspace,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
+        yield c
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "params,expected,hint",
+    [
+        (
+            "q=.&include=*.ts",
+            {
+                "app.ts",
+                "app.test.ts",
+                "src/index.ts",
+                "src/deep/core.ts",
+                "node_modules/pkg/index.ts",
+            },
+            "bare '*.ts' must match exactly the .ts files at any depth (no .js/.md)",
+        ),
+        (
+            "q=.&include=src/**",
+            {"src/index.ts", "src/util.js", "src/deep/core.ts"},
+            "'src/**' must return exactly the files under the src subtree",
+        ),
+        (
+            "q=.&include=*.{js,md}",
+            {"src/util.js", "readme.md"},
+            "'{js,md}' brace alternation must match exactly the .js and .md files",
+        ),
+        (
+            "q=.&include=readme.m?",
+            {"readme.md"},
+            "'?' must match exactly one character (readme.md, nothing else)",
+        ),
+        (
+            # *.ts minus *.test.ts: node_modules/pkg/index.ts stays (no nm exclude).
+            "q=.&include=*.ts&exclude=*.test.ts",
+            {"app.ts", "src/index.ts", "src/deep/core.ts", "node_modules/pkg/index.ts"},
+            "exclude must drop *.test.ts and keep every other included .ts",
+        ),
+        (
+            # **/node_modules prunes that subtree; app.test.ts stays (still .ts).
+            "q=.&include=*.ts&exclude=**/node_modules",
+            {"app.ts", "app.test.ts", "src/index.ts", "src/deep/core.ts"},
+            "'**/node_modules' must prune that subtree and keep all other .ts files",
+        ),
+        (
+            "q=index&include=*.ts",
+            {"src/index.ts", "node_modules/pkg/index.ts"},
+            "the q substring and the include glob must both apply (AND)",
+        ),
+    ],
+    ids=[
+        "include_ext_any_depth",
+        "include_subtree",
+        "include_braces",
+        "include_question_mark",
+        "exclude_wins_over_include",
+        "exclude_node_modules_subtree",
+        "q_and_include_combined",
+    ],
+)
+async def test_search_glob_filters(
+    glob_client: httpx.AsyncClient,
+    params: str,
+    expected: set[str],
+    hint: str,
+) -> None:
+    """GET /search applies include/exclude globs to scope a query's results.
+
+    Exercises the ``_glob_to_regex`` translator end-to-end through the public
+    endpoint: extension globs at any depth, subtree globs, brace alternation,
+    single-char ``?``, exclude-wins precedence, subtree pruning, and the
+    combination of a real text query with an include glob.
+
+    All cases except the last pair the glob with ``q=.``: every file in the
+    fixture has an extension, so the dot matches every file and isolates the
+    glob filter under test (q is required, so we cannot omit it).
+
+    The result set is asserted for *exact* equality, so a stray match (a file
+    the glob shouldn't have kept, or a leaked directory entry) fails the test —
+    a subset check would let extras slip through.
+
+    :param glob_client: httpx client backed by the glob workspace.
+    :param params: Raw query string for the /search request.
+    :param expected: The complete set of paths the search must return.
+    :param hint: Explanation surfaced when the assertion fails.
+    """
+    resp = await glob_client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search?{params}"
+    )
+    assert resp.status_code == 200, resp.text
+    paths = {e["path"] for e in resp.json()["data"]}
+    # Exact match — proves the glob kept precisely the right files: no missing
+    # match and no stray include (wrong file or a leaked directory entry).
+    assert paths == expected, f"{hint}: got {paths}, expected {expected}"
+
+
+@pytest.mark.asyncio
+async def test_search_directory_match_honors_exclude_glob(
+    glob_client: httpx.AsyncClient,
+) -> None:
+    """A directory match is dropped when an exclude glob prunes its subtree.
+
+    ``q=deep`` matches the ``src/deep`` directory by name. Without an exclude
+    it surfaces as a directory entry; with ``exclude=**/deep`` the subtree is
+    pruned from the walk so the directory itself never appears.
+    """
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search"
+    resp = await glob_client.get(f"{base}?q=deep")
+    assert resp.status_code == 200, resp.text
+    paths = {(e["path"], e["type"]) for e in resp.json()["data"]}
+    assert ("src/deep", "directory") in paths, (
+        f"q=deep should surface the src/deep directory, got {paths}"
+    )
+
+    resp = await glob_client.get(f"{base}?q=deep&exclude=**/deep")
+    assert resp.status_code == 200, resp.text
+    excluded = {e["path"] for e in resp.json()["data"]}
+    assert "src/deep" not in excluded, (
+        f"exclude=**/deep must prune the src/deep directory, got {excluded}"
+    )
+
+
+# ── Per-session filesystem registry (worktree) ──────────────────────────────
+
+
+def _git_env() -> dict[str, str]:
+    """Build an env dict with dummy git identity.
+
+    :returns: Copy of the current environment with GIT_AUTHOR_* and
+        GIT_COMMITTER_* set to safe dummy values.
+    """
+    return {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+    }
+
+
+@pytest.mark.asyncio
+async def test_worktree_session_uses_session_workspace_for_changes(
+    tmp_path: Path,
+) -> None:
+    """The /changes endpoint uses the session's workspace, not the runner's.
+
+    When a session uses a git worktree, its workspace differs from the
+    runner's global workspace. The /changes endpoint must run ``git status``
+    in the session's workspace to detect changes there, not in the runner's
+    startup workspace (where there are no changes).
+
+    Failure means worktree sessions always show "No workspace changes yet"
+    even when the agent has modified files in the worktree.
+    """
+    env = _git_env()
+
+    # Runner's global workspace: a git repo with no uncommitted changes.
+    runner_ws = tmp_path / "main-repo"
+    runner_ws.mkdir()
+    subprocess.run(["git", "init"], cwd=runner_ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "init"],
+        cwd=runner_ws,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+
+    # Session's workspace: a separate git repo simulating a worktree
+    # with an uncommitted change.
+    session_ws = tmp_path / "worktree-session"
+    session_ws.mkdir()
+    subprocess.run(["git", "init"], cwd=session_ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "init"],
+        cwd=session_ws,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    (session_ws / "agent_change.py").write_text("# written by agent")
+
+    session_id = "conv_worktree_test"
+
+    # Set up the OS environment for the session pointing at the
+    # session workspace so _require_os_env passes.
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(session_ws),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+    assert os_env is not None
+    reg = SessionResourceRegistry()
+    reg._primary_envs[session_id] = os_env
+
+    # Fake server_client that returns the session's workspace in
+    # GET /v1/sessions/{id}.
+    session_response = httpx.Response(
+        200,
+        json={
+            "id": session_id,
+            "agent_id": "agent_1",
+            "status": "idle",
+            "created_at": 1000,
+            "workspace": str(session_ws),
+        },
+    )
+
+    async def _mock_transport(request: httpx.Request) -> httpx.Response:
+        """Return the session response for GET /v1/sessions/{id}.
+
+        :param request: The outgoing request.
+        :returns: Mocked session response.
+        """
+        if request.url.path == f"/v1/sessions/{session_id}":
+            return session_response
+        return httpx.Response(404)
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_mock_transport),
+        base_url="http://fake-server",
+    )
+
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=runner_ws,
+        server_client=server_client,
+    )
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        resp = await client.get(
+            f"/v1/sessions/{session_id}/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        paths = [e["path"] for e in body["data"]]
+        assert "agent_change.py" in paths, (
+            f"Expected 'agent_change.py' in changes but got {paths}. "
+            "The /changes endpoint is reading from the runner's global "
+            "workspace instead of the session's worktree workspace."
+        )
+
+
+@pytest.mark.asyncio
+async def test_search_scopes_to_a_subdirectory(client: httpx.AsyncClient) -> None:
+    """Search covers exactly what the tree is showing. Scoped to a directory it
+    reports the resolved base and returns paths relative to it, so a panel
+    browsing that directory does not show hits from outside it."""
+    scoped = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search/src?q=."
+    )
+    assert scoped.status_code == 200, scoped.text
+    body = scoped.json()
+    paths = {e["path"] for e in body["data"]}
+
+    assert body["base"].endswith("/src")
+    # Paths are relative to the scoped base (no "src/" prefix), and the
+    # parent's files are absent -- search covers exactly the scoped tree.
+    assert paths == {"main.py"}, paths
+
+
+@pytest.mark.asyncio
+async def test_search_reports_untruncated_for_a_small_tree(client: httpx.AsyncClient) -> None:
+    """``truncated`` distinguishes "searched everything, found nothing" from
+    "ran out of scan budget". A small workspace always completes, so a caller
+    can trust an empty result here to mean there really are no matches."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+        "/search?q=zzq9xnomatchzz"
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    assert body["data"] == []
+    assert body["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_search_scan_budget_bounds_a_no_match_walk(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A query matching nothing never fills the result cap, so the walk needs
+    its own bound. With the scan budget lowered, a tree larger than the budget
+    stops early and says so rather than walking to completion."""
+    deep = tmp_path / "many"
+    deep.mkdir()
+    for i in range(60):
+        (deep / f"f{i}.txt").write_text("x")
+
+    monkeypatch.setattr(
+        "omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET",
+        10,
+    )
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+    )
+    entries, truncated = await fs.search_files("zzq9xnomatchzz")
+
+    assert entries == []
+    assert truncated is True, "a budget-exhausted search must not look like 'no matches'"
+
+
+@pytest.mark.asyncio
+async def test_search_tree_of_exactly_budget_size_is_not_truncated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tree with exactly `budget` entries is fully enumerable, not truncated.
+
+    The walk counts an entry then checks `> budget` (not `>= budget`), so a
+    tree whose entry count equals the budget is walked to completion and must
+    report ``truncated=False``. One more entry would flip it to True.
+    """
+    # 3 files + their parent dir = 4 walked entries. Budget 4 exactly covers it.
+    d = tmp_path / "d"
+    d.mkdir()
+    for i in range(3):
+        (d / f"f{i}.txt").write_text("x")
+
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 4)
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+    )
+    _entries, truncated = await fs.search_files("zznomatchzz")
+
+    assert truncated is False, (
+        "a tree of exactly budget size is fully enumerable and must not be flagged truncated"
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_defers_deep_noise_subtree_to_reach_later_real_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deep dependency subtree must not starve a later-sorted real directory.
+
+    Layout (``aaa`` sorts before ``zzz``)::
+
+        aaa/node_modules/<many files>   # deprioritized, huge
+        zzz/target/keep.txt             # the real match, deep and late
+
+    Reordering only *sibling* dirs isn't enough: without globally deferring the
+    ``node_modules`` subtree, the walk descends all of ``aaa/node_modules``
+    first and exhausts a tight budget before it ever reaches ``zzz/target`` —
+    so a query for ``target`` would come back empty. Deferring noise subtrees
+    lets the real tree be scanned first, so the match is found.
+    """
+    noise = tmp_path / "aaa" / "node_modules"
+    noise.mkdir(parents=True)
+    for i in range(40):
+        (noise / f"dep{i}.js").write_text("x")
+    target = tmp_path / "zzz" / "target"
+    target.mkdir(parents=True)
+    (target / "keep.txt").write_text("y")
+
+    # Budget large enough for the whole real tree but far smaller than the noise
+    # subtree, so a non-deferring walk would run out inside node_modules.
+    monkeypatch.setattr(
+        "omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET",
+        20,
+    )
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+    )
+    entries, _truncated = await fs.search_files("target")
+
+    paths = {e.path for e in entries}
+    assert "zzz/target" in paths, (
+        f"the real 'zzz/target' directory must be reached despite the earlier "
+        f"aaa/node_modules subtree, got {paths}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_does_not_follow_symlinked_deprioritized_dir(
+    tmp_path: Path,
+) -> None:
+    """A symlinked deprioritized dir must not let the walk escape the workspace.
+
+    The deferred second pass walks each noise root directly, and ``os.walk``
+    follows a *top-level* symlink. A committed ``node_modules`` symlink pointing
+    outside the workspace would otherwise disclose file names/sizes/mtimes from
+    the target — content the single-pass ``os.walk(followlinks=False)`` could
+    never reach. Deferring only real directories preserves that boundary.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("leaked")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    # A committed noise-named symlink pointing at the sibling outside/ dir.
+    (ws / "node_modules").symlink_to(outside, target_is_directory=True)
+
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(ws),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+    )
+    entries, _truncated = await fs.search_files("secret")
+
+    paths = {e.path for e in entries}
+    assert not any("secret" in p for p in paths), (
+        f"search must not descend a symlinked node_modules and leak the target's "
+        f"contents, got {paths}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_scoped_search_reports_the_matched_files_own_size(tmp_path: Path) -> None:
+    """A scoped search must stat the file it actually matched.
+
+    Result paths are relative to the search base, but the helper's cwd is the
+    workspace root -- so statting the relative path either misses or, worse,
+    stats a same-named file under the workspace and reports ITS size/mtime.
+    The workspace decoy here shares the basename and has a very different
+    size, so a regression reports a wrong number rather than merely a null.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "collide.txt").write_text("x" * 500)
+    # Same basename at the workspace root, where a cwd-relative stat lands.
+    (tmp_path / "collide.txt").write_text("y")
+
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        ),
+    )
+
+    entries, _truncated = await fs.search_files("collide", path=str(outside))
+
+    assert [e.path for e in entries] == ["collide.txt"]
+    assert entries[0].bytes == 500, "reported the workspace decoy's size, not the matched file's"
+
+
+@pytest.mark.asyncio
+async def test_write_outside_workspace_accepted_for_an_unconfined_environment(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """The runner serves an absolute write when the environment is unconfined.
+
+    It does not ask WHO is writing -- it cannot see the caller. Identity is
+    the server's gate: absolute paths require session ownership there, pinned
+    in ``tests/server/routes/test_shell_permission_gate.py``. What the runner
+    still enforces on its own is the sandbox policy, which is why a CONFINED
+    environment refuses the same request (see the isolation suite).
+    """
+    target = tmp_path / "outside.txt"
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+    encoded = "%2F" + str(target).lstrip("/")
+
+    resp = await client.put(
+        f"{base}/{encoded}", json={"content": "written\n", "encoding": "utf-8"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert target.read_text() == "written\n"
+
+
+@pytest.mark.asyncio
+async def test_edit_and_delete_outside_workspace_round_trip(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """Edit and delete follow write outside the workspace. Edit in particular
+    has to report a path it can echo back: the response entry cannot be made
+    relative to the workspace root, which previously turned a successful edit
+    into a 400."""
+    target = tmp_path / "roundtrip.txt"
+    target.write_text("alpha beta\n")
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+    url = f"{base}/%2F{str(target).lstrip('/')}"
+
+    edited = await client.patch(url, json={"old_text": "alpha", "new_text": "gamma"})
+    assert edited.status_code == 200, edited.text
+    assert target.read_text() == "gamma beta\n"
+
+    removed = await client.request("DELETE", url)
+    assert removed.status_code == 200, removed.text
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_unwritable_target_reports_an_error_not_a_crash(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """An ordinary OS permission denial must surface as a filesystem error. The
+    in-process route bypasses the helper subprocess, which is what normally
+    converts a raised OSError into an error payload."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)  # read+execute only: no new entries
+    try:
+        base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+        url = f"{base}/%2F{str(locked / 'nope.txt').lstrip('/')}"
+
+        resp = await client.put(url, json={"content": "x", "encoding": "utf-8"})
+
+        assert resp.status_code < 500, f"expected a handled error, got {resp.status_code}"
+        assert "error" in resp.json()
+    finally:
+        locked.chmod(0o700)
+
+
+def _git_runner_client(
+    ws: Path, session_id: str, *, runner_workspace: Path | None = None
+) -> httpx.AsyncClient:
+    """Runner app serving *ws* as the session's environment, for the search tests.
+
+    :param ws: The session environment's working tree.
+    :param session_id: Session to register the OS environment under.
+    :param runner_workspace: The runner's own workspace; defaults to *ws*.
+    :returns: An httpx client bound to the runner app.
+    """
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(ws),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        )
+    )
+    reg = SessionResourceRegistry()
+    reg._primary_envs[session_id] = os_env
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=runner_workspace if runner_workspace is not None else ws,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://runner")
+
+
+@pytest.mark.asyncio
+async def test_search_finds_tracked_files_past_the_scan_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reported failure: a repo far larger than the walk budget, so the walk
+    quit in the first directories and the panel said the file did not exist.
+    Tracked files must come from git's index whatever the budget; untracked
+    ones ride on the Changed tab's ``git status`` once it has run; and the
+    walk keeps running regardless, because ignored files live nowhere else."""
+    env = _git_env()
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    many = ws / "aaa"
+    many.mkdir()
+    for i in range(60):
+        (many / f"f{i:02d}.txt").write_text("x")
+    (ws / "zzz").mkdir()
+    (ws / "zzz" / "target.jsonnet").write_text("y")
+    subprocess.run(["git", "add", "-A"], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    (ws / "zzz" / "scratch.txt").write_text("untracked")
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
+    base = f"/v1/sessions/conv_git/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_git") as client:
+        resp = await client.get(f"{base}/search", params={"q": "target"})
+        body = resp.json()
+        assert [e["path"] for e in body["data"]] == ["zzz/target.jsonnet"], body
+        # No git status has run yet, so untracked coverage is still the walk's
+        # — and the walk ran out of budget in aaa/.
+        assert body["truncated"] is True
+
+        assert (await client.get(f"{base}/changes")).status_code == 200
+        resp = await client.get(f"{base}/search", params={"q": "zzz"})
+        body = resp.json()
+        assert [(e["path"], e["type"]) for e in body["data"]] == [
+            ("zzz", "directory"),
+            ("zzz/scratch.txt", "file"),
+            ("zzz/target.jsonnet", "file"),
+        ], body
+        # The walk still ran (only it can find ignored files) and still ran out
+        # of budget in aaa/, so the answer stays flagged as possibly incomplete.
+        assert body["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_search_walk_skips_git_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``.git`` sorts first and in a clone holds more entries than the whole
+    budget; the walk used to spend all of it there and miss every real file."""
+    env = _git_env()
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
+    (tmp_path / "zz.txt").write_text("x")
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+    )
+
+    entries, truncated = await fs.search_files("zz")
+
+    assert [e.path for e in entries] == ["zz.txt"]
+    assert truncated is False
+
+
+@pytest.mark.asyncio
+async def test_search_still_finds_gitignored_files_after_git_status(tmp_path: Path) -> None:
+    """Ignored files are in neither git's index nor ``git status``, so only the
+    walk can find them — it must keep running once a status snapshot exists."""
+    env = _git_env()
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    (ws / ".gitignore").write_text("build/\n")
+    subprocess.run(["git", "add", ".gitignore"], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    (ws / "build").mkdir()
+    (ws / "build" / "out.log").write_text("ignored")
+    base = f"/v1/sessions/conv_ignored/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_ignored") as client:
+        assert (await client.get(f"{base}/changes")).status_code == 200
+        resp = await client.get(f"{base}/search", params={"q": "out.log"})
+        body = resp.json()
+        assert [e["path"] for e in body["data"]] == ["build/out.log"], body
+        assert body["truncated"] is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX filesystem root")
+@pytest.mark.asyncio
+async def test_search_from_filesystem_root_keeps_paths_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Browsing ``/`` is allowed for an unconfined environment. The walk builds
+    result paths by slicing off the root, and a root of ``/`` already ends in
+    the separator — slicing one more character used to turn ``etc`` into ``tc``."""
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 60)
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+    )
+
+    entries, _truncated = await fs.search_files("etc", path="/")
+
+    paths = [e.path for e in entries]
+    assert "etc" in paths, paths
+    assert all((Path("/") / p).exists() for p in paths), paths
+
+
+def _seed_budget_busting_repo(ws: Path, *, commit: bool = True) -> None:
+    """Fill *ws* so an alphabetical walk exhausts a small budget before ``zzz/``.
+
+    :param ws: Directory to seed.
+    :param commit: Whether to also ``git init`` + commit the tree.
+    """
+    many = ws / "aaa"
+    many.mkdir()
+    for i in range(60):
+        (many / f"f{i:02d}.txt").write_text("x")
+    (ws / "zzz").mkdir()
+    (ws / "zzz" / "target.jsonnet").write_text("y")
+    if commit:
+        env = _git_env()
+        subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+        subprocess.run(["git", "add", "-A"], cwd=ws, check=True, capture_output=True, env=env)
+        subprocess.run(
+            ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+        )
+
+
+@pytest.mark.asyncio
+async def test_search_indexes_the_walked_workspace_not_the_runners(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A runner-managed session searches its own generated workspace, which is
+    neither the session's stored workspace nor the runner's. The index consulted
+    must belong to the walked tree, or tracked files past the walk budget stay
+    unfindable there while the runner's registry answers for the wrong files."""
+    ws = tmp_path / "session-ws"
+    ws.mkdir()
+    _seed_budget_busting_repo(ws)
+    runner_ws = tmp_path / "runner-ws"
+    runner_ws.mkdir()
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
+    base = f"/v1/sessions/conv_env_ws/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_env_ws", runner_workspace=runner_ws) as client:
+        resp = await client.get(f"{base}/search", params={"q": "target"})
+        body = resp.json()
+        assert [e["path"] for e in body["data"]] == ["zzz/target.jsonnet"], body
+        assert body["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_search_picks_up_a_repo_created_mid_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace that becomes a git repository after its first search (an
+    agent cloning into it) must gain index coverage on the next search rather
+    than staying pinned to the walk-only answer — and since the agent made that
+    repository, search must never start a registry on it (startup probes the
+    repository with git, which would run its ``core.fsmonitor`` here)."""
+    ws = tmp_path / "session-ws"
+    ws.mkdir()
+    _seed_budget_busting_repo(ws, commit=False)
+    runner_ws = tmp_path / "runner-ws"
+    runner_ws.mkdir()
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
+    base = f"/v1/sessions/conv_late_git/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_late_git", runner_workspace=runner_ws) as client:
+        resp = await client.get(f"{base}/search", params={"q": "target"})
+        body = resp.json()
+        assert body["data"] == [], body
+        assert body["truncated"] is True
+
+        env = _git_env()
+        subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+        subprocess.run(["git", "add", "-A"], cwd=ws, check=True, capture_output=True, env=env)
+        subprocess.run(
+            ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+        )
+
+        def forbid_start(self: GitFilesystemRegistry) -> None:
+            raise AssertionError("search must not start a registry on an agent-created repo")
+
+        monkeypatch.setattr(GitFilesystemRegistry, "start", forbid_start)
+        resp = await client.get(f"{base}/search", params={"q": "target"})
+        body = resp.json()
+        assert [e["path"] for e in body["data"]] == ["zzz/target.jsonnet"], body
+        assert body["truncated"] is True
+
+
+def test_search_indexed_paths_never_describes_a_symlink(tmp_path: Path) -> None:
+    """Index paths are stat'ed in the unsandboxed runner, so a symlink — as the
+    leaf or as any parent, wherever it points, and even if swapped mid-search —
+    must never be followed: the sandboxed walk is the only thing that describes
+    links. Regular files beneath real directories are described as before."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "b.txt").write_text("12345")
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "b-link").symlink_to(outside / "b.txt")
+    (root / "a").symlink_to(outside)
+    (root / "real").mkdir()
+    (root / "real" / "b.md").write_text("md")
+    (root / "b-docs").symlink_to(root / "real")
+
+    entries = search_indexed_paths(root, ["b-link", "a/b.txt", "b-docs", "real/b.md"], "b")
+
+    assert [(e.path, e.type, e.bytes) for e in entries] == [("real/b.md", "file", 2)]
+
+
+@pytest.mark.asyncio
+async def test_search_follows_a_repository_created_inside_an_outer_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace that starts inside an outer repository and later becomes its
+    own must be searched through its own index — the outer index never lists a
+    nested repository's files — so the cached registry has to be replaced when
+    the repository boundary moves."""
+    env = _git_env()
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    subprocess.run(["git", "init"], cwd=outer, check=True, capture_output=True, env=env)
+    ws = outer / "ws"
+    ws.mkdir()
+    _seed_budget_busting_repo(ws, commit=False)
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
+    base = f"/v1/sessions/conv_nested/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_nested", runner_workspace=outer) as client:
+        resp = await client.get(f"{base}/search", params={"q": "target"})
+        assert resp.json()["data"] == [], resp.json()
+
+        for args in (["init"], ["add", "-A"], ["commit", "-m", "init"]):
+            subprocess.run(["git", *args], cwd=ws, check=True, capture_output=True, env=env)
+
+        resp = await client.get(f"{base}/search", params={"q": "target"})
+        assert [e["path"] for e in resp.json()["data"]] == ["zzz/target.jsonnet"], resp.json()
+
+
+@pytest.mark.asyncio
+async def test_search_keeps_a_tracked_directory_symlink_a_folder(tmp_path: Path) -> None:
+    """A tracked symlink to an in-workspace directory must come back as a
+    folder row. The index leaves symlinks to the sandboxed walk, whose
+    classification is the one shown; describing them from the index once
+    turned this reveal into a broken file open."""
+    env = _git_env()
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    (ws / "real").mkdir()
+    (ws / "real" / "x.txt").write_text("x")
+    (ws / "docs").symlink_to(ws / "real")
+    subprocess.run(["git", "add", "-A"], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    base = f"/v1/sessions/conv_dirlink/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_dirlink") as client:
+        resp = await client.get(f"{base}/search", params={"q": "docs"})
+        body = resp.json()
+
+    assert [(e["path"], e["type"]) for e in body["data"]] == [("docs", "directory")], body
+
+
+@pytest.mark.asyncio
+async def test_scoped_search_reaches_snapshot_files_past_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inside a nested scope, an untracked file the scoped walk cannot reach
+    must still come from the Changed tab's snapshot, re-rooted at the scope.
+    (On Windows the scope arrives with native separators while snapshot paths
+    are normalized to '/'; the two must be compared alike.)"""
+    env = _git_env()
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True, env=env)
+    filler = ws / "src" / "app" / "aaa"
+    filler.mkdir(parents=True)
+    for i in range(60):
+        (filler / f"f{i:02d}.txt").write_text("x")
+    subprocess.run(["git", "add", "-A"], cwd=ws, check=True, capture_output=True, env=env)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=ws, check=True, capture_output=True, env=env
+    )
+    (ws / "src" / "app" / "zzz").mkdir()
+    (ws / "src" / "app" / "zzz" / "new.txt").write_text("untracked")
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
+    base = f"/v1/sessions/conv_scoped/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+
+    async with _git_runner_client(ws, "conv_scoped") as client:
+        assert (await client.get(f"{base}/changes")).status_code == 200
+        resp = await client.get(f"{base}/search/src/app", params={"q": "new"})
+        body = resp.json()
+
+    assert [e["path"] for e in body["data"]] == ["zzz/new.txt"], body
+    assert body["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_write_file_base64_keeps_binary_bytes_and_tells_the_file_search(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An upload's bytes arrive as base64, land intact, and the file search hears about them."""
+    import base64
+
+    told: list[object] = []
+    monkeypatch.setattr("omnigent.superchat.knowledge.runtime.notify_written", told.append)
+    data = bytes(range(256)) * 4
+    resp = await client.put(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/your_files/uploads/2026-10-09/blob.pdf",
+        json={"content": base64.b64encode(data).decode(), "encoding": "base64"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["bytes_written"] == len(data)
+    assert (workspace / "your_files/uploads/2026-10-09/blob.pdf").read_bytes() == data
+    assert len(told) == 1 and str(told[0]).endswith("uploads/2026-10-09/blob.pdf")
+
+
+@pytest.mark.asyncio
+async def test_write_file_rejects_invalid_base64(client: httpx.AsyncClient) -> None:
+    resp = await client.put(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/bad.bin",
+        json={"content": "***not base64***", "encoding": "base64"},
+    )
+    assert resp.status_code == 400

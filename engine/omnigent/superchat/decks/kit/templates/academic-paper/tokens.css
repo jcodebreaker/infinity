@@ -1,0 +1,18 @@
+      --bg: #fdfcf8;
+      --fg: #0a0a0a;
+      --muted: #464646;
+      --accent: #1a3a7a;
+      --surface: #f7f5ed;
+      --shell: #08090d;
+      --line: #cfccc0;
+      --radius: 0px;
+      --font-display: "Newsreader", Georgia, "Times New Roman", serif;
+      --font-body: "Newsreader", Georgia, "Times New Roman", serif;
+      --font-mono: "Newsreader", Georgia, "Times New Roman", serif;
+      --display-weight: 600;
+      --display-tracking: -0.01em;
+      --accent-2: #0a0a0a;
+      --accent-3: #8a1a1a;
+      --good: #1a5a2a;
+      --warn: #7a5a10;
+      --font-serif: var(--font-display);

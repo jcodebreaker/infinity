@@ -1,0 +1,21 @@
+{
+  "name": "@superchat/adapters",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    "./omnigent/browser": "./src/omnigent/browser.ts"
+  },
+  "scripts": {
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run --root ../../.. web/packages/adapters/src"
+  },
+  "dependencies": {
+    "@superchat/contracts": "workspace:*",
+    "@superchat/core": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2",
+    "vitest": "4.1.11"
+  }
+}

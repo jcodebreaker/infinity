@@ -1,0 +1,33 @@
+<!-- Portions modified from nexu-io/open-design design-templates/html-ppt/templates/single-page/chart-pie.html@802708f,
+     MIT (Copyright (c) 2026 lewis, see design-templates/html-ppt/LICENSE; the repository is Apache-2.0).
+     Changes: the <section> alone (Superchat supplies the deck around it); Superchat layout classes and data-superchat-id
+     on every element; a caption that cites the data source; a unique canvas id per slide; the colors are
+     read from the canvas' own CSS tokens (--accent, --accent-2, --accent-3, --muted, --line) so a slide
+     surface can recolor them; the chart is in a fixed-height container (data-report skill rule); the
+     script carries data-superchat-chart. The Chart.js options are otherwise as in the template. -->
+<section class="slide t-a l-chart" data-screen-label="06 Time split" data-superchat-id="time-pie">
+  <div class="kicker" data-superchat-id="time-pie-kicker">Chart · doughnut</div>
+  <h2 class="title" data-superchat-id="time-pie-title">Where the time goes</h2>
+  <div class="cols-chart">
+    <div class="chart" data-superchat-id="time-pie-chart"><canvas id="time-pie-canvas" data-superchat-id="time-pie-canvas"></canvas></div>
+    <div class="panel" data-superchat-id="time-pie-panel">
+      <h3 data-superchat-id="time-pie-panel-h">Takeaways</h3>
+      <p data-superchat-id="time-pie-panel-p">More than half the time goes to writing content; motion is only 5%.</p>
+    </div>
+  </div>
+  <p class="source" data-superchat-id="time-pie-source">Source: timesheets/q3.csv, column hours, share by activity</p>
+  <script data-superchat-chart>
+    addEventListener('DOMContentLoaded',()=>{
+      const canvas=document.getElementById('time-pie-canvas');
+      const css=getComputedStyle(canvas);
+      const colors=['--accent','--accent-2','--accent-3','--good','--warn'].map(k=>css.getPropertyValue(k).trim());
+      const text2=css.getPropertyValue('--muted').trim();
+      new Chart(canvas,{type:'doughnut',
+        data:{labels:['Writing','Layouts','Styling','Imagery','Motion'],
+          datasets:[{data:[55,18,14,8,5],backgroundColor:colors,borderWidth:0}]},
+        options:{responsive:true,maintainAspectRatio:false,cutout:'62%',
+          plugins:{legend:{position:'right',labels:{color:text2}}}}});
+    });
+  </script>
+  <div class="foot" data-superchat-id="time-pie-foot"><span data-superchat-id="time-pie-foot-left">Deck name</span><span data-superchat-id="time-pie-foot-page">04</span></div>
+</section>

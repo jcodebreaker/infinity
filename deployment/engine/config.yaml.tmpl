@@ -1,0 +1,51 @@
+# Omnigent server config for the Superchat engine (the default template). NON-SECRET: start.sh renders
+# __ENGINE_PUBLIC_URL__ from the ENGINE_PUBLIC_URL variable; ${...} is expanded by the engine.
+#
+# The model pickers list what the Anthropic key serves. default_model below is what a chat runs on
+# until its person picks another in Settings > Models; it must be one the key serves.
+# Background work (memory upkeep, summaries) runs on the fast model through this same provider.
+hosts:
+  provider: docker
+  # Where the runner inside each host dials back: this service's PUBLIC https URL.
+  server_url: __ENGINE_PUBLIC_URL__
+  # NAMES only. Resolved from this service's environment and handed to each host's runner.
+  runner_env:
+    - ANTHROPIC_API_KEY
+    - OPENROUTER_API_KEY
+    - OMNIGENT_BROWSER_BACKEND
+    - OMNIGENT_SUBAGENT_MAX_CONCURRENT
+    - OMNIGENT_LLM_TRACE_DIR
+    - OMNIGENT_PROMPT_CACHE_1H
+    - OTEL_EXPORTER_OTLP_ENDPOINT
+    - OMNIGENT_TELEMETRY_ENABLED
+    - OTEL_EXPORTER_OTLP_PROTOCOL
+    - OTEL_METRICS_EXPORTER
+    - OTEL_LOGS_EXPORTER
+    - OMNIGENT_OTEL_CAPTURE_CONTENT
+  host_config:
+    providers:
+      # The operator's Anthropic key for everyone (readable inside the host, like any
+      # operator key). To keep keys in the engine, use the BYOK template's model connection.
+      anthropic:
+        kind: gateway
+        display_name: Anthropic
+        anthropic:
+          base_url: https://api.anthropic.com
+          api_key_ref: env:ANTHROPIC_API_KEY
+          # Model limits pi is told (it otherwise assumes 128k context / 16k output).
+          context_window: 1000000
+          max_output_tokens: 32000
+    inference:
+      harnesses:
+        claude-sdk:
+          provider: anthropic
+          default_model: claude-sonnet-5-5
+        pi:
+          provider: anthropic
+          default_model: claude-sonnet-5-5
+  # The model pickers list what the key serves (GET /v1/models), read server-side.
+  model_discovery:
+    anthropic:
+      base_url: https://api.anthropic.com
+      api_key_ref: env:ANTHROPIC_API_KEY
+      family: anthropic

@@ -1,0 +1,151 @@
+diff --git a/src/index.js b/src/index.js
+index 6db918e..a6be00e 100644
+--- a/src/index.js
++++ b/src/index.js
+@@ -319,6 +319,64 @@ function getCustomShapeType(customShapeName, pptx) {
+   return pptx.ShapeType.rect;
+ }
+ 
++// Superchat patch: native chart hook ---------------------------------------------------------------
++// The page puts a PptxGenJS chart spec on a <canvas data-pptx-chart>:
++//   { "types": [{ "type": "bar", "data": [...], "options": {...} }, ...], "options": {...} }
++// One entry in `types` is a single chart, several are a combo chart (PptxGenJS addChart with a
++// type array). `type` is a PptxGenJS chart type (bar, line, area, pie, doughnut, radar, scatter,
++// bubble); `data` and `options` are exactly what pptx.addChart takes. Lengths that are CSS pixels
++// on the page (font sizes, line widths, marker sizes) come as px and are converted to points at
++// the slide scale here, because only this function knows the scale.
++const CHART_PX_KEYS = /FontSize$|^lineSize$|^lineDataSymbolSize$|^size$/;
++
++function readChartSpec(node) {
++  let spec;
++  try {
++    spec = JSON.parse(node.getAttribute('data-pptx-chart'));
++  } catch (e) {
++    throw new Error(`data-pptx-chart is not valid JSON: ${e.message}`);
++  }
++  if (!spec || !Array.isArray(spec.types) || spec.types.length === 0) {
++    throw new Error('data-pptx-chart needs a non-empty "types" array');
++  }
++  return spec;
++}
++
++function scaleChartPx(value, scale) {
++  if (Array.isArray(value)) return value.map((entry) => scaleChartPx(entry, scale));
++  if (!value || typeof value !== 'object') return value;
++  const out = {};
++  for (const [key, entry] of Object.entries(value)) {
++    out[key] =
++      CHART_PX_KEYS.test(key) && typeof entry === 'number'
++        ? Math.max(0.25, Math.round(entry * 0.75 * scale * 100) / 100)
++        : scaleChartPx(entry, scale);
++  }
++  return out;
++}
++
++function addNativeChart(slide, pptx, item, scale) {
++  const known = new Set(Object.values(pptx.charts));
++  const types = item.chartSpec.types.map((entry) => {
++    if (!known.has(entry.type)) throw new Error(`data-pptx-chart: unknown chart type "${entry.type}"`);
++    return { type: entry.type, data: entry.data, options: scaleChartPx(entry.options || {}, scale) };
++  });
++  const options = {
++    ...scaleChartPx(item.chartSpec.options || {}, scale),
++    x: item.options.x,
++    y: item.options.y,
++    w: item.options.w,
++    h: item.options.h,
++    altText: item.options.altText,
++    objectName: item.options.objectName,
++  };
++  if (types.length === 1) {
++    slide.addChart(types[0].type, types[0].data, { ...types[0].options, ...options });
++  } else {
++    slide.addChart(types, options);
++  }
++}
++
+ async function processSlide(root, slide, pptx, globalOptions = {}) {
+   const rootRect = root.getBoundingClientRect();
+   const PPTX_WIDTH_IN = globalOptions._slideWidth || 10;
+@@ -432,12 +490,19 @@ async function processSlide(root, slide, pptx, globalOptions = {}) {
+     if (item.type === 'shape') slide.addShape(item.shapeType, item.options);
+     if (item.type === 'image') slide.addImage(item.options);
+     if (item.type === 'text') slide.addText(item.textParts, item.options);
++    if (item.type === 'chart') addNativeChart(slide, pptx, item, layoutConfig.scale);
+     if (item.type === 'table') {
+       slide.addTable(item.tableData.rows, {
+         x: item.options.x,
+         y: item.options.y,
+         w: item.options.w,
+         colW: item.tableData.colWidths, // Essential for correct layout
++        // Superchat patch: the rendered <tr> heights, so PowerPoint does not collapse rows to text height.
++        ...(item.tableData.rowHeights.length === item.tableData.rows.length &&
++          item.tableData.rowHeights.length > 0 && {
++            rowH: item.tableData.rowHeights,
++            h: item.tableData.rowHeights.reduce((sum, rowHeight) => sum + rowHeight, 0),
++          }),
+         autoPage: false,
+         // Remove default table styles so our extracted CSS applies cleanly
+         border: { type: 'none' },
+@@ -938,6 +1003,23 @@ function prepareRenderItem(node, config, domOrder, pptx, effectiveZIndex, comput
+     style.getPropertyValue('--shape-type') ||
+     style.getPropertyValue('--pptx-shape');
+ 
++  // Superchat patch: a <canvas data-pptx-chart="{...}"> becomes a native PowerPoint chart (never a
++  // picture of the canvas). The attribute holds the PptxGenJS chart spec, see readChartSpec().
++  if (node.tagName === 'CANVAS' && node.hasAttribute('data-pptx-chart')) {
++    return {
++      items: [
++        {
++          type: 'chart',
++          zIndex: parentSortKey.concat([0, -1]),
++          domOrder,
++          chartSpec: readChartSpec(node),
++          options: { x, y, w, h },
++        },
++      ],
++      stopRecursion: true,
++    };
++  }
++
+   if (node.tagName === 'TABLE') {
+     const tableData = extractTableData(node, config.scale);
+     const tableItems = [
+diff --git a/src/pptx-normalizer.js b/src/pptx-normalizer.js
+index c0459b5..58589f7 100644
+--- a/src/pptx-normalizer.js
++++ b/src/pptx-normalizer.js
+@@ -352,6 +352,8 @@ function sortSpTree(doc) {
+                   ? 'Picture'
+                   : typeSegment === 'table'
+                     ? 'Table'
++                    : typeSegment === 'chart'
++                      ? 'Chart'
+                     : typeSegment === 'line'
+                       ? 'Line'
+                       : typeSegment === 'shape'
+diff --git a/src/utils.js b/src/utils.js
+index a8d28e6..da26dff 100644
+--- a/src/utils.js
++++ b/src/utils.js
+@@ -37,6 +37,7 @@ function getTableBorder(style, side, scale) {
+ export function extractTableData(node, scale) {
+   const rows = [];
+   const colWidths = [];
++  const rowHeights = []; // Superchat patch: rendered <tr> heights in inches, parallel to `rows`
+ 
+   // 1. Calculate Column Widths based on the first row of cells
+   // We look at the first <tr>'s children to determine visual column widths.
+@@ -145,10 +146,11 @@ export function extractTableData(node, scale) {
+ 
+     if (rowData.length > 0) {
+       rows.push(rowData);
++      rowHeights.push(tr.getBoundingClientRect().height * (1 / 96) * scale);
+     }
+   });
+ 
+-  return { rows, colWidths };
++  return { rows, colWidths, rowHeights };
+ }
+ 
+ // Checks if any parent element has overflow: hidden which would clip this element

@@ -1,0 +1,35 @@
+{
+  "id": "academic-paper",
+  "name": "Academic Paper",
+  "tagline": "Scholarly ink serif",
+  "description": "Paper white, black ink, a book serif and a single ink-blue accent.",
+  "best_for": "research readouts, policy and methodology papers, conference-style talks",
+  "category": "professional",
+  "mode": "light",
+  "upstream": "https://github.com/lewislulu/html-ppt-skill",
+  "source": "nexu-io/open-design design-templates/html-ppt/assets/themes/academic-paper.css@802708f",
+  "license": "MIT (see LICENSE); fonts SIL OFL 1.1 (see ../../fonts/OFL-*.txt)",
+  "fonts": [
+    {
+      "family": "Newsreader",
+      "weight": 400,
+      "style": "normal",
+      "file": "Newsreader-400.ttf",
+      "license": "OFL-newsreader.txt"
+    },
+    {
+      "family": "Newsreader",
+      "weight": 600,
+      "style": "normal",
+      "file": "Newsreader-600.ttf",
+      "license": "OFL-newsreader.txt"
+    },
+    {
+      "family": "Newsreader",
+      "weight": 400,
+      "style": "italic",
+      "file": "Newsreader-400-italic.ttf",
+      "license": "OFL-newsreader.txt"
+    }
+  ]
+}

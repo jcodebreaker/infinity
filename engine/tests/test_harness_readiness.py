@@ -1,0 +1,75 @@
+"""Tests for omnigent.onboarding.harness_readiness gating."""
+
+from __future__ import annotations
+
+import pytest
+
+from omnigent.onboarding import harness_readiness as hr
+
+
+def test_pi_harness_gates_on_pi_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``pi`` is gated on the ``pi`` CLI being installed.
+
+    Regression guard: pi has no ``_HARNESS_FAMILY`` entry (it uses the
+    ``PI_SURFACE`` sentinel), so it must not hit the unknown-harness fail-open
+    branch and report configured when ``pi`` is missing — the host pre-spawn
+    check would then let a doomed launch through.
+    """
+    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: False)
+    assert hr.harness_is_configured("pi") is False
+
+    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: True)
+    assert hr.harness_is_configured("pi") is True
+
+
+def test_sdk_and_unknown_harnesses_still_fail_open(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SDK and unknown harnesses are never gated, even with no CLI installed.
+
+    Pins that the pi gate narrowed only the pi surface — SDK harnesses
+    (runtime/ambient credentials) and unknown harnesses must keep failing open
+    so a working launch is never blocked.
+    """
+    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: False)
+    assert hr.harness_is_configured("claude-sdk") is True
+    assert hr.harness_is_configured("totally-unknown-harness") is True
+
+
+def test_configured_harness_map_exposes_pi(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The readiness map carries a ``pi`` key for the web picker lookup.
+
+    The agent picker warns "needs setup" by looking up the agent's harness
+    (``pi``) in this map; without the key the Pi row could never warn.
+    A missing binary now reports the richer ``"binary-missing"`` reason (Pi
+    gained the credential axis) rather than a bare ``False``.
+    """
+    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: False)
+    # No ``pi`` on PATH either, or a present-but-unprobed binary reads as
+    # ``"version-too-low"`` instead.
+    monkeypatch.setattr(hr, "resolve_cli_binary", lambda _binary: None)
+    cmap = hr.configured_harness_map()
+    assert cmap.get("pi") == "binary-missing"
+
+
+def test_configured_harness_map_pi_installed_no_provider_needs_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pi installed but with no configured provider reports ``"needs-auth"``.
+
+    Pi has no CLI login — its only credential is an omnigent-managed provider —
+    so an installed binary with no provider is the yellow "installed but not
+    configured" state the setup dialog offers an "Add key" action for.
+    """
+    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: True)
+    monkeypatch.setattr(hr, "_family_provider_configured", lambda _h: False)
+    cmap = hr.configured_harness_map()
+    assert cmap.get("pi") == "needs-auth"
+
+
+def test_configured_harness_map_pi_installed_with_provider_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pi installed AND a provider configured reports ready (``True``)."""
+    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: True)
+    monkeypatch.setattr(hr, "_family_provider_configured", lambda _h: True)
+    cmap = hr.configured_harness_map()
+    assert cmap.get("pi") is True

@@ -1,0 +1,933 @@
+@import "tw-animate-css";
+@import "./shadcn.css";
+@import "@superchat/ui-tokens/css";
+
+@source "./**/*.{ts,tsx}";
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-chat-user: var(--chat-user);
+  --color-chat-user-foreground: var(--chat-user-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-link: var(--link);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-overlay: var(--overlay);
+  --color-scrollbar: var(--scrollbar);
+  --color-scrollbar-hover: var(--scrollbar-hover);
+  --color-ground: var(--ground);
+  --color-ground-wash: var(--ground-wash);
+  --color-panel: var(--panel);
+  --color-solid: var(--solid);
+  --color-line: var(--line);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-bubble: var(--bubble);
+  --color-selection: var(--selection);
+  --color-window: var(--window);
+  --color-content: var(--content);
+  --color-glass: var(--glass);
+  --color-glass-line: var(--glass-line);
+  --color-group: var(--group);
+  --color-separator: var(--separator);
+  --color-selection-strong: var(--selection-strong);
+  --color-tint: var(--tint);
+  --color-tint-ink: var(--tint-ink);
+  --color-tint-2: var(--tint-2);
+  --color-tint-3: var(--tint-3);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-alert: var(--alert);
+  --color-sig-goals: var(--sig-goals);
+  --color-sig-feed: var(--sig-feed);
+  --color-sig-ideas: var(--sig-ideas);
+  --color-sig-library: var(--sig-library);
+  --color-sig-waiting: var(--sig-waiting);
+  --color-tile-blue-from: var(--tile-blue-from);
+  --color-tile-blue-to: var(--tile-blue-to);
+  --color-tile-green-from: var(--tile-green-from);
+  --color-tile-green-to: var(--tile-green-to);
+  --color-tile-yellow-from: var(--tile-yellow-from);
+  --color-tile-yellow-to: var(--tile-yellow-to);
+  --color-tile-orange-from: var(--tile-orange-from);
+  --color-tile-orange-to: var(--tile-orange-to);
+  --color-tile-purple-from: var(--tile-purple-from);
+  --color-tile-purple-to: var(--tile-purple-to);
+  --color-tile-red-from: var(--tile-red-from);
+  --color-tile-red-to: var(--tile-red-to);
+  --color-tile-indigo-from: var(--tile-indigo-from);
+  --color-tile-indigo-to: var(--tile-indigo-to);
+  --color-tile-teal-from: var(--tile-teal-from);
+  --color-tile-teal-to: var(--tile-teal-to);
+  --color-tile-gray-from: var(--tile-gray-from);
+  --color-tile-gray-to: var(--tile-gray-to);
+  --color-media: var(--media);
+  --color-media-deep: var(--media-deep);
+  --color-media-glow: var(--media-glow);
+  --color-media-bar: var(--media-bar);
+  --color-media-bar-2: var(--media-bar-2);
+  --color-media-key-from: var(--media-key-from);
+  --color-media-key-to: var(--media-key-to);
+  --color-media-warm-glow: var(--media-warm-glow);
+  --color-media-warm-deep: var(--media-warm-deep);
+  --color-media-pink-glow: var(--media-pink-glow);
+  --color-media-pink-deep: var(--media-pink-deep);
+  --color-media-green-glow: var(--media-green-glow);
+  --color-media-green-deep: var(--media-green-deep);
+  --color-welcome-bg: var(--welcome-bg);
+  --color-welcome-paper: var(--welcome-paper);
+  --color-welcome-ink: var(--welcome-ink);
+  --color-welcome-ink-2: var(--welcome-ink-2);
+  --color-welcome-ink-3: var(--welcome-ink-3);
+  --color-welcome-line: var(--welcome-line);
+  --color-welcome-me: var(--welcome-me);
+  --color-welcome-bubble: var(--welcome-bubble);
+  --color-welcome-rose: var(--welcome-rose);
+  --color-welcome-ok: var(--welcome-ok);
+  --color-welcome-amber: var(--welcome-amber);
+  --color-welcome-amber-ink: var(--welcome-amber-ink);
+  --color-welcome-pc: var(--welcome-pc);
+  --color-welcome-pc-ink: var(--welcome-pc-ink);
+  --color-welcome-pc-mute: var(--welcome-pc-mute);
+  --color-welcome-pc-win: var(--welcome-pc-win);
+  --color-welcome-pc-win-ink: var(--welcome-pc-win-ink);
+  --color-welcome-pc-win-mute: var(--welcome-pc-win-mute);
+  --color-welcome-pc-bar: var(--welcome-pc-bar);
+  --color-welcome-live: var(--welcome-live);
+  --color-welcome-chip: var(--welcome-chip);
+  --color-welcome-chip-line: var(--welcome-chip-line);
+  --color-welcome-chip-ink: var(--welcome-chip-ink);
+  --color-welcome-orb-hi: var(--welcome-orb-hi);
+  --color-welcome-orb-mid: var(--welcome-orb-mid);
+  --color-welcome-orb-deep: var(--welcome-orb-deep);
+  --color-welcome-orb-lo: var(--welcome-orb-lo);
+  --color-welcome-violet: var(--welcome-violet);
+  --color-welcome-canvas: var(--welcome-canvas);
+  --color-welcome-panel: var(--welcome-panel);
+  --color-welcome-rec: var(--welcome-rec);
+  --color-welcome-rec-dot: var(--welcome-rec-dot);
+  --color-welcome-night: var(--welcome-night);
+  --color-welcome-night-ink: var(--welcome-night-ink);
+  --color-welcome-night-ink-2: var(--welcome-night-ink-2);
+  --color-welcome-night-ink-3: var(--welcome-night-ink-3);
+  --color-welcome-night-sub: var(--welcome-night-sub);
+  --color-welcome-night-body: var(--welcome-night-body);
+  --color-welcome-night-glow: var(--welcome-night-glow);
+  --color-welcome-night-glow-ink: var(--welcome-night-glow-ink);
+  --color-welcome-night-glow-ink-2: var(--welcome-night-glow-ink-2);
+  --color-welcome-night-orb-hi: var(--welcome-night-orb-hi);
+  --color-welcome-night-orb-lo: var(--welcome-night-orb-lo);
+  --color-welcome-night-rose: var(--welcome-night-rose);
+  --color-welcome-night-amber: var(--welcome-night-amber);
+  --color-welcome-night-bubble: var(--welcome-night-bubble);
+  --color-welcome-night-panel: var(--welcome-night-panel);
+  --color-welcome-night-key: var(--welcome-night-key);
+  --color-welcome-night-switch: var(--welcome-night-switch);
+  --color-welcome-night-pill: var(--welcome-night-pill);
+  --color-welcome-night-bar: var(--welcome-night-bar);
+  --color-welcome-night-rec-ink: var(--welcome-night-rec-ink);
+  --color-welcome-night-star: var(--welcome-night-star);
+  --color-welcome-night-line: var(--welcome-night-line);
+  --color-welcome-screen-hi: var(--welcome-screen-hi);
+  --color-welcome-screen-mid: var(--welcome-screen-mid);
+  --color-welcome-screen-lo: var(--welcome-screen-lo);
+  --color-welcome-sheet: var(--welcome-sheet);
+  --color-welcome-sheet-line: var(--welcome-sheet-line);
+  --color-welcome-sheet-line-2: var(--welcome-sheet-line-2);
+  --color-welcome-sheet-ink-2: var(--welcome-sheet-ink-2);
+  --color-welcome-mute: var(--welcome-mute);
+  --color-welcome-doc: var(--welcome-doc);
+  --color-welcome-doc-ink: var(--welcome-doc-ink);
+  --color-welcome-app-dot: var(--welcome-app-dot);
+  --color-welcome-app-line: var(--welcome-app-line);
+  --color-welcome-app-line-2: var(--welcome-app-line-2);
+  --color-welcome-app-hint: var(--welcome-app-hint);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+@keyframes superchat-avatar-spin {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+.superchat-bot-avatar-ring {
+  animation: superchat-avatar-spin 1.2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  opacity: 0;
+  transition: opacity 180ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.superchat-bot-avatar {
+  transition: box-shadow 180ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.superchat-bot-avatar[data-working="true"] .superchat-bot-avatar-ring {
+  opacity: 1;
+}
+
+.superchat-bot-avatar-eyes {
+  animation: var(--superchat-eye-animation-name) var(--superchat-eye-animation-duration)
+    var(--superchat-eye-animation-easing) var(--superchat-eye-animation-delay) infinite;
+  transition: opacity 180ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.superchat-bot-avatar-eyes-working {
+  opacity: 0;
+}
+
+.superchat-bot-avatar[data-working="true"] .superchat-bot-avatar-eyes-idle {
+  opacity: 0;
+}
+
+.superchat-bot-avatar[data-working="true"] .superchat-bot-avatar-eyes-working {
+  opacity: 1;
+}
+
+.superchat-organic-avatar-body {
+  transform-origin: center;
+  transition: opacity 180ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.superchat-organic-avatar-body-idle {
+  animation: superchat-organic-idle 5.6s ease-in-out infinite;
+}
+
+.superchat-organic-avatar-body-working {
+  opacity: 0;
+}
+
+.superchat-organic-avatar[data-working="true"] .superchat-organic-avatar-body-idle {
+  opacity: 0;
+}
+
+.superchat-organic-avatar[data-working="true"] .superchat-organic-avatar-body-working {
+  opacity: 1;
+}
+
+.superchat-organic-avatar-eyes {
+  transition: opacity 180ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.superchat-organic-avatar-eyes-working {
+  opacity: 0;
+}
+
+.superchat-organic-avatar[data-working="true"] .superchat-organic-avatar-eyes-idle {
+  opacity: 0;
+}
+
+.superchat-organic-avatar[data-working="true"] .superchat-organic-avatar-eyes-working {
+  opacity: 1;
+}
+
+.superchat-organic-avatar[data-eye-pattern="0"] .superchat-organic-avatar-eyes-idle {
+  animation: superchat-eyes-idle-0 5.8s ease-in-out infinite;
+}
+
+.superchat-organic-avatar[data-eye-pattern="1"] .superchat-organic-avatar-eyes-idle {
+  animation: superchat-eyes-idle-1 6.4s ease-in-out -1.7s infinite;
+}
+
+.superchat-organic-avatar[data-eye-pattern="2"] .superchat-organic-avatar-eyes-idle {
+  animation: superchat-eyes-idle-2 5.2s ease-in-out -3.1s infinite;
+}
+
+.superchat-organic-avatar[data-eye-pattern="3"] .superchat-organic-avatar-eyes-idle {
+  animation: superchat-eyes-idle-3 6.8s ease-in-out -2.3s infinite;
+}
+
+.superchat-organic-avatar[data-eye-pattern="0"] .superchat-organic-avatar-eyes-working {
+  animation: superchat-organic-eyes-loop-0 6.6s ease-in-out infinite;
+}
+
+.superchat-organic-avatar[data-eye-pattern="1"] .superchat-organic-avatar-eyes-working {
+  animation: superchat-organic-eyes-loop-1 7.2s ease-in-out -1.4s infinite;
+}
+
+.superchat-organic-avatar[data-eye-pattern="2"] .superchat-organic-avatar-eyes-working {
+  animation: superchat-organic-eyes-loop-2 6.1s ease-in-out -3.2s infinite;
+}
+
+.superchat-organic-avatar[data-eye-pattern="3"] .superchat-organic-avatar-eyes-working {
+  animation: superchat-organic-eyes-loop-3 7.8s ease-in-out -2.1s infinite;
+}
+
+.superchat-organic-avatar[data-shape-family="0"] .superchat-organic-avatar-body-working {
+  animation: superchat-organic-float 1.8s ease-in-out infinite;
+}
+
+.superchat-organic-avatar[data-shape-family="1"] .superchat-organic-avatar-body-working {
+  animation: superchat-organic-stretch 1.35s ease-in-out infinite;
+}
+
+.superchat-organic-avatar[data-shape-family="2"] .superchat-organic-avatar-body-working,
+.superchat-organic-avatar[data-shape-family="8"] .superchat-organic-avatar-body-working {
+  animation: superchat-organic-sway 1.6s ease-in-out infinite;
+}
+
+.superchat-organic-avatar[data-shape-family="3"] .superchat-organic-avatar-body-working,
+.superchat-organic-avatar[data-shape-family="4"] .superchat-organic-avatar-body-working {
+  animation: superchat-organic-turn 2.4s ease-in-out infinite;
+}
+
+.superchat-organic-avatar[data-shape-family="5"] .superchat-organic-avatar-body-working,
+.superchat-organic-avatar[data-shape-family="9"] .superchat-organic-avatar-body-working {
+  animation: superchat-organic-squash 1.35s ease-in-out infinite;
+}
+
+.superchat-organic-avatar[data-shape-family="6"] .superchat-organic-avatar-body-working {
+  animation: superchat-organic-pulse 1.1s ease-in-out infinite;
+}
+
+.superchat-organic-avatar[data-shape-family="7"] .superchat-organic-avatar-body-working {
+  transform-origin: center 20%;
+  animation: superchat-organic-ring 1.35s ease-in-out infinite;
+}
+
+@keyframes superchat-organic-float {
+  0%,
+  100% {
+    transform: translateY(2px) scaleX(1.02);
+  }
+  50% {
+    transform: translateY(-3px) scaleX(0.98);
+  }
+}
+
+@keyframes superchat-organic-idle {
+  0%,
+  100% {
+    transform: translateY(1.2px) scale(1.012, 0.988);
+  }
+  50% {
+    transform: translateY(-1.4px) scale(0.988, 1.012);
+  }
+}
+
+@keyframes superchat-organic-stretch {
+  0%,
+  100% {
+    transform: translateY(2px) scale(1.04, 0.96);
+  }
+  50% {
+    transform: translateY(-3px) scale(0.96, 1.05);
+  }
+}
+
+@keyframes superchat-organic-sway {
+  0%,
+  100% {
+    transform: rotate(-3deg) translateX(-1px);
+  }
+  50% {
+    transform: rotate(3deg) translateX(1px);
+  }
+}
+
+@keyframes superchat-organic-turn {
+  0%,
+  100% {
+    transform: rotate(-4deg) scale(0.98);
+  }
+  50% {
+    transform: rotate(4deg) scale(1.04);
+  }
+}
+
+@keyframes superchat-organic-squash {
+  0%,
+  100% {
+    transform: scale(1.04, 0.96);
+  }
+  50% {
+    transform: scale(0.96, 1.04);
+  }
+}
+
+@keyframes superchat-organic-pulse {
+  0%,
+  100% {
+    transform: scale(0.96);
+  }
+  45% {
+    transform: scale(1.06);
+  }
+}
+
+@keyframes superchat-organic-ring {
+  0%,
+  100% {
+    transform: rotate(-4deg);
+  }
+  35% {
+    transform: rotate(5deg);
+  }
+  65% {
+    transform: rotate(-3deg);
+  }
+}
+
+@keyframes superchat-organic-eyes-loop-0 {
+  0%,
+  100% {
+    transform: translate(-9%, 1%) scaleY(0.94);
+  }
+  18% {
+    transform: translate(9%, -2%) scaleY(1.04);
+  }
+  34% {
+    transform: translate(0, -8%) scale(1.08);
+  }
+  48% {
+    transform: scale(1.12, 0.82);
+  }
+  51% {
+    transform: scale(1.05, 0.08);
+  }
+  54% {
+    transform: scale(1.12, 0.9);
+  }
+  72% {
+    transform: translate(-5%, 7%) scaleY(0.9);
+  }
+  86% {
+    transform: translate(7%, 3%);
+  }
+}
+
+@keyframes superchat-organic-eyes-loop-1 {
+  0%,
+  100% {
+    transform: translate(0, -8%) scale(1.06);
+  }
+  16% {
+    transform: translate(8%, 2%);
+  }
+  31% {
+    transform: translate(0, 8%) scaleY(0.9);
+  }
+  46% {
+    transform: translate(-8%, 2%);
+  }
+  61% {
+    transform: scale(0.88, 1.1);
+  }
+  76% {
+    transform: translateY(-7%) scaleY(1.08);
+  }
+  88% {
+    transform: translateY(6%) scale(1.08, 0.86);
+  }
+}
+
+@keyframes superchat-organic-eyes-loop-2 {
+  0%,
+  100% {
+    transform: scale(0.9, 1.08);
+  }
+  20% {
+    transform: scale(1.14, 0.84);
+  }
+  24% {
+    transform: scale(1.08, 0.08);
+  }
+  28% {
+    transform: scale(1.02);
+  }
+  45% {
+    transform: translate(-9%, -3%) scaleY(0.94);
+  }
+  62% {
+    transform: translate(9%, 2%) scaleY(1.05);
+  }
+  80% {
+    transform: translate(0, -8%) scale(1.06);
+  }
+}
+
+@keyframes superchat-organic-eyes-loop-3 {
+  0%,
+  100% {
+    transform: translateY(7%) scaleY(0.9);
+  }
+  14% {
+    transform: translateY(-9%) scaleY(1.08);
+  }
+  30% {
+    transform: translate(8%, -2%);
+  }
+  47% {
+    transform: translate(-8%, 3%) scaleY(0.94);
+  }
+  63% {
+    transform: scale(1.12, 0.82);
+  }
+  78% {
+    transform: translate(0, -7%) scale(0.9, 1.08);
+  }
+  91% {
+    transform: translate(0, 5%) scale(1.06, 0.9);
+  }
+}
+
+@keyframes superchat-eyes-idle-0 {
+  0%,
+  32%,
+  100% {
+    transform: translate(0, 0) scaleY(1);
+  }
+  35% {
+    transform: translate(0, 0) scaleY(0.08);
+  }
+  38% {
+    transform: translate(0, 0) scaleY(1);
+  }
+  48%,
+  62% {
+    transform: translate(3px, -0.5px) scaleY(1);
+  }
+  70%,
+  84% {
+    transform: translate(-2.5px, 0.5px) scaleY(1);
+  }
+  89% {
+    transform: translate(0, 0) scaleY(0.12);
+  }
+  91% {
+    transform: translate(0, 0) scaleY(1);
+  }
+}
+
+@keyframes superchat-eyes-idle-1 {
+  0%,
+  25%,
+  100% {
+    transform: translate(0, 0) scaleY(1);
+  }
+  32%,
+  48% {
+    transform: translate(-3px, -1px) scaleY(1);
+  }
+  54% {
+    transform: translate(0, 0) scaleY(0.08);
+  }
+  56% {
+    transform: translate(0, 0) scaleY(1);
+  }
+  59% {
+    transform: translate(0, 0) scaleY(0.08);
+  }
+  61% {
+    transform: translate(0, 0) scaleY(1);
+  }
+  68%,
+  82% {
+    transform: translate(2.5px, 0.5px) scaleY(1);
+  }
+}
+
+@keyframes superchat-eyes-idle-2 {
+  0%,
+  28%,
+  100% {
+    transform: translate(0, 0) scaleY(1);
+  }
+  36%,
+  52% {
+    transform: translate(0.5px, -1.8px) scaleY(1.05);
+  }
+  58% {
+    transform: translate(0, 0) scaleY(0.08);
+  }
+  60% {
+    transform: translate(0, 0) scaleY(1);
+  }
+  68%,
+  85% {
+    transform: translate(3px, 0) scaleY(1);
+  }
+  92% {
+    transform: translate(0, 0) scaleY(0.1);
+  }
+  94% {
+    transform: translate(0, 0) scaleY(1);
+  }
+}
+
+@keyframes superchat-eyes-idle-3 {
+  0%,
+  24%,
+  100% {
+    transform: translate(0, 0) scaleY(1);
+  }
+  30%,
+  46% {
+    transform: translate(-2.5px, 1.2px) scaleY(0.95);
+  }
+  52% {
+    transform: translate(0, 0) scaleY(0.08);
+  }
+  54% {
+    transform: translate(0, 0) scaleY(1);
+  }
+  62%,
+  78% {
+    transform: translate(2.8px, -1px) scaleY(1);
+  }
+  86% {
+    transform: translate(0, 0) scaleY(0.08);
+  }
+  88% {
+    transform: translate(0, 0) scaleY(1);
+  }
+}
+
+@keyframes superchat-eyes-working {
+  0% {
+    transform: translate(-4px, 0) scale(0.92, 0.95);
+  }
+  25% {
+    transform: translate(0, -2px) scale(1.08, 1.08);
+  }
+  50% {
+    transform: translate(4px, 0) scale(0.92, 0.95);
+  }
+  75% {
+    transform: translate(0, 2px) scale(1, 0.9);
+  }
+  100% {
+    transform: translate(-4px, 0) scale(0.92, 0.95);
+  }
+}
+
+/* Muse face: idle breathe + blink, thinking breathe + glance around + thought dots,
+   working busy bounce/squash + eye scan + spinning spark + a pulsing glow ring,
+   waiting periodic nudge + wave + pulsing spark. State comes from data-muse-state
+   (derived MuseState, never a free string). */
+.superchat-muse-all {
+  transform-box: fill-box;
+  transform-origin: 50% 82%;
+}
+
+.superchat-muse-glow {
+  opacity: 0;
+  filter: blur(3px);
+  transform-box: fill-box;
+  transform-origin: 50% 50%;
+}
+
+.superchat-muse-pupils,
+.superchat-muse-spark,
+.superchat-muse-dot {
+  transform-box: fill-box;
+  transform-origin: 50% 50%;
+}
+
+.superchat-muse-thought {
+  opacity: 0;
+  transition: opacity 200ms ease;
+}
+
+/* Rendered only for data-muse-state="waiting" (see bot-avatar.tsx), so it only needs its
+   own wave animation, no cross-state visibility toggle. */
+.superchat-muse-hand {
+  transform-box: fill-box;
+  transform-origin: 15% 88%;
+  animation: superchat-muse-wave 0.6s ease-in-out infinite;
+}
+
+.superchat-muse-avatar[data-muse-state="idle"] .superchat-muse-all {
+  animation: superchat-muse-breathe 4.2s ease-in-out infinite;
+}
+
+.superchat-muse-avatar[data-muse-state="idle"] .superchat-muse-pupils {
+  animation: superchat-muse-blink 5.4s ease-in-out infinite;
+}
+
+.superchat-muse-avatar[data-muse-state="idle"] .superchat-muse-spark {
+  animation: superchat-muse-spark-float 3.6s ease-in-out infinite;
+}
+
+.superchat-muse-avatar[data-muse-state="thinking"] .superchat-muse-all {
+  animation: superchat-muse-breathe 2.4s ease-in-out infinite;
+}
+
+.superchat-muse-avatar[data-muse-state="thinking"] .superchat-muse-pupils {
+  animation: superchat-muse-glance 2.6s ease-in-out infinite;
+}
+
+.superchat-muse-avatar[data-muse-state="thinking"] .superchat-muse-thought {
+  opacity: 1;
+}
+
+.superchat-muse-avatar[data-muse-state="thinking"] .superchat-muse-dot {
+  animation: superchat-muse-dot 1.2s ease-in-out infinite;
+}
+
+.superchat-muse-avatar[data-muse-state="thinking"] .superchat-muse-dot-2 {
+  animation-delay: 0.15s;
+}
+
+.superchat-muse-avatar[data-muse-state="thinking"] .superchat-muse-dot-3 {
+  animation-delay: 0.3s;
+}
+
+.superchat-muse-avatar[data-muse-state="working"] .superchat-muse-all {
+  animation: superchat-muse-busy 1.4s ease-in-out infinite;
+}
+
+.superchat-muse-avatar[data-muse-state="working"] .superchat-muse-pupils {
+  animation: superchat-muse-scan 1.6s ease-in-out infinite;
+}
+
+.superchat-muse-avatar[data-muse-state="working"] .superchat-muse-spark {
+  animation: superchat-muse-spin 1.1s linear infinite;
+}
+
+.superchat-muse-avatar[data-muse-state="working"] .superchat-muse-glow {
+  animation: superchat-muse-glow-pulse 1.6s ease-in-out infinite;
+}
+
+.superchat-muse-avatar[data-muse-state="waiting"] .superchat-muse-all {
+  animation: superchat-muse-nudge 4s ease-in-out infinite;
+}
+
+.superchat-muse-avatar[data-muse-state="waiting"] .superchat-muse-spark {
+  animation: superchat-muse-spark-pulse 0.9s ease-in-out infinite;
+}
+
+@keyframes superchat-muse-breathe {
+  0%,
+  100% {
+    transform: translateY(0) scale(1, 1);
+  }
+  50% {
+    transform: translateY(-2px) scale(1.015, 0.985);
+  }
+}
+
+@keyframes superchat-muse-blink {
+  0%,
+  90%,
+  100% {
+    transform: scaleY(1);
+  }
+  93% {
+    transform: scaleY(0.1);
+  }
+  96% {
+    transform: scaleY(1);
+  }
+}
+
+@keyframes superchat-muse-spark-float {
+  0%,
+  100% {
+    transform: translateY(0) rotate(-4deg);
+  }
+  50% {
+    transform: translateY(-3px) rotate(4deg);
+  }
+}
+
+@keyframes superchat-muse-dot {
+  0%,
+  100% {
+    transform: scale(0.6);
+    opacity: 0.35;
+  }
+  50% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes superchat-muse-glance {
+  0%,
+  100% {
+    transform: translate(0, 0);
+  }
+  15% {
+    transform: translate(0, -4px);
+  }
+  35% {
+    transform: translate(4px, -2px);
+  }
+  55% {
+    transform: translate(-4px, -2px);
+  }
+  75% {
+    transform: translate(0, -3px);
+  }
+}
+
+@keyframes superchat-muse-busy {
+  0%,
+  100% {
+    transform: rotate(-5deg) translate(-3px, 0) scale(1, 1);
+  }
+  25% {
+    transform: rotate(0deg) translate(0, -3px) scale(1.035, 0.965);
+  }
+  50% {
+    transform: rotate(5deg) translate(3px, 0) scale(1, 1);
+  }
+  75% {
+    transform: rotate(0deg) translate(0, -3px) scale(0.965, 1.035);
+  }
+}
+
+@keyframes superchat-muse-glow-pulse {
+  0%,
+  100% {
+    opacity: 0.16;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.4;
+    transform: scale(1.08);
+  }
+}
+
+@keyframes superchat-muse-scan {
+  0%,
+  100% {
+    transform: translateX(-5px);
+  }
+  50% {
+    transform: translateX(5px);
+  }
+}
+
+@keyframes superchat-muse-spin {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+/* Mostly at rest — a brief bounce every few seconds is the "attention nudge",
+   not a continuous hop. */
+@keyframes superchat-muse-nudge {
+  0%,
+  80%,
+  100% {
+    transform: translateY(0) scale(1, 1);
+  }
+  86% {
+    transform: translateY(-7px) scale(0.96, 1.05);
+  }
+  90% {
+    transform: translateY(0) scale(1.06, 0.92);
+  }
+  95% {
+    transform: translateY(-2px) scale(0.99, 1.01);
+  }
+}
+
+@keyframes superchat-muse-spark-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.3);
+    opacity: 0.75;
+  }
+}
+
+@keyframes superchat-muse-wave {
+  0%,
+  100% {
+    transform: rotate(-8deg);
+  }
+  50% {
+    transform: rotate(18deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .superchat-bot-avatar-ring,
+  .superchat-bot-avatar-eyes {
+    animation: none;
+    transition: none;
+  }
+
+  .superchat-bot-avatar {
+    transition: none;
+  }
+
+  .superchat-bot-avatar-visor {
+    transition: none;
+  }
+
+  .superchat-organic-avatar[data-shape-family] .superchat-organic-avatar-body {
+    animation: none;
+    d: var(--superchat-organic-path);
+    transition: none;
+  }
+
+  .superchat-organic-avatar[data-eye-pattern] .superchat-organic-avatar-eyes {
+    animation: none;
+    transition: none;
+  }
+
+  .superchat-muse-all,
+  .superchat-muse-pupils,
+  .superchat-muse-spark,
+  .superchat-muse-dot,
+  .superchat-muse-hand,
+  .superchat-muse-glow {
+    animation: none;
+  }
+
+  /* State stays visible through color/copy, not motion: a steady glow tint
+     instead of the pulsing ring. */
+  .superchat-muse-avatar[data-muse-state="working"] .superchat-muse-glow {
+    opacity: 0.28;
+  }
+}

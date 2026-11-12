@@ -1,0 +1,11049 @@
+"""End-to-end runner-dispatch tests: server → runner → spawned harness.
+
+The load-bearing assertion: the runner FastAPI app, when given a
+real :class:`HarnessProcessManager`, accepts a
+POST /v1/sessions/{conversation_id}/events?stream=true,
+spawns a harness subprocess (using the existing
+``omnigent/runtime/harnesses/`` machinery — NOT a parallel impl),
+forwards the request to the harness via UDS, and streams the
+harness's SSE response back through the runner's own SSE response.
+
+Architecture verified end-to-end:
+- A real ``HarnessProcessManager`` is started (writes its instance
+  dir, runs orphan sweep, starts the idle reaper).
+- A test-only harness module is registered in ``_HARNESS_MODULES``.
+- The runner FastAPI app is built with ``process_manager=mgr``.
+- The test posts to the runner's
+  /v1/sessions/{conversation_id}/events?stream=true with a message
+  body + harness name.
+- The runner calls ``mgr.get_client()`` → spawns a uvicorn
+  subprocess running the test harness on a UDS → returns the
+  per-conversation httpx client.
+- The runner POSTs the request to the harness via that client.
+- The harness drives an LLM call via ``run_turn`` and streams SSE
+  back.
+- The runner relays each SSE chunk through to the test client.
+
+The OpenAI-key-gated test runs the full chain against gpt-4o-mini.
+The unkeyed test asserts on plumbing only (handler is reached,
+503 on bad harness name).
+
+Turn-context recovery tests are also included here (see the
+``# ── turn-context recovery ──`` section at the bottom of this
+file): verdict-delivery failure retry/signal, ``_resync_turn_state``
+edge cases, and the three-factor causal chain.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import os
+import tempfile
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace, TracebackType
+from typing import Any, cast
+
+import httpx
+import pytest
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse, Response
+from fastapi.responses import StreamingResponse as _StreamingResponse
+
+import omnigent.runtime.harnesses._executor_adapter as _adapter_mod_recovery
+from omnigent.harnesses.executor import (
+    Executor as _RecoveryExecutor,
+)
+from omnigent.harnesses.executor import (
+    ExecutorConfig as _RecoveryExecutorConfig,
+)
+from omnigent.harnesses.executor import (
+    ExecutorEvent as _RecoveryExecutorEvent,
+)
+from omnigent.harnesses.executor import (
+    Message as _RecoveryMessage,
+)
+from omnigent.harnesses.executor import (
+    ToolSpec as _RecoveryToolSpec,
+)
+from omnigent.harnesses.executor import (
+    TurnComplete as _RecoveryTurnComplete,
+)
+from omnigent.runner import create_runner_app
+from omnigent.runner.app import (
+    _RUNNER_TURN_CONTEXT_DESYNC_CODE,
+    _build_spawn_env_from_spec,
+    _evaluate_policy_via_omnigent,
+    _forward_harness_response,
+    _harness_error_response_error,
+    _normalize_turn_error,
+    _resolve_harness_config,
+)
+from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.runtime.harnesses._executor_adapter import (
+    _ORPHAN_RESYNC_THRESHOLD,
+    ExecutorAdapter,
+)
+from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultEvent
+from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
+from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+from tests.runner.conftest import (
+    _FakeProcessManager as _RecoveryFakeProcessManager,
+)
+from tests.runner.conftest import (
+    _runner_client as _recovery_runner_client,
+)
+from tests.runner.conftest import (
+    _ScriptedHarnessClient as _RecoveryScriptedHarnessClient,
+)
+from tests.runner.helpers import NullServerClient
+
+_TEST_HARNESS_NAME = "runner-test-default"
+_TEST_HARNESS_MODULE = "tests._fixtures.runner_test_harness"
+
+
+@pytest.fixture(autouse=True)
+def _assume_harness_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Neutralize the sub-agent dispatch CLI preflight for hermetic tests.
+
+    The named-mode child-create path refuses to spawn a sub-agent whose
+    harness CLI (``claude`` / ``codex`` / ``pi``) is absent from ``PATH``
+    (see ``missing_harness_cli``, dispatched from ``tool_dispatch``). These
+    dispatch tests run in a hermetic environment where those binaries may be
+    absent (e.g. CI), so without this stub they would fail at the preflight
+    instead of exercising the create / continue logic under test. Tests that
+    specifically assert the preflight re-patch ``missing_harness_cli`` in
+    their own body, which wins over this autouse default.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.missing_harness_cli",
+        lambda harness: None,
+    )
+
+
+@asynccontextmanager
+async def _runner_test_client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    """Create a test client against a runner ASGI app.
+
+    :param app: Runner app under test.
+    :returns: Async context manager yielding an ``httpx.AsyncClient``.
+    """
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        yield client
+
+
+class _FakeHarnessStream:
+    """
+    Async context manager that yields scripted harness SSE chunks.
+
+    :param chunks: SSE chunks returned by ``aiter_text``.
+    :param status_code: HTTP status exposed to the runner.
+    """
+
+    def __init__(self, chunks: list[str], status_code: int = 200) -> None:
+        """
+        Store scripted stream state.
+
+        :param chunks: SSE chunks returned by ``aiter_text``.
+        :param status_code: HTTP status exposed to the runner.
+        """
+        self._chunks = chunks
+        self.status_code = status_code
+
+    async def __aenter__(self) -> _FakeHarnessStream:
+        """
+        Enter the fake stream context.
+
+        :returns: This fake stream.
+        """
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        """
+        Exit the fake stream without suppressing exceptions.
+
+        :param exc_type: Exception type from the context, if any.
+        :param exc: Exception value from the context, if any.
+        :param tb: Traceback from the context, if any.
+        :returns: None.
+        """
+        del exc_type, exc, tb
+
+    async def aiter_text(self) -> AsyncIterator[str]:
+        """
+        Yield scripted text chunks.
+
+        :returns: Async iterator of SSE chunks.
+        """
+        for chunk in self._chunks:
+            yield chunk
+
+
+async def _await_bg_turn_task(conv: str, *, timeout: float = 10.0) -> None:
+    """Await the fire-and-forget background turn task for *conv* before draining.
+
+    The ``POST /events`` background path returns 202 before its turn task
+    (named ``turn-{conv}``) finishes publishing the terminal ``session.status``.
+    Awaiting that task by name removes the race where a status-queue drain's
+    timeout expires under heavy CI load before the task completes. A task that
+    already finished is absent from ``asyncio.all_tasks()`` (it published its
+    terminal status synchronously on the way out), so a ``None`` lookup is a
+    safe no-op.
+
+    :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param timeout: Hard cap in seconds for awaiting the task.
+    """
+    turn_task = next(
+        (t for t in asyncio.all_tasks() if t.get_name() == f"turn-{conv}"),
+        None,
+    )
+    if turn_task is not None:
+        await asyncio.wait_for(turn_task, timeout=timeout)
+
+
+async def _drain_published_statuses(
+    queues: dict[str, Any],
+    conv: str,
+    *,
+    until: str,
+    timeout: float,
+) -> list[str]:
+    """Collect ``session.status`` values a runner published for a session.
+
+    Reads the runner's per-session event queue (``app.state.session_event_queues``)
+    — the same queue the SSE ``/stream`` endpoint drains — and returns the
+    ordered list of ``session.status`` values seen, stopping once *until* is
+    published. This polls the in-process queue rather than a concurrent SSE
+    ``GET`` because ``httpx.ASGITransport`` does not interleave a streaming
+    response with a concurrent ``POST`` on the same client, so a live SSE
+    subscriber would never observe the background turn's events.
+
+    :param queues: The app's per-session event-queue dict, i.e.
+        ``app.state.session_event_queues``.
+    :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param until: Stop once this ``session.status`` value is observed,
+        e.g. ``"failed"``.
+    :param timeout: Hard cap in seconds — if *until* never arrives the poll
+        gives up and returns what it saw, so a hang regression fails the
+        assertion instead of spinning forever.
+    :returns: Ordered ``session.status`` values published for *conv*.
+    """
+    statuses: list[str] = []
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        queue = queues.get(conv)
+        drained = False
+        while queue is not None and not queue.empty():
+            event = queue.get_nowait()
+            drained = True
+            if isinstance(event, dict) and event.get("type") == "session.status":
+                status = event.get("status")
+                if isinstance(status, str):
+                    statuses.append(status)
+        if until in statuses:
+            return statuses
+        if not drained:
+            # Let the background turn task make progress before re-polling.
+            await asyncio.sleep(0.02)
+    return statuses
+
+
+async def _drain_failed_status_event(
+    queues: dict[str, Any],
+    conv: str,
+    *,
+    timeout: float,
+) -> dict[str, Any] | None:
+    """Return the first ``session.status: failed`` event a runner published.
+
+    Mirrors :func:`_drain_published_statuses` but returns the full event
+    dict (not just the status string) so a test can assert the carried
+    ``error`` payload. Used to prove a SETUP-phase failure forwards its
+    error message on the terminal ``failed`` event instead of dropping it.
+
+    :param queues: The app's per-session event-queue dict, i.e.
+        ``app.state.session_event_queues``.
+    :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param timeout: Hard cap in seconds; returns ``None`` if no failed
+        event arrives so a regression fails the assertion rather than
+        hanging.
+    :returns: The ``session.status: failed`` event dict, or ``None``.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        queue = queues.get(conv)
+        drained = False
+        while queue is not None and not queue.empty():
+            event = queue.get_nowait()
+            drained = True
+            if (
+                isinstance(event, dict)
+                and event.get("type") == "session.status"
+                and event.get("status") == "failed"
+            ):
+                return event
+        if not drained:
+            await asyncio.sleep(0.02)
+    return None
+
+
+class _FakeHarnessClient:
+    """
+    Harness client stub exposing ``stream`` for runner proxy tests.
+
+    :param chunks: SSE chunks returned by the fake stream.
+    """
+
+    def __init__(self, chunks: list[str]) -> None:
+        """
+        Store scripted stream chunks.
+
+        :param chunks: SSE chunks returned by the fake stream.
+        """
+        self._chunks = chunks
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: dict[str, object],
+        timeout: float | None,
+    ) -> _FakeHarnessStream:
+        """
+        Return a fake streaming response.
+
+        :param method: HTTP method, e.g. ``"POST"``.
+        :param url: Harness endpoint path.
+        :param json: JSON body sent to the harness.
+        :param timeout: Request timeout.
+        :returns: Fake stream context manager.
+        """
+        del method, url, json, timeout
+        return _FakeHarnessStream(self._chunks)
+
+
+class _FakeProcessManager:
+    """
+    Process manager stub for runner dispatch tests.
+
+    :param harness_client: Optional harness client to return.
+    """
+
+    def __init__(self, harness_client: _FakeHarnessClient | None = None) -> None:
+        """
+        Store the optional harness client.
+
+        :param harness_client: Optional harness client to return.
+        """
+        self._harness_client = harness_client
+
+    async def get_client(
+        self,
+        conversation_id: str,
+        harness_name: str,
+        *,
+        env: dict[str, str] | None = None,
+    ) -> _FakeHarnessClient:
+        """
+        Return the configured fake harness client.
+
+        :param conversation_id: Omnigent conversation id.
+        :param harness_name: Harness name requested by the runner.
+        :param env: Optional spawn environment.
+        :returns: Configured fake harness client.
+        :raises AssertionError: If no fake client was configured.
+        """
+        del conversation_id, harness_name, env
+        if self._harness_client is None:
+            raise AssertionError("get_client should not be called")
+        return self._harness_client
+
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        """Reaper in-flight marker — no-op for this stub (issue #1414)."""
+        del conversation_id, response_id
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        """Reaper in-flight clear — no-op for this stub (issue #1414)."""
+        del conversation_id
+
+    async def release(self, conversation_id: str, **kwargs: object) -> None:
+        """Agent-switch subprocess release — no-op for this stub."""
+        del conversation_id, kwargs
+
+
+@pytest.fixture
+async def started_manager() -> AsyncIterator[HarnessProcessManager]:
+    """A real, started HarnessProcessManager with the test harness registered.
+
+    Uses a short ``/tmp/oa-rtest`` parent rather than pytest's
+    ``tmp_path`` because UDS paths on Linux are capped at 108 chars
+    and the manager's per-conversation socket layout
+    (``<parent>/ap-<uuid32>/<conv_id>.sock``) blows past that when
+    nested under pytest's already-long ``/tmp/pytest-of-.../...``
+    tree.
+
+    Yields the started manager; on teardown, shuts it down so any
+    spawned subprocesses are reaped before the test ends.
+    """
+    import shutil
+    import uuid
+
+    short_parent = Path(f"/tmp/oa-rtest-{uuid.uuid4().hex[:8]}")
+    short_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Inject the test-only harness module into the registry. We
+    # mutate the dict directly per the registry's documented test-
+    # injection pattern; restore on teardown to avoid leaking into
+    # other tests.
+    _HARNESS_MODULES[_TEST_HARNESS_NAME] = _TEST_HARNESS_MODULE
+    mgr = HarnessProcessManager(tmp_parent=short_parent)
+    await mgr.start()
+    try:
+        yield mgr
+    finally:
+        await mgr.shutdown()
+        _HARNESS_MODULES.pop(_TEST_HARNESS_NAME, None)
+        shutil.rmtree(short_parent, ignore_errors=True)
+
+
+# ── Plumbing tests (no LLM key required) ─────────────────
+
+
+def test_forward_harness_response_preserves_no_body_responses() -> None:
+    """204/304 harness side-channel responses must not serialize JSON null.
+
+    Returning ``JSONResponse(status_code=204, content=None)`` writes ``b"null"``
+    even though Uvicorn/HTTP semantics require an empty body for 204. That
+    manifests under uvicorn as ``Response content longer than Content-Length``.
+    """
+    response = _forward_harness_response(httpx.Response(204, content=b""))
+
+    assert response.status_code == 204
+    assert response.body == b""
+    assert b"content-length" not in dict(response.raw_headers)
+
+
+def test_forward_harness_response_preserves_json_body() -> None:
+    response = _forward_harness_response(httpx.Response(404, json={"error": "not_found"}))
+
+    assert response.status_code == 404
+    assert response.body == b'{"error":"not_found"}'
+    assert dict(response.raw_headers)[b"content-length"] == b"21"
+
+
+@pytest.mark.asyncio
+async def test_runner_post_without_manager_returns_501() -> None:
+    """Scaffold-mode preserved when no manager is wired up."""
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type] # no process_manager → scaffold
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            "/v1/sessions/conv_x/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "harness": _TEST_HARNESS_NAME,
+                "model": "fake/model",
+                "content": [],
+            },
+        )
+        assert response.status_code == 501
+        assert "HarnessProcessManager" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_runner_resolves_harness_from_fallback_when_no_agent_id(
+    started_manager: HarnessProcessManager,
+) -> None:
+    """Without agent_id or server_base_url, runner falls back to the
+    test-default harness. Verifies the fallback path doesn't crash."""
+    app = create_runner_app(
+        process_manager=started_manager,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        # No agent_id → runner falls back to "runner-test-default"
+        # harness. With that registered in _HARNESS_MODULES, the
+        # runner must spawn the harness and return its SSE stream.
+        # Missing LLM credentials are represented inside that stream
+        # as ``response.failed``, not as a runner spawn failure.
+        response = await http.post(
+            "/v1/sessions/c_fallback/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "x",
+                "content": [{"role": "user", "content": "test"}],
+            },
+        )
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert "event: response.created" in response.text
+
+
+@pytest.mark.asyncio
+async def test_resolve_harness_config_raises_when_spec_resolver_returns_none() -> None:
+    """_resolve_harness_config raises RuntimeError when spec_resolver is wired
+    but returns no spec, instead of silently falling back to runner-test-default.
+
+    The fallback is only valid when no spec_resolver is configured (test mode).
+    A production runner that has a spec_resolver must never silently spawn the
+    test harness — the caller's ``except RuntimeError`` will surface a clean
+    error instead of leaving the session in a broken/hung state.
+
+    :returns: None.
+    """
+
+    async def _resolver_returning_none(
+        agent_id: str, session_id: str | None = None
+    ) -> AgentSpec | None:
+        """
+        Always return None to simulate an agent that cannot be resolved.
+
+        :param agent_id: Ignored.
+        :param session_id: Ignored.
+        :returns: None.
+        """
+        return None
+
+    with pytest.raises(RuntimeError, match="No agent spec found for agent_id="):
+        await _resolve_harness_config(
+            agent_id="ag_missing",
+            spec_resolver=_resolver_returning_none,
+            session_id="conv_x",
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolve_harness_config_raises_when_agent_id_missing_with_spec_resolver() -> None:
+    """_resolve_harness_config raises when spec_resolver is set but agent_id is absent.
+
+    A production runner with a spec_resolver requires agent_id to select the
+    right harness. If it's missing the runner must fail loudly so the problem
+    surfaces immediately rather than spawning the test-only harness and hanging.
+
+    :returns: None.
+    """
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Return a valid spec — should never be reached in this test.
+
+        :param agent_id: Agent id.
+        :param session_id: Session id.
+        :returns: A minimal agent spec.
+        """
+        return AgentSpec(
+            spec_version=1,
+            name="x",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    with pytest.raises(RuntimeError, match="agent_id is missing"):
+        await _resolve_harness_config(
+            agent_id=None,
+            spec_resolver=_resolver,
+            session_id="conv_x",
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_session_returns_400_when_spec_resolver_returns_none(
+    started_manager: HarnessProcessManager,
+) -> None:
+    """POST /v1/sessions returns 400 no_agent_spec when spec_resolver returns no spec.
+
+    When the server sends a session-create request with an agent_id that
+    doesn't map to any registered agent, the runner must return a clear 400
+    rather than silently proceeding with the test-only harness (which would
+    either fail with a 503 or, worse, appear to succeed and then hang on the
+    first turn because no real LLM is configured for it).
+
+    :param started_manager: A real HarnessProcessManager fixture.
+    :returns: None.
+    """
+
+    async def _resolver_returning_none(
+        agent_id: str, session_id: str | None = None
+    ) -> AgentSpec | None:
+        """
+        Always return None to simulate an unregistered agent.
+
+        :param agent_id: Ignored.
+        :param session_id: Ignored.
+        :returns: None.
+        """
+        return None
+
+    app = create_runner_app(
+        process_manager=started_manager,
+        spec_resolver=_resolver_returning_none,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            "/v1/sessions",
+            json={"session_id": "conv_bad_agent", "agent_id": "ag_unregistered"},
+        )
+
+    assert response.status_code == 400, (
+        f"Expected 400 no_agent_spec; got {response.status_code}: {response.text!r}. "
+        "Without the safeguard the runner falls back to runner-test-default and "
+        "returns 503 (unregistered harness) or silently spawns a test harness."
+    )
+    body = response.json()
+    assert body["error"] == "no_agent_spec"
+    assert "ag_unregistered" in body["detail"]
+
+
+class _RecordingProcessManager:
+    """
+    Process manager stub that records the harness name get_client saw.
+
+    Unlike :class:`_FakeProcessManager`, this captures the resolved
+    harness name so a test can assert which harness the runner chose,
+    and signals an event when the background turn reaches dispatch.
+
+    :param captured: Dict the recorded harness name is written into
+        under the ``"harness"`` key.
+    :param reached: Event set once ``get_client`` is called.
+    """
+
+    def __init__(self, captured: dict[str, str], reached: asyncio.Event) -> None:
+        """
+        Store the capture sink and the reached-dispatch event.
+
+        :param captured: Dict the harness name is written into.
+        :param reached: Event set once ``get_client`` is called.
+        """
+        self._captured = captured
+        self._reached = reached
+
+    async def get_client(
+        self,
+        conversation_id: str,
+        harness_name: str,
+        *,
+        env: dict[str, str] | None = None,
+    ) -> _FakeHarnessClient:
+        """
+        Record the harness name and return an empty fake harness client.
+
+        :param conversation_id: Omnigent conversation id.
+        :param harness_name: Harness name the runner resolved — the
+            value under test.
+        :param env: Optional spawn environment (ignored).
+        :returns: A fake harness client with an empty SSE stream so the
+            background turn completes immediately.
+        """
+        del conversation_id, env
+        self._captured["harness"] = harness_name
+        self._reached.set()
+        return _FakeHarnessClient([])
+
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        """Reaper in-flight marker — no-op for this stub (issue #1414)."""
+        del conversation_id, response_id
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        """Reaper in-flight clear — no-op for this stub (issue #1414)."""
+        del conversation_id
+
+
+@pytest.mark.asyncio
+async def test_runner_resolves_agent_from_server_snapshot_when_msg_lacks_agent_id() -> None:
+    """A turn-triggering message that races ahead of session assignment
+    arrives with no ``agent_id`` and an empty spec cache. The runner must
+    resolve the agent from the authoritative server snapshot
+    (``GET /v1/sessions/{id}``) rather than falling through to the
+    test-only ``runner-test-default`` harness, which would silently drop
+    the turn (the first-message race).
+    """
+    conv = "conv_ondemand_race"
+    resolved_agent_id = "ag_resolved_from_snapshot"
+    resolved_harness = "runner-test-resolved"
+
+    def _server_handler(request: httpx.Request) -> httpx.Response:
+        """
+        Stub Omnigent server: the session snapshot carries the agent_id.
+
+        :param request: Outbound request from the runner.
+        :returns: Snapshot with ``agent_id`` for the session GET; benign
+            payloads otherwise so the background turn can proceed.
+        """
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            return httpx.Response(200, json={"id": conv, "agent_id": resolved_agent_id})
+        if request.url.path.endswith("/items"):
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [],
+                    "first_id": None,
+                    "last_id": None,
+                    "has_more": False,
+                },
+            )
+        return httpx.Response(200, json={})
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    )
+
+    async def _snapshot_spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Resolve the spec for the agent_id read from the snapshot.
+
+        :param agent_id: Agent id the runner resolved. MUST equal the
+            snapshot's agent_id — the message body carried none, so any
+            other value means the on-demand snapshot path didn't run.
+        :param session_id: Session id (unused).
+        :returns: A minimal spec whose harness is ``resolved_harness``.
+        """
+        # The agent_id can only come from the server snapshot here — the
+        # POST body below omits it. If this fires with a different value
+        # (or not at all), the on-demand resolution path is broken.
+        assert agent_id == resolved_agent_id
+        return AgentSpec(
+            spec_version=1,
+            name="ondemand-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": resolved_harness}),
+        )
+
+    captured: dict[str, str] = {}
+    reached_dispatch = asyncio.Event()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _RecordingProcessManager(captured, reached_dispatch),
+        ),
+        spec_resolver=_snapshot_spec_resolver,
+        server_client=server_client,
+    )
+    try:
+        async with _runner_test_client(app) as http:
+            response = await http.post(
+                # No ``?stream=true`` → background turn, the production
+                # path the Omnigent server uses to forward session messages.
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "hi"}],
+                    # No agent_id — this is the race condition under test.
+                },
+            )
+            # Background turn accepted; dispatch happens asynchronously.
+            assert response.status_code == 202
+            await asyncio.wait_for(reached_dispatch.wait(), timeout=10.0)
+    finally:
+        await server_client.aclose()
+
+    # The harness came from the snapshot-resolved spec, proving the
+    # runner fetched agent_id from the server when the message lacked it.
+    # Without the fix this is "runner-test-default" (the fallback) and the
+    # real turn never dispatches.
+    assert captured["harness"] == resolved_harness
+
+
+class _ContentCapturingProcessManager:
+    """
+    Process manager stub that captures the body sent to the harness.
+
+    Returns a harness client whose ``stream`` records the JSON body
+    (which carries the turn's ``content`` history) into a shared sink
+    and yields an empty SSE stream so the background turn completes
+    immediately.
+
+    :param captured: Dict the harness request body is written into
+        under the ``"body"`` key.
+    :param reached: Event set once the harness stream is opened.
+    """
+
+    def __init__(self, captured: dict[str, Any], reached: asyncio.Event) -> None:
+        """
+        Store the capture sink and the reached-dispatch event.
+
+        :param captured: Dict the harness request body is written into.
+        :param reached: Event set once the harness stream is opened.
+        """
+        self._captured = captured
+        self._reached = reached
+
+    async def get_client(
+        self,
+        conversation_id: str,
+        harness_name: str,
+        *,
+        env: dict[str, str] | None = None,
+    ) -> _ContentCapturingHarnessClient:
+        """
+        Return a harness client that records the body it is sent.
+
+        :param conversation_id: Omnigent conversation id (unused).
+        :param harness_name: Harness name the runner resolved (unused).
+        :param env: Optional spawn environment (unused).
+        :returns: A capturing harness client.
+        """
+        del conversation_id, harness_name, env
+        return _ContentCapturingHarnessClient(self._captured, self._reached)
+
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        """Reaper in-flight marker — no-op for this stub (issue #1414)."""
+        del conversation_id, response_id
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        """Reaper in-flight clear — no-op for this stub (issue #1414)."""
+        del conversation_id
+
+
+class _ContentCapturingHarnessClient:
+    """
+    Harness client stub that records the JSON body of each stream.
+
+    :param captured: Dict the request body is written into under
+        ``"body"``.
+    :param reached: Event set once ``stream`` is invoked.
+    """
+
+    def __init__(self, captured: dict[str, Any], reached: asyncio.Event) -> None:
+        """
+        Store the capture sink and reached event.
+
+        :param captured: Dict the request body is written into.
+        :param reached: Event set once ``stream`` is invoked.
+        """
+        self._captured = captured
+        self._reached = reached
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: dict[str, Any],
+        timeout: float | None,
+    ) -> _FakeHarnessStream:
+        """
+        Record the body and return an empty SSE stream.
+
+        :param method: HTTP method (unused).
+        :param url: Harness endpoint path (unused).
+        :param json: JSON body sent to the harness — captured here.
+        :param timeout: Request timeout (unused).
+        :returns: An empty fake stream so the turn completes at once.
+        """
+        del method, url, timeout
+        self._captured["body"] = json
+        self._reached.set()
+        return _FakeHarnessStream([])
+
+
+@pytest.mark.asyncio
+async def test_runner_reloads_full_history_on_cold_cache_after_restart() -> None:
+    """A message to a cold session reloads prior history, not just itself.
+
+    Regression for an agent (e.g. nessie) losing all chat context after a
+    server/runner restart. On restart the runner's in-memory
+    ``_session_histories`` cache is empty; the old code seeded it with ONLY
+    the incoming message (``setdefault(conv, []).append(...)``), so the
+    harness ran the turn with no prior context. This is acute for the
+    claude-sdk harness, which on a cold SDK session replays the in-memory
+    history verbatim as the prompt — a one-message cache erased the whole
+    conversation.
+
+    The fix rehydrates the full history from the store on the first touch of
+    a conversation. The stub server models invariant I1 (persist-before-
+    forward): its ``GET /items`` returns the prior turns AND the just-posted
+    message (``item_3``), and the forwarded body carries
+    ``persisted_item_id="item_3"`` — so the reload drops that exact item by
+    id and appends the runner's copy, proving no duplication.
+    """
+    from omnigent.runner import app as runner_app
+
+    conv = "conv_restart_history_reload"
+    prior_user = "what is the capital of France?"
+    prior_assistant = "Paris."
+    new_user = "and of Germany?"
+
+    def _server_handler(request: httpx.Request) -> httpx.Response:
+        """
+        Stub Omnigent server: snapshot + full persisted history on ``/items``.
+
+        :param request: Outbound request from the runner.
+        :returns: Snapshot for the session GET; the persisted history
+            (prior turns + the new message, per invariant I1) for
+            ``/items``; benign payloads otherwise.
+        """
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            return httpx.Response(200, json={"id": conv, "agent_id": "ag_restart"})
+        if request.url.path.endswith("/items"):
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "item_1",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": prior_user}],
+                        },
+                        {
+                            "id": "item_2",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": prior_assistant}],
+                        },
+                        # Persist-before-forward (I1): the new message is
+                        # already in the store when the runner reloads.
+                        {
+                            "id": "item_3",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": new_user}],
+                        },
+                    ],
+                    "first_id": "item_1",
+                    "last_id": "item_3",
+                    "has_more": False,
+                },
+            )
+        return httpx.Response(200, json={})
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Resolve a minimal spec for the restarted session.
+
+        :param agent_id: Agent id resolved from the snapshot (unused).
+        :param session_id: Session id (unused).
+        :returns: A minimal spec on a benign test harness.
+        """
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="restart-agent",
+            executor=ExecutorSpec(
+                type="omnigent",
+                config={"harness": "runner-test-resolved"},
+            ),
+        )
+
+    captured: dict[str, Any] = {}
+    reached = asyncio.Event()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _ContentCapturingProcessManager(captured, reached),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=server_client,
+    )
+    # Simulate a fresh runner process: no cached history for this conv.
+    runner_app._session_histories_ref.pop(conv, None)
+    try:
+        async with _runner_test_client(app) as http:
+            response = await http.post(
+                # No ``?stream=true`` → background turn, the production path
+                # the Omnigent server uses to forward session messages.
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "model": "x",
+                    # The store id the Omnigent server persisted for this turn
+                    # (matches ``item_3`` from the stub ``/items``), so the
+                    # cold-cache reload drops that exact item and the dedup
+                    # fires (no duplicate).
+                    "persisted_item_id": "item_3",
+                    "content": [{"type": "input_text", "text": new_user}],
+                },
+            )
+            assert response.status_code == 202
+            await asyncio.wait_for(reached.wait(), timeout=10.0)
+    finally:
+        await server_client.aclose()
+        runner_app._session_histories_ref.pop(conv, None)
+
+    content = captured["body"]["content"]
+    texts = [
+        block.get("text")
+        for item in content
+        if isinstance(item, dict)
+        for block in item.get("content", [])
+        if isinstance(block, dict)
+    ]
+    # Prior context survived the restart...
+    assert prior_user in texts, f"prior user turn missing from reloaded history: {texts}"
+    assert prior_assistant in texts, f"prior assistant turn missing: {texts}"
+    # ...and the new message is present exactly once (reload didn't dup it).
+    assert texts.count(new_user) == 1, f"new message not delivered exactly once: {texts}"
+    # The full 3-item history reached the harness, not just the new message.
+    assert len(content) == 3, f"expected full history, got {len(content)} items: {content}"
+
+
+@pytest.mark.asyncio
+async def test_runner_cold_cache_keeps_trailing_user_when_no_persisted_id() -> None:
+    """A real trailing user message is kept when no ``persisted_item_id`` is sent.
+
+    Regression for the id-based dedup replacing the old role heuristic. The
+    earlier fix unconditionally popped a trailing *user* item, assuming it was
+    always this turn's persisted input. That's wrong when the forward did NOT
+    persist-before-forward AND the store legitimately ends with a user
+    message — e.g. a crash mid-turn where the prior user prompt was persisted
+    but its assistant reply never was, or a native-terminal injection. Popping
+    there deletes real history.
+
+    With id-based dedup, no ``persisted_item_id`` means nothing is dropped: the
+    real trailing user message survives and the new message is appended.
+    """
+    from omnigent.runner import app as runner_app
+
+    conv = "conv_cold_cache_keep_user"
+    # A prior user prompt whose assistant reply was never persisted (e.g. the
+    # runner crashed mid-turn), so the store ends on a USER message.
+    prior_user = "prompt whose reply was lost to a crash"
+    new_user = "follow-up not persisted before forward"
+
+    def _server_handler(request: httpx.Request) -> httpx.Response:
+        """
+        Stub Omnigent server: history reload ending on a real prior user message.
+
+        :param request: Outbound request from the runner.
+        :returns: Snapshot for the session GET; a single prior user item
+            (no assistant reply, no new message) for ``/items``; benign
+            payloads otherwise.
+        """
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            return httpx.Response(200, json={"id": conv, "agent_id": "ag_keep"})
+        if request.url.path.endswith("/items"):
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "item_1",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": prior_user}],
+                        },
+                    ],
+                    "first_id": "item_1",
+                    "last_id": "item_1",
+                    "has_more": False,
+                },
+            )
+        return httpx.Response(200, json={})
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Resolve a minimal spec for the session.
+
+        :param agent_id: Agent id (unused).
+        :param session_id: Session id (unused).
+        :returns: A minimal spec on a benign test harness.
+        """
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="keep-user-agent",
+            executor=ExecutorSpec(
+                type="omnigent",
+                config={"harness": "runner-test-resolved"},
+            ),
+        )
+
+    captured: dict[str, Any] = {}
+    reached = asyncio.Event()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _ContentCapturingProcessManager(captured, reached),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=server_client,
+    )
+    runner_app._session_histories_ref.pop(conv, None)
+    try:
+        async with _runner_test_client(app) as http:
+            response = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "model": "x",
+                    # No ``persisted_item_id`` → the trailing user item is NOT
+                    # this turn's input, so it must be kept.
+                    "content": [{"type": "input_text", "text": new_user}],
+                },
+            )
+            assert response.status_code == 202
+            await asyncio.wait_for(reached.wait(), timeout=10.0)
+    finally:
+        await server_client.aclose()
+        runner_app._session_histories_ref.pop(conv, None)
+
+    content = captured["body"]["content"]
+    texts = [
+        block.get("text")
+        for item in content
+        if isinstance(item, dict)
+        for block in item.get("content", [])
+        if isinstance(block, dict)
+    ]
+    # The real prior user message survived (old role heuristic would drop it)
+    # and the new message was appended.
+    assert texts == [prior_user, new_user], f"trailing user message must be preserved, got {texts}"
+
+
+@pytest.mark.asyncio
+async def test_runner_cold_cache_uses_resolved_message_not_stored_file_id() -> None:
+    """Cold-cache reload of a media turn uses the resolved block, not the store copy.
+
+    The server persists the PRE-resolution body (``file_id`` blocks) and the
+    runner resolves ``file_id`` → ``image_url`` itself. So on a cold cache the
+    ``GET /items`` tail is the just-posted message in its *unresolved* form,
+    while ``message_body`` is the *resolved* form. Any content-equality dedup
+    would never match (the blocks differ), which would both duplicate the
+    message AND leave an unresolved ``file_id`` block in the history forwarded
+    to the harness.
+
+    The fix drops the persisted item by id (``persisted_item_id``, forwarded by
+    the server) and appends the runner-resolved message, so the harness sees
+    exactly one, fully resolved copy regardless of the content mismatch.
+    """
+    from omnigent.runner import app as runner_app
+
+    conv = "conv_cold_cache_media"
+    prior_user = "earlier question"
+    prior_assistant = "earlier answer"
+    prompt_text = "what is this?"
+
+    def _server_handler(request: httpx.Request) -> httpx.Response:
+        """
+        Stub Omnigent server: file resolution, snapshot, and a history reload
+        whose tail is the UNRESOLVED (``file_id``) copy of this message.
+
+        :param request: Outbound request from the runner.
+        :returns: File metadata / bytes for resolution; the persisted
+            history (ending with the unresolved media message, per I1)
+            for ``/items``; snapshot for the session GET.
+        """
+        path = request.url.path
+        if path == f"/v1/sessions/{conv}":
+            return httpx.Response(200, json={"id": conv, "agent_id": "ag_media"})
+        if path.endswith("/resources/files/file_img/content"):
+            return httpx.Response(200, content=b"png-bytes", headers={"content-type": "image/png"})
+        if path.endswith("/resources/files/file_img"):
+            return httpx.Response(
+                200,
+                json={"id": "file_img", "filename": "photo.png", "content_type": "image/png"},
+            )
+        if path.endswith("/items"):
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "item_1",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": prior_user}],
+                        },
+                        {
+                            "id": "item_2",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": prior_assistant}],
+                        },
+                        # I1 persisted THIS message — but in its unresolved
+                        # (file_id) form, exactly as received.
+                        {
+                            "id": "item_3",
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_image",
+                                    "file_id": "file_img",
+                                    "filename": "photo.png",
+                                },
+                                {"type": "input_text", "text": prompt_text},
+                            ],
+                        },
+                    ],
+                    "first_id": "item_1",
+                    "last_id": "item_3",
+                    "has_more": False,
+                },
+            )
+        return httpx.Response(200, json={})
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Resolve a minimal spec for the session.
+
+        :param agent_id: Agent id (unused).
+        :param session_id: Session id (unused).
+        :returns: A minimal spec on a benign test harness.
+        """
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="media-agent",
+            executor=ExecutorSpec(
+                type="omnigent",
+                config={"harness": "runner-test-resolved"},
+            ),
+        )
+
+    captured: dict[str, Any] = {}
+    reached = asyncio.Event()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _ContentCapturingProcessManager(captured, reached),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=server_client,
+    )
+    runner_app._session_histories_ref.pop(conv, None)
+    try:
+        async with _runner_test_client(app) as http:
+            response = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "model": "x",
+                    # Server forwards the id of the (unresolved) item it
+                    # persisted; the runner drops it from the reload by id.
+                    "persisted_item_id": "item_3",
+                    "content": [
+                        {"type": "input_image", "file_id": "file_img", "filename": "photo.png"},
+                        {"type": "input_text", "text": prompt_text},
+                    ],
+                },
+            )
+            assert response.status_code == 202
+            await asyncio.wait_for(reached.wait(), timeout=10.0)
+    finally:
+        await server_client.aclose()
+        runner_app._session_histories_ref.pop(conv, None)
+
+    content = captured["body"]["content"]
+    # Prior context + the media turn = three items, not four (no duplicate).
+    assert len(content) == 3, f"expected no duplicate of the media message: {content}"
+    image_msg = content[-1]
+    image_block = image_msg["content"][0]
+    # The stored unresolved copy was dropped; the resolved block is used —
+    # no ``file_id`` leaks to the harness.
+    assert "file_id" not in image_block, f"unresolved file_id leaked to harness: {image_block}"
+    assert image_block.get("image_url", "").startswith("data:image/png;base64,"), (
+        f"expected resolved image_url block, got {image_block}"
+    )
+    # No unresolved file_id anywhere in the forwarded history.
+    flat = json.dumps(content)
+    assert "file_id" not in flat, f"unresolved file_id present in forwarded history: {flat}"
+
+
+@pytest.mark.asyncio
+async def test_runner_post_returns_503_when_spec_resolver_fails(
+    caplog: pytest.LogCaptureFixture,
+    pinned_runner_log: Path,
+) -> None:
+    """Spec resolver failures are surfaced as structured 503 errors.
+
+    :param caplog: Pytest log capture, used to confirm the raw cause is
+        logged server-side (the other half of the log-and-genericize
+        contract).
+    :param pinned_runner_log: The log path the detail must name.
+    :returns: None.
+    """
+
+    async def _failing_spec_resolver(
+        agent_id: str, session_id: str | None = None
+    ) -> AgentSpec | None:
+        """
+        Raise the resolver failure under test.
+
+        :param agent_id: Agent id requested by the runner.
+        :returns: Never returns.
+        :raises RuntimeError: Always.
+        """
+        raise RuntimeError(f"spec resolver unavailable for {agent_id}")
+
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager()),
+        spec_resolver=_failing_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            response = await http.post(
+                "/v1/sessions/conv_spec_resolver_failed/events?stream=true",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_missing",
+                    "model": "x",
+                    "content": [],
+                },
+            )
+
+    assert response.status_code == 503
+    body = response.json()
+    # The structured error slug is preserved for the caller; the detail names
+    # the runner log holding the cause. The raw resolver exception text must
+    # not leak into the HTTP body (it is logged on the runner instead).
+    assert body["error"] == "spec_resolver_failed"
+    assert body["detail"] == (
+        f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+    )
+    assert "spec resolver unavailable" not in body["detail"]
+    # The other half of the contract: the raw cause IS logged for operators.
+    # If this fails, log-and-genericize logged nothing and the detail is the
+    # only record of the failure — defeating the diagnostic path.
+    assert "spec resolver unavailable for ag_missing" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_runner_stream_emits_failed_when_tool_spec_resolver_fails() -> None:
+    """Streaming spec resolver failures emit ``response.failed`` SSE.
+
+    :returns: None.
+    """
+    chunks = [
+        (
+            "event: response.created\ndata: "
+            '{"type":"response.created","response":{"id":"resp_1"}}\n\n'
+        ),
+        (
+            'event: response.output_item.done\ndata: {"type":"response.output_item.done",'
+            '"item":{"type":"function_call","status":"action_required",'
+            '"name":"sys_os_read","call_id":"call_1","arguments":"{}"}}\n\n'
+        ),
+    ]
+
+    async def _failing_spec_resolver(
+        agent_id: str, session_id: str | None = None
+    ) -> AgentSpec | None:
+        """
+        Raise during local tool dispatch spec resolution.
+
+        :param agent_id: Agent id requested by the runner.
+        :returns: Never returns.
+        :raises RuntimeError: Always.
+        """
+        raise RuntimeError(f"stream spec resolver unavailable for {agent_id}")
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient(chunks)),
+        ),
+        spec_resolver=_failing_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            "/v1/sessions/conv_stream_spec_resolver_failed/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "harness": _TEST_HARNESS_NAME,
+                "agent_id": "ag_stream",
+                "model": "x",
+                "content": [],
+            },
+        )
+
+    assert response.status_code == 200
+    assert "event: response.created" in response.text
+    assert "event: response.failed" in response.text
+    # The exception class (a safe, generic label) is still surfaced as the
+    # error ``type``; the failure message is a fixed client-safe string. The
+    # raw resolver exception text must not leak into the SSE stream (it is
+    # logged on the runner instead).
+    assert "RuntimeError" in response.text
+    assert "Failed to resolve the agent spec for this turn." in response.text
+    assert "stream spec resolver unavailable for ag_stream" not in response.text
+
+
+# ── Harness error-response detail → stream subscribers ───
+
+_SPAWN_LOG_DETAIL = "Request failed on the runner; see the runner log for details: ~/x.log"
+
+
+@pytest.mark.parametrize(
+    "response, expected",
+    [
+        pytest.param(
+            JSONResponse(
+                status_code=503,
+                content={"error": "harness_spawn_failed", "detail": _SPAWN_LOG_DETAIL},
+            ),
+            {"message": f"harness_spawn_failed: {_SPAWN_LOG_DETAIL}"},
+            id="code-and-detail-compose",
+        ),
+        pytest.param(
+            JSONResponse(status_code=503, content={"error": "spec_resolver_failed"}),
+            {"message": "spec_resolver_failed"},
+            id="code-only-is-the-message",
+        ),
+        pytest.param(
+            JSONResponse(status_code=503, content={"detail": "just prose"}),
+            {"message": "just prose"},
+            id="detail-only-is-the-message",
+        ),
+        pytest.param(
+            JSONResponse(status_code=503, content={"error": "  ", "detail": ""}),
+            {"message": '{"error":"  ","detail":""}'},
+            id="blank-strings-fall-through-to-raw-text",
+        ),
+        pytest.param(
+            Response(content="plain text body", status_code=500),
+            {"message": "plain text body"},
+            id="non-json-body-is-the-message",
+        ),
+        pytest.param(
+            Response(content=b"\xff\xfe", status_code=500),
+            {"message": "harness returned error response"},
+            id="undecodable-body-falls-back",
+        ),
+        pytest.param(
+            object(),
+            {"message": "harness returned error response"},
+            id="missing-body-attribute-falls-back",
+        ),
+        pytest.param(
+            type("_NoneBody", (), {"body": None})(),
+            {"message": "harness returned error response"},
+            id="none-body-falls-back",
+        ),
+        pytest.param(
+            Response(content="x" * 300, status_code=500),
+            {"message": "x" * 200},
+            id="long-body-truncated-to-200",
+        ),
+        pytest.param(
+            JSONResponse(status_code=500, content=["not", "a", "dict"]),
+            {"message": '["not","a","dict"]'},
+            id="non-object-json-is-raw-text",
+        ),
+    ],
+)
+def test_harness_error_response_error_parses_runner_error_bodies(
+    response: object, expected: dict[str, str]
+) -> None:
+    """The helper turns a harness error response into a ``{message}`` error.
+
+    Covers every body shape the runner can hand back: the structured
+    ``{"error", "detail"}`` bodies ``_stream_message_to_harness`` returns,
+    partial and blank variants of those, and the degenerate bodies (plain
+    text, undecodable bytes, a ``None`` body, no ``body`` attribute at
+    all). Reaching the
+    assertion at all is the "never raises" half of the contract.
+
+    :param response: The non-streaming response handed to the helper.
+    :param expected: The exact error dict the helper must return.
+    :returns: None.
+    """
+    assert _harness_error_response_error(response) == expected
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        # A harness failure names itself: the status edge keeps that code so the
+        # web UI can de-duplicate it against the persisted error item.
+        (
+            {
+                "code": "databricks_sign_in_pending",
+                "message": "Codex is waiting for a sign-in.",
+            },
+            {
+                "code": "databricks_sign_in_pending",
+                "message": "Codex is waiting for a sign-in.",
+            },
+        ),
+        # The legacy ``type`` spelling still wins over the generic fallback.
+        (
+            {"type": "_ContextWindowOverflow", "message": "too long"},
+            {"code": "_ContextWindowOverflow", "message": "too long"},
+        ),
+        (
+            {"message": "turn setup failed: boom"},
+            {"code": "runner_error", "message": "turn setup failed: boom"},
+        ),
+        ({"status": 503}, {"code": "runner_error", "message": "turn failed (status 503)"}),
+        ({}, {"code": "runner_error", "message": "turn failed"}),
+    ],
+)
+def test_normalize_turn_error_keeps_the_failure_code(
+    error: dict[str, object], expected: dict[str, str]
+) -> None:
+    assert _normalize_turn_error(error) == expected
+
+
+class _SpawnFailingProcessManager(_FakeProcessManager):
+    """Process manager stub whose harness spawn always fails.
+
+    Inherits :class:`_FakeProcessManager`'s reaper and release no-ops and
+    replaces only ``get_client``, so the runner takes the
+    ``harness_spawn_failed`` 503 arm of ``_stream_message_to_harness``.
+    """
+
+    async def get_client(
+        self,
+        conversation_id: str,
+        harness_name: str,
+        *,
+        env: dict[str, str] | None = None,
+    ) -> _FakeHarnessClient:
+        """
+        Fail the spawn the way a broken harness binary does.
+
+        :param conversation_id: Omnigent conversation id.
+        :param harness_name: Harness name requested by the runner.
+        :param env: Optional spawn environment.
+        :returns: Never returns.
+        :raises RuntimeError: Always.
+        """
+        del conversation_id, harness_name, env
+        raise RuntimeError("harness binary exploded")
+
+
+@pytest.mark.asyncio
+async def test_runner_stream_spawn_failed_reaches_subscribers_with_detail(
+    caplog: pytest.LogCaptureFixture,
+    pinned_runner_log: Path,
+) -> None:
+    """A ``stream=true`` spawn failure publishes the runner's own failure class and detail.
+
+    The direct HTTP caller already received
+    ``{"error": "harness_spawn_failed", "detail": ...}``. Relay subscribers
+    read the same failure off the terminal ``session.status: failed`` event,
+    so that event must carry the same diagnosis rather than a generic
+    placeholder — otherwise the two callers disagree about why the turn died.
+
+    :param caplog: Pytest log capture, used to confirm the raw cause is
+        logged server-side (the other half of the log-and-genericize
+        contract).
+    :param pinned_runner_log: The log path the detail must name.
+    :returns: None.
+    """
+
+    async def _none_spec_resolver(
+        agent_id: str, session_id: str | None = None
+    ) -> AgentSpec | None:
+        """
+        Resolve no spec, so the harness named in the body is used as-is.
+
+        :param agent_id: Agent id requested by the runner.
+        :param session_id: Session id (unused).
+        :returns: Always ``None``.
+        """
+        del agent_id, session_id
+        return None
+
+    conv = "conv_stream_spawn_failed"
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _SpawnFailingProcessManager()),
+        spec_resolver=_none_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            response = await http.post(
+                f"/v1/sessions/{conv}/events?stream=true",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "harness": _TEST_HARNESS_NAME,
+                    "agent_id": "ag_spawn",
+                    "model": "x",
+                    "content": [],
+                },
+            )
+        event = await _drain_failed_status_event(app.state.session_event_queues, conv, timeout=5.0)
+
+    # The direct caller's contract is unchanged.
+    assert response.status_code == 503
+    assert response.json()["error"] == "harness_spawn_failed"
+    # The subscriber's copy now names the same failure. The wire code stays
+    # the generic setup-failure code the failure card describes.
+    assert event is not None
+    assert event["error"]["code"] == "runner_error"
+    expected_detail = (
+        f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+    )
+    assert event["error"]["message"] == f"harness_spawn_failed: {expected_detail}"
+    assert "harness returned error response" not in event["error"]["message"]
+    # Log-and-genericize: the raw cause is logged, never relayed.
+    assert "harness binary exploded" not in event["error"]["message"]
+    assert "harness binary exploded" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_runner_background_spawn_failed_reaches_subscribers_with_detail(
+    pinned_runner_log: Path,
+) -> None:
+    """The background turn path publishes the same spawn-failure detail.
+
+    Companion to
+    :func:`test_runner_stream_spawn_failed_reaches_subscribers_with_detail`:
+    both turn paths inspect the harness error response through the same
+    helper, so a 202 background turn must surface the identical message.
+    The resolver returns a spec here (rather than ``None``) because the
+    background path takes its harness from the resolved spec, not from the
+    request body.
+
+    :param pinned_runner_log: The log path the detail must name.
+    :returns: None.
+    """
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Pin the turn to the test harness so dispatch reaches the spawn.
+
+        :param agent_id: Agent id requested by the runner (unused).
+        :param session_id: Session id (unused).
+        :returns: A minimal spec naming the test harness.
+        """
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="spawn-failing-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": _TEST_HARNESS_NAME}),
+        )
+
+    conv = "conv_bg_spawn_failed"
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _SpawnFailingProcessManager()),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_spawn",
+                "model": "x",
+                "content": [],
+            },
+        )
+        assert response.status_code == 202
+        await _await_bg_turn_task(conv)
+        event = await _drain_failed_status_event(app.state.session_event_queues, conv, timeout=5.0)
+
+    assert event is not None
+    assert event["error"]["code"] == "runner_error"
+    expected_detail = (
+        f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+    )
+    assert event["error"]["message"] == f"harness_spawn_failed: {expected_detail}"
+    assert "harness returned error response" not in event["error"]["message"]
+
+
+def test_direct_and_background_switch_sites_share_one_invalidation_routine() -> None:
+    """Both dispatch paths must call the shared `_invalidate_session_agent_state` helper."""
+    import inspect
+
+    import omnigent.runner.app as runner_app_mod
+
+    source = inspect.getsource(runner_app_mod)
+    direct_stream_start = source.index("async def _stream_message_to_harness(")
+    direct_stream_body = source[direct_stream_start : direct_stream_start + 4000]
+    background_start = source.index("async def _run_turn_bg_setup_and_stream(")
+    background_body = source[background_start : background_start + 4000]
+
+    assert "_invalidate_session_agent_state(" in direct_stream_body, (
+        "_stream_message_to_harness must call the shared "
+        "_invalidate_session_agent_state helper on its switch/provenance-"
+        "reject branch, not an inline cache-pop list of its own."
+    )
+    assert "_invalidate_session_agent_state(" in background_body, (
+        "_run_turn_bg_setup_and_stream must call the shared "
+        "_invalidate_session_agent_state helper on its switch/provenance-"
+        "reject branch, not an inline cache-pop list of its own."
+    )
+
+
+def test_agent_cache_reset_clears_the_agent_id_marker_too() -> None:
+    """`_clear_session_agent_caches` must pop `_session_agent_ids` with the other tagged caches."""
+    import inspect
+
+    import omnigent.runner.app as runner_app_mod
+
+    source = inspect.getsource(runner_app_mod)
+    start = source.index("def _clear_session_agent_caches(")
+    end = source.index("\n    async def _invalidate_session_agent_state(", start)
+    body = source[start:end]
+
+    assert "_session_agent_ids.pop(" in body, (
+        "_clear_session_agent_caches must pop _session_agent_ids(session_id) "
+        "so it doesn't outlive the caches it's supposed to describe."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+class _RecordingHarnessClient:
+    """Fake harness client that records the event body posted to it."""
+
+    def __init__(self, chunks: list[str]) -> None:
+        self._chunks = chunks
+        self.posted_bodies: list[dict[str, Any]] = []
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: dict[str, object],
+        timeout: float | None,
+    ) -> _FakeHarnessStream:
+        del method, url, timeout
+        self.posted_bodies.append(json)  # type: ignore[arg-type]
+        return _FakeHarnessStream(self._chunks)
+
+
+_INSTRUCTION_WARN_CHUNKS = [
+    'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_iw_1"}}\n\n',
+    (
+        "event: response.completed\ndata: "
+        '{"type":"response.completed","response":{"id":"resp_iw_1","status":"completed"}}\n\n'
+    ),
+]
+
+
+async def _post_stream_message(http: httpx.AsyncClient, conv: str, **body: Any) -> httpx.Response:
+    """POST a minimal ``?stream=true`` message body for the warn-site tests.
+
+    :param http: Test HTTP client bound to the runner app.
+    :param conv: Conversation id.
+    :param body: Extra fields merged into the message body (``harness``,
+        ``harness_override``, ``agent_id``, ...).
+    :returns: The runner's HTTP response.
+    """
+    payload: dict[str, Any] = {
+        "type": "message",
+        "role": "user",
+        "model": "x",
+        "content": [],
+        **body,
+    }
+    return await http.post(f"/v1/sessions/{conv}/events?stream=true", json=payload)
+
+
+def test_build_spawn_env_applies_model_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A per-session ``/model`` override overrides ``HARNESS_<H>_MODEL``.
+
+    Regression: ``/model`` was recorded in the session readout but the turn
+    still used the provider/catalog default, because the SDK harnesses take
+    their model from the spawn-env env var (which only the native CLIs'
+    ``--model`` path honored). The override must override the baked-in
+    ``HARNESS_CLAUDE_SDK_MODEL`` so the switch actually takes effect.
+
+    :param tmp_path: Pytest temp dir for an isolated provider config.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  anthropic:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    anthropic:\n"
+        "      base_url: https://api.anthropic.com\n"
+        "      api_key: $ANTHROPIC_API_KEY\n"
+        "      models:\n"
+        "        default: test-default\n"
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    base = _build_spawn_env_from_spec(spec, "claude-sdk")
+    overridden = _build_spawn_env_from_spec(spec, "claude-sdk", model_override="claude-sonnet-4-6")
+    assert base is not None and overridden is not None
+    # Baseline uses the provider/catalog default (not the override) …
+    assert base["HARNESS_CLAUDE_SDK_MODEL"] != "claude-sonnet-4-6"
+    # … and the override wins, landing in the model env var the SDK reads.
+    assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_resolve_harness_config_applies_harness_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A per-session ``harness_override`` replaces the spec's brain harness.
+
+    The web UI's new-chat picker persists the override on the session and
+    the server forwards it in the message body; the runner must spawn THAT
+    harness (with its spawn-env shape), not the spec's declared one — else
+    the snapshot would claim "pi" while claude-sdk actually runs.
+
+    :param tmp_path: Pytest temp dir for an isolated provider config.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  anthropic:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    anthropic:\n"
+        "      base_url: https://api.anthropic.com\n"
+        "      api_key: $ANTHROPIC_API_KEY\n"
+        "      models:\n"
+        "        default: test-default\n"
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _resolver(_agent_id: str, _session_id: str | None) -> AgentSpec:
+        return spec
+
+    # Baseline: no override resolves the spec's declared harness.
+    harness, spawn_env = await _resolve_harness_config(
+        agent_id="ag_x", spec_resolver=_resolver, session_id="conv_x"
+    )
+    assert harness == "claude-sdk"
+    assert spawn_env is not None and "HARNESS_CLAUDE_SDK_MODEL" in spawn_env
+
+    # Override: the harness AND its spawn-env shape follow the override.
+    harness, spawn_env = await _resolve_harness_config(
+        agent_id="ag_x",
+        spec_resolver=_resolver,
+        session_id="conv_x",
+        harness_override="pi",
+    )
+    assert harness == "pi", (
+        f"harness_override='pi' resolved to {harness!r} — the override "
+        f"was ignored and the spec's declared harness won."
+    )
+    # The spawn env must be built FOR the overridden harness (pi env keys),
+    # not the spec's claude-sdk shape — a claude env here means the harness
+    # name and env were resolved inconsistently.
+    assert spawn_env is not None and "HARNESS_PI_MODEL" in spawn_env, (
+        f"Expected a pi spawn-env; got keys {sorted(spawn_env or {})!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_background_turn_emits_failed_when_spawn_env_build_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spawn-env build failure must end the turn, never hang on "running".
+
+    Regression for the silent-hang failure mode: when
+    ``_build_claude_sdk_spawn_env`` raises (e.g. a generic provider routed
+    to the claude-sdk harness has no resolvable model, raising
+    ``OmnigentError``), the setup phase of ``_run_turn_bg`` failed before
+    the streaming block's own error handling. Because the background turn
+    task's only done-callback was ``_background_tasks.discard``, the
+    exception was swallowed: ``_active_turns`` stayed set and no terminal
+    ``session.status`` event was published, so the REPL spun on "working"
+    forever with no output.
+
+    The fix wraps the setup phase so any pre-stream exception routes through
+    ``_on_proxy_stream_end``, which clears the active turn and publishes
+    ``session.status: failed``. This test drives the background-turn path
+    (no ``?stream=true`` — the production path the Omnigent server uses) and
+    asserts the ``failed`` status reaches the session SSE stream.
+
+    :param monkeypatch: pytest fixture used to force the spawn-env build to
+        raise the same error class the no-model provider path produces.
+    """
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    conv = "conv_spawn_env_build_raises"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Return a claude-sdk spec so the runner takes the claude-sdk
+        spawn-env builder path.
+
+        :param agent_id: Agent id requested by the runner (unused).
+        :param session_id: Session id (unused).
+        :returns: A minimal claude-sdk spec.
+        """
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="claude-sdk-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    def _raising_build(
+        spec: object, *, cwd: object = None, workdir: object = None
+    ) -> dict[str, str]:
+        """
+        Stand in for ``_build_claude_sdk_spawn_env`` and fail the way the
+        no-model generic-provider path does.
+
+        :param spec: The agent spec (unused).
+        :param workdir: Bundle workdir (unused).
+        :returns: Never returns.
+        :raises OmnigentError: Always — mirrors the no-model provider error.
+        """
+        del spec, workdir
+        raise OmnigentError(
+            "No model resolved for the 'claude-sdk' harness on a generic provider.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+    # ``_build_spawn_env_from_spec`` imports this from workflow at call time,
+    # so patching the workflow attribute reaches the runner's call site.
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._build_claude_sdk_spawn_env",
+        _raising_build,
+    )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            # No ``?stream=true`` → background turn (the production path the
+            # Omnigent server uses to forward session messages).
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_claude_sdk",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert response.status_code == 202
+        # Await the background turn task (main's helper) before draining, then
+        # read the runner's per-session queue via the ``app.state`` test seam.
+        await _await_bg_turn_task(conv)
+        statuses = await _drain_published_statuses(
+            app.state.session_event_queues, conv, until="failed", timeout=2.0
+        )
+
+    # The turn published "running" then "failed" — it reached a terminal
+    # state and cleared. Without the fix, the setup-phase OmnigentError is
+    # swallowed: only "running" is published, ``_active_turns`` stays set, and
+    # the session hangs on "working" forever (the silent-hang regression).
+    assert statuses == ["running", "failed"]
+
+
+@pytest.mark.asyncio
+async def test_runner_failed_status_carries_setup_error_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A SETUP-phase failure forwards its error message on the ``failed`` event.
+
+    Regression for the silent-REPL failure mode: ending the turn on a
+    pre-stream error stopped the spinner but rendered no text, because the
+    runner published a bare ``session.status: failed`` with no error
+    detail — the message never left the runner. This drives the same
+    spawn-env-build failure as
+    :func:`test_runner_background_turn_emits_failed_when_spawn_env_build_raises`
+    and asserts the published ``failed`` event now carries the normalized
+    ``{code, message}`` error so Omnigent and the REPL can render it.
+
+    :param monkeypatch: pytest fixture used to force the spawn-env build to
+        raise the no-model provider error.
+    """
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    conv = "conv_failed_status_carries_error"
+    raised_message = "No model resolved for the 'claude-sdk' harness on a generic provider."
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Return a claude-sdk spec so the spawn-env builder path is taken.
+
+        :param agent_id: Agent id (unused).
+        :param session_id: Session id (unused).
+        :returns: A minimal claude-sdk spec.
+        """
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="claude-sdk-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    def _raising_build(
+        spec: object, *, cwd: object = None, workdir: object = None
+    ) -> dict[str, str]:
+        """
+        Fail the spawn-env build the way the no-model provider path does.
+
+        :param spec: The agent spec (unused).
+        :param workdir: Bundle workdir (unused).
+        :returns: Never returns.
+        :raises OmnigentError: Always.
+        """
+        del spec, workdir
+        raise OmnigentError(raised_message, code=ErrorCode.INVALID_INPUT)
+
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._build_claude_sdk_spawn_env",
+        _raising_build,
+    )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_claude_sdk",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert response.status_code == 202
+        # Await the background turn task (main's helper) before draining, then
+        # read the runner's per-session queue via the ``app.state`` test seam.
+        await _await_bg_turn_task(conv)
+        failed_event = await _drain_failed_status_event(
+            app.state.session_event_queues, conv, timeout=2.0
+        )
+
+    # The failed event must carry the real setup error message — not a
+    # bare status. Without the fix ``error`` is absent and the REPL
+    # renders nothing.
+    assert failed_event is not None
+    error = failed_event.get("error")
+    assert isinstance(error, dict)
+    # The raised OmnigentError message is wrapped as "turn setup
+    # failed: <message>" by _run_turn_bg's setup-phase handler.
+    assert raised_message in error["message"]
+    # Normalized shape always has a code so the wire ErrorDetail validates.
+    assert error["code"]
+
+
+# ── Harness-stream failure → terminal session.status ────
+
+
+async def _drain_status_events(
+    queues: dict[str, Any],
+    conv: str,
+    *,
+    until: str,
+    timeout: float,
+) -> list[dict[str, Any]]:
+    """Collect full ``session.status`` events a runner published for a session.
+
+    Like :func:`_drain_published_statuses` but returns the full event dicts,
+    so one drain can assert both the status order and the carried ``error``
+    payload — the queue is consumed by reading, so a test cannot drain twice.
+
+    :param queues: The app's per-session event-queue dict, i.e.
+        ``app.state.session_event_queues``.
+    :param conv: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param until: Stop once this ``session.status`` value is observed,
+        e.g. ``"failed"``.
+    :param timeout: Hard cap in seconds — if *until* never arrives the poll
+        gives up and returns what it saw, so a hang regression fails the
+        assertion instead of spinning forever.
+    :returns: Ordered ``session.status`` event dicts published for *conv*.
+    """
+    events: list[dict[str, Any]] = []
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        queue = queues.get(conv)
+        drained = False
+        while queue is not None and not queue.empty():
+            event = queue.get_nowait()
+            drained = True
+            if isinstance(event, dict) and event.get("type") == "session.status":
+                events.append(event)
+        if any(event.get("status") == until for event in events):
+            return events
+        if not drained:
+            # Let the background turn task make progress before re-polling.
+            await asyncio.sleep(0.02)
+    return events
+
+
+_STREAM_FAILURE_MESSAGE = "harness turn failed: executor stream disconnected"
+
+_SSE_RESPONSE_CREATED = (
+    'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_sf_1"}}\n\n'
+)
+_SSE_RESPONSE_FAILED = (
+    "event: response.failed\ndata: "
+    '{"type":"response.failed","response":{"status":"failed"},'
+    f'"error":{{"message":"{_STREAM_FAILURE_MESSAGE}","code":"executor_error"}}}}\n\n'
+)
+_SSE_RESPONSE_COMPLETED = (
+    "event: response.completed\ndata: "
+    '{"type":"response.completed","response":{"id":"resp_sf_1","status":"completed"}}\n\n'
+)
+
+
+# ── Runner-local OS env dispatch ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
+    from omnigent.harnesses.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.spec.types import AgentSpec
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        spec = AgentSpec(
+            spec_version=1,
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=str(root),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            ),
+        )
+
+        write = await _execute_os_env_tool(
+            "sys_os_write",
+            {"path": "note.txt", "content": "hello\nplanet\n"},
+            agent_spec=spec,
+            conversation_id="conv_runner_os_env_test",
+        )
+        assert json.loads(write)["created"] is True
+        assert root.joinpath("note.txt").read_text() == "hello\nplanet\n"
+
+        edit = await _execute_os_env_tool(
+            "sys_os_edit",
+            {"path": "note.txt", "oldText": "planet", "newText": "world"},
+            agent_spec=spec,
+            conversation_id="conv_runner_os_env_test",
+        )
+        assert json.loads(edit)["replacements"] == 1
+
+        read = await _execute_os_env_tool(
+            "sys_os_read",
+            {"path": "note.txt"},
+            agent_spec=spec,
+            conversation_id="conv_runner_os_env_test",
+        )
+        assert json.loads(read)["content"] == "hello\nworld\n"
+
+        shell = await _execute_os_env_tool(
+            "sys_os_shell",
+            {"command": "pwd"},
+            agent_spec=spec,
+            conversation_id="conv_runner_os_env_test",
+        )
+        shell_result = json.loads(shell)
+        assert shell_result["exit_code"] == 0
+        assert Path(shell_result["stdout"].strip()).resolve() == root.resolve()
+
+
+@pytest.mark.asyncio
+async def test_runner_os_env_placeholder_cwd_uses_cli_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Runner-local OS tools map ``cwd: .`` to the CLI workspace.
+
+    Remote ``run --server`` uploads the spec to an app server,
+    but the local runner still owns filesystem access. This pins
+    the contract that a placeholder cwd resolves to the local
+    project root the CLI passed into the runner, not to the
+    runner-owned temp fallback.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :param tmp_path: Per-test temp root for workspace and fallback paths.
+    :returns: None.
+    """
+    from omnigent.harnesses.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.setenv("OMNIGENT_RUNNER_OS_ENV_ROOT", str(tmp_path / "fallback"))
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=".",
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+
+    out = await _execute_os_env_tool(
+        "sys_os_write",
+        {"path": "created.txt", "content": "from workspace"},
+        agent_spec=spec,
+        conversation_id="conv_runner_workspace",
+        runner_workspace=workspace.resolve(),
+    )
+
+    assert json.loads(out)["created"] is True
+    assert workspace.joinpath("created.txt").read_text() == "from workspace"
+    assert not (tmp_path / "fallback").exists()
+
+
+@pytest.mark.asyncio
+async def test_runner_os_env_tools_default_to_conversation_workspace(monkeypatch) -> None:
+    from omnigent.harnesses.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.spec.types import AgentSpec
+
+    with tempfile.TemporaryDirectory() as td:
+        monkeypatch.setenv("OMNIGENT_RUNNER_OS_ENV_ROOT", td)
+        spec = AgentSpec(
+            spec_version=1,
+            os_env=OSEnvSpec(
+                type="caller_process",
+                sandbox=OSEnvSandboxSpec(type="none"),
+            ),
+        )
+
+        out = await _execute_os_env_tool(
+            "sys_os_write",
+            {"path": "created.txt", "content": "hi"},
+            agent_spec=spec,
+            conversation_id="conv/default workspace",
+        )
+        assert json.loads(out)["created"] is True
+        assert Path(td, "conv_default_workspace", "workspace", "created.txt").read_text() == "hi"
+
+
+def test_clone_os_env_spec_preserves_all_sandbox_fields() -> None:
+    """Cloning an OSEnvSpec must preserve every sandbox field.
+
+    Regression guard for the same class of bug previously fixed in
+    :func:`omnigent.harnesses.terminal._clone_sandbox_spec`: hand-enumerated
+    field copies silently drop security-critical fields (egress_rules,
+    egress_allow_private_destinations, env_passthrough, etc.) when new
+    fields are added to :class:`OSEnvSandboxSpec`. This test asserts the
+    runner-side clone is field-complete by comparing the dataclass dicts
+    and verifying list-typed fields are not aliased with the original.
+
+    :returns: None.
+    """
+    import dataclasses
+
+    from omnigent.harnesses.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _clone_os_env_spec
+
+    sandbox = OSEnvSandboxSpec(
+        type="darwin_seatbelt",
+        read_paths=["~/.databrickscfg"],
+        write_paths=["."],
+        write_files=["~/.ssh/known_hosts"],
+        allow_network=True,
+        cwd_allow_hidden=[".git", ".venv"],
+        cwd_hidden_scan_max_entries=12345,
+        cwd_hidden_scan_overflow="warn",
+        env_passthrough=["DATABRICKS_HOST", "DATABRICKS_TOKEN"],
+        egress_rules=["GET api.github.com/repos/databricks/*/**"],
+        egress_allow_private_destinations=True,
+    )
+    spec = OSEnvSpec(
+        type="caller_process",
+        cwd="/tmp/work",
+        sandbox=sandbox,
+        fork=True,
+        start_in_scratch=True,
+    )
+
+    clone = _clone_os_env_spec(spec)
+
+    # Every OSEnvSpec field round-trips.
+    assert dataclasses.asdict(clone) == dataclasses.asdict(spec), (
+        "clone must preserve every OSEnvSpec / OSEnvSandboxSpec field; "
+        "hand-enumerated copies silently drop newly-added fields."
+    )
+    # Mutable list fields are copied, not aliased.
+    assert clone.sandbox is not sandbox
+    for name in (
+        "read_paths",
+        "write_paths",
+        "write_files",
+        "cwd_allow_hidden",
+        "env_passthrough",
+        "egress_rules",
+    ):
+        original_list = getattr(sandbox, name)
+        cloned_list = getattr(clone.sandbox, name)
+        assert cloned_list == original_list
+        assert cloned_list is not original_list, (
+            f"{name} must be a new list so later mutation of the clone "
+            "does not leak into the original spec."
+        )
+
+
+def test_effective_runner_os_env_defaults_when_spec_has_no_os_env(monkeypatch) -> None:
+    """Agent specs without ``os_env`` get a runner-owned workspace cwd.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    from omnigent.runner.tool_dispatch import _effective_runner_os_env_spec
+    from omnigent.spec.types import AgentSpec
+
+    with tempfile.TemporaryDirectory() as td:
+        monkeypatch.setenv("OMNIGENT_RUNNER_OS_ENV_ROOT", td)
+        spec = AgentSpec(spec_version=1)
+
+        os_env = _effective_runner_os_env_spec(spec, "conv/no os env")
+
+        assert os_env.type == "caller_process"
+        assert Path(os_env.cwd) == Path(td, "conv_no_os_env", "workspace")
+        assert Path(os_env.cwd).is_dir()
+
+
+def test_effective_runner_os_env_uses_cli_workspace_when_spec_has_no_os_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Agent specs without ``os_env`` use the CLI workspace when available.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :param tmp_path: Per-test temp root for workspace and fallback paths.
+    :returns: None.
+    """
+    from omnigent.runner.tool_dispatch import _effective_runner_os_env_spec
+    from omnigent.spec.types import AgentSpec
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.setenv("OMNIGENT_RUNNER_OS_ENV_ROOT", str(tmp_path / "fallback"))
+    spec = AgentSpec(spec_version=1)
+
+    os_env = _effective_runner_os_env_spec(
+        spec,
+        "conv/no os env",
+        runner_workspace=workspace.resolve(),
+    )
+
+    assert os_env.type == "caller_process"
+    assert Path(os_env.cwd) == workspace.resolve()
+    assert not (tmp_path / "fallback").exists()
+
+
+def test_effective_runner_os_env_runner_workspace_overrides_absolute_spec_cwd(
+    tmp_path: Path,
+) -> None:
+    """
+    runner_workspace wins over an absolute ``os_env.cwd`` in the spec.
+
+    Per designs/SESSION_WORKSPACE_SELECTION.md "How this maps onto
+    runtime": absolute spec cwds are session-create-time
+    boundaries, not runtime overrides. When the runner is launched
+    with ``OMNIGENT_RUNNER_WORKSPACE`` set, it always wins —
+    otherwise picking ``~/universe/src/foo`` for an agent
+    declaring ``cwd: ~/universe`` would silently relocate up to
+    ``~/universe`` at runtime.
+    """
+    from omnigent.harnesses.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _effective_runner_os_env_spec
+    from omnigent.spec.types import AgentSpec
+
+    workspace = tmp_path / "picked-subdir"
+    workspace.mkdir()
+    spec_cwd = tmp_path / "agent-spec-cwd"
+    spec_cwd.mkdir()
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(spec_cwd),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+
+    os_env = _effective_runner_os_env_spec(
+        spec,
+        "conv_abs_override",
+        runner_workspace=workspace.resolve(),
+    )
+
+    # Workspace wins over the absolute spec cwd.
+    assert Path(os_env.cwd) == workspace.resolve()
+    assert Path(os_env.cwd) != spec_cwd.resolve()
+
+
+def test_effective_runner_os_env_absolute_spec_cwd_used_without_runner_workspace(
+    tmp_path: Path,
+) -> None:
+    """
+    Without runner_workspace, an absolute ``os_env.cwd`` in the
+    spec is used as-is.
+
+    Pins the no-env-var fallback path so unit tests / pure local
+    runs that construct an agent spec directly without the env
+    var continue to honor whatever the spec declared.
+    """
+    from omnigent.harnesses.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _effective_runner_os_env_spec
+    from omnigent.spec.types import AgentSpec
+
+    spec_cwd = tmp_path / "agent-spec-cwd"
+    spec_cwd.mkdir()
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(spec_cwd),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
+    )
+
+    os_env = _effective_runner_os_env_spec(
+        spec,
+        "conv_no_workspace_abs",
+        runner_workspace=None,
+    )
+
+    assert Path(os_env.cwd) == spec_cwd
+
+
+@pytest.mark.asyncio
+async def test_runner_terminal_dispatch_passes_cli_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Runner terminal tools receive the CLI workspace in ``ToolContext``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Workspace path exported to the runner.
+    :returns: None.
+    """
+    from omnigent.harnesses.datamodel import TerminalEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_terminal_tool
+    from omnigent.terminals import TerminalRegistry
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins.sys_terminal import SysTerminalLaunchTool
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    spec = AgentSpec(
+        spec_version=1,
+        terminals={"zsh": TerminalEnvSpec(command="zsh")},
+    )
+    captured: dict[str, object] = {}
+
+    def _fake_invoke(
+        self: SysTerminalLaunchTool,
+        arguments: str,
+        ctx: ToolContext,
+    ) -> str:
+        """
+        Capture the runner-built context without launching tmux.
+
+        :param self: Bound launch tool instance.
+        :param arguments: JSON arguments forwarded by dispatch.
+        :param ctx: Tool context created by runner dispatch.
+        :returns: JSON status payload.
+        """
+        del self
+        captured["arguments"] = arguments
+        captured["workspace"] = ctx.workspace
+        return json.dumps({"status": "captured"})
+
+    monkeypatch.setattr(SysTerminalLaunchTool, "invoke", _fake_invoke)
+
+    out = await _execute_terminal_tool(
+        "sys_terminal_launch",
+        {"terminal": "zsh", "session": "s1"},
+        terminal_registry=TerminalRegistry(),
+        agent_spec=spec,
+        conversation_id="conv_terminal_dispatch",
+        task_id="task_terminal_dispatch",
+        agent_id="ag_terminal_dispatch",
+        runner_workspace=workspace.resolve(),
+    )
+
+    assert json.loads(out)["status"] == "captured"
+    assert json.loads(captured["arguments"]) == {"terminal": "zsh", "session": "s1"}
+    assert captured["workspace"] == workspace.resolve()
+
+
+class _StubTerminalInstance:
+    """Minimal stand-in for a launched ``TerminalInstance``.
+
+    ``terminal_resource_view`` reads only stable ``TerminalInstance``
+    fields; the launch/close tool's ``invoke`` is monkeypatched in
+    these tests so no real tmux instance is created.
+
+    :param running: Value surfaced as ``metadata.running`` in the
+        resource view.
+    """
+
+    def __init__(self, running: bool = True) -> None:
+        self.running = running
+        # ``None`` => the view uses the default environment id, so we
+        # don't need to fabricate an OSEnvironment.
+        self.os_env = None
+        self.socket_path = Path("/tmp/omnigent-test-tmux.sock")
+        self.tmux_target = "main"
+        # ``terminal_resource_view`` reads this to project the effective
+        # web-attach transport into metadata; ``None`` => the global default.
+        # Records on_activity callbacks the dispatch wires up so a fresh
+        # launch's pane-activity watcher start is observable (and so the
+        # call doesn't AttributeError against this stub).
+        self.activity_watchers: list[Callable[[], None]] = []
+
+    def start_idle_watcher_thread(
+        self,
+        on_idle: Callable[[], None] | None = None,
+        *,
+        on_activity: Callable[[], None] | None = None,
+        **kwargs: object,
+    ) -> None:
+        """Record the activity callback instead of polling real tmux."""
+        del kwargs
+        if on_activity is not None:
+            self.activity_watchers.append(on_activity)
+
+
+class _StubTerminalRegistry:
+    """Registry stub whose ``get`` returns a fixed instance.
+
+    The launch/close tool's ``invoke`` is monkeypatched, so the tool
+    never touches the registry; only ``_emit_terminal_resource_event``
+    calls ``get`` (on the fresh-launch branch) to build the resource
+    view. A real stub class (not ``MagicMock``) so an unexpected extra
+    call surfaces as a recorded entry rather than silently passing.
+
+    :param instance: Instance returned for every ``get``, or ``None``
+        to simulate a registry miss.
+    """
+
+    def __init__(self, instance: _StubTerminalInstance | None) -> None:
+        self._instance = instance
+        self.get_calls: list[tuple[str, str, str]] = []
+
+    def get(
+        self,
+        conversation_id: str,
+        terminal_name: str,
+        session_key: str,
+    ) -> _StubTerminalInstance | None:
+        """Record the lookup and return the configured instance."""
+        self.get_calls.append((conversation_id, terminal_name, session_key))
+        return self._instance
+
+
+def _capturing_publish_event(
+    captured: list[dict[str, Any]],
+) -> Any:
+    """Build a ``publish_event`` stub that records published events.
+
+    :param captured: List the returned callable appends each event
+        dict to (the session id is discarded — every event in these
+        tests targets the same conversation).
+    :returns: A ``(session_id, event) -> None`` callable.
+    """
+
+    def _publish(session_id: str, event: dict[str, Any]) -> None:
+        del session_id
+        captured.append(event)
+
+    return _publish
+
+
+@pytest.mark.asyncio
+async def test_terminal_launch_dispatch_emits_resource_created(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh ``sys_terminal_launch`` publishes ``session.resource.created``.
+
+    Verifies the runner dispatcher surfaces a tool-launched terminal
+    on the live SSE stream mid-turn (the whole point of this change),
+    with the same resource shape the REST path emits.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.runner.tool_dispatch import _execute_terminal_tool
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins.sys_terminal import SysTerminalLaunchTool
+
+    spec = AgentSpec(spec_version=1)
+
+    def _fake_invoke(self: SysTerminalLaunchTool, arguments: str, ctx: ToolContext) -> str:
+        del self, arguments, ctx
+        return json.dumps({"terminal": "zsh", "session": "s1", "status": "launched"})
+
+    monkeypatch.setattr(SysTerminalLaunchTool, "invoke", _fake_invoke)
+
+    registry = _StubTerminalRegistry(_StubTerminalInstance(running=True))
+    published: list[dict[str, Any]] = []
+
+    out = await _execute_terminal_tool(
+        "sys_terminal_launch",
+        {"terminal": "zsh", "session": "s1"},
+        terminal_registry=registry,
+        agent_spec=spec,
+        conversation_id="conv_emit",
+        task_id="task_emit",
+        agent_id="ag_emit",
+        publish_event=_capturing_publish_event(published),
+    )
+
+    # Tool output is returned unchanged to the harness.
+    assert json.loads(out)["status"] == "launched"
+    # Exactly one live event — the fresh-launch resource.created. A
+    # second event would mean the close branch or a duplicate fired.
+    assert len(published) == 1, f"expected 1 published event, got {published}"
+    event = published[0]
+    assert event["type"] == "session.resource.created"
+    # Resource shape matches the REST path: deterministic id +
+    # terminal type so the web rail / relay handle both identically.
+    assert event["resource"]["id"] == "terminal_zsh_s1"
+    assert event["resource"]["type"] == "terminal"
+    assert event["resource"]["metadata"]["terminal_name"] == "zsh"
+    # The instance was looked up from the registry to build the view.
+    assert registry.get_calls == [("conv_emit", "zsh", "s1")]
+
+
+@pytest.mark.asyncio
+async def test_terminal_launch_idempotent_does_not_emit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``already_running`` launch publishes nothing.
+
+    Re-launching an existing ``(terminal, session)`` returns
+    ``status: already_running``; emitting ``session.resource.created``
+    again would double-create the same id in the rail.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.runner.tool_dispatch import _execute_terminal_tool
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins.sys_terminal import SysTerminalLaunchTool
+
+    spec = AgentSpec(spec_version=1)
+
+    def _fake_invoke(self: SysTerminalLaunchTool, arguments: str, ctx: ToolContext) -> str:
+        del self, arguments, ctx
+        return json.dumps({"terminal": "zsh", "session": "s1", "status": "already_running"})
+
+    monkeypatch.setattr(SysTerminalLaunchTool, "invoke", _fake_invoke)
+
+    registry = _StubTerminalRegistry(_StubTerminalInstance(running=True))
+    published: list[dict[str, Any]] = []
+
+    await _execute_terminal_tool(
+        "sys_terminal_launch",
+        {"terminal": "zsh", "session": "s1"},
+        terminal_registry=registry,
+        agent_spec=spec,
+        conversation_id="conv_emit",
+        task_id="task_emit",
+        agent_id="ag_emit",
+        publish_event=_capturing_publish_event(published),
+    )
+
+    # No event: the resource already existed before this launch.
+    assert published == []
+    # And we didn't even bother looking up the instance to build a view.
+    assert registry.get_calls == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_close_dispatch_emits_resource_deleted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful ``sys_terminal_close`` publishes ``session.resource.deleted``.
+
+    Verifies the symmetric teardown path: closing a terminal removes
+    it from the rail live, with the deleted-event shape the REST path
+    and web UI already handle.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.runner.tool_dispatch import _execute_terminal_tool
+    from omnigent.tools.base import ToolContext
+    from omnigent.tools.builtins.sys_terminal import SysTerminalCloseTool
+
+    spec = AgentSpec(spec_version=1)
+
+    def _fake_invoke(self: SysTerminalCloseTool, arguments: str, ctx: ToolContext) -> str:
+        del self, arguments, ctx
+        return json.dumps({"terminal": "zsh", "session": "s1", "status": "closed"})
+
+    monkeypatch.setattr(SysTerminalCloseTool, "invoke", _fake_invoke)
+
+    # Close doesn't look up the instance (no resource view to build),
+    # so a miss-returning registry is fine here.
+    registry = _StubTerminalRegistry(None)
+    published: list[dict[str, Any]] = []
+
+    await _execute_terminal_tool(
+        "sys_terminal_close",
+        {"terminal": "zsh", "session": "s1"},
+        terminal_registry=registry,
+        agent_spec=spec,
+        conversation_id="conv_emit",
+        task_id="task_emit",
+        agent_id="ag_emit",
+        publish_event=_capturing_publish_event(published),
+    )
+
+    assert len(published) == 1, f"expected 1 published event, got {published}"
+    event = published[0]
+    assert event["type"] == "session.resource.deleted"
+    assert event["resource_id"] == "terminal_zsh_s1"
+    assert event["resource_type"] == "terminal"
+    assert event["session_id"] == "conv_emit"
+    # Deleted carries only the id; no registry lookup needed.
+    assert registry.get_calls == []
+
+
+@pytest.mark.asyncio
+async def test_runner_read_inbox_continues_after_malformed_terminal_idle_item() -> None:
+    """
+    Malformed terminal idle items must not abort the inbox drain.
+
+    :returns: None.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    session_inbox.put_nowait(
+        {
+            "handle_id": "handle_before",
+            "tool_name": "sys_os_shell",
+            "status": "completed",
+            "output": "before",
+        }
+    )
+    session_inbox.put_nowait({"type": "terminal_idle", "source": "zsh"})
+    session_inbox.put_nowait(
+        {
+            "handle_id": "handle_after",
+            "tool_name": "sys_os_shell",
+            "status": "completed",
+            "output": "after",
+        }
+    )
+
+    inbox_output = await execute_tool(
+        tool_name="sys_read_inbox",
+        arguments="{}",
+        session_inbox=session_inbox,
+    )
+
+    assert "task handle_before completed" in inbox_output
+    assert "sys_os_shell returned: before" in inbox_output
+    assert "malformed terminal_idle inbox item ignored" in inbox_output
+    assert "terminal-idle inbox payload requires non-empty string session" in inbox_output
+    assert "task handle_after completed" in inbox_output
+    assert "sys_os_shell returned: after" in inbox_output
+    assert session_inbox.empty()
+
+
+@pytest.mark.asyncio
+async def test_async_inbox_dispatch_does_not_create_unused_harness_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct async-inbox dispatch must not allocate an unused HTTP client."""
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    def unexpected_client(*args: object, **kwargs: object) -> None:
+        raise AssertionError("async-inbox dispatch created an unused HTTP client")
+
+    monkeypatch.setattr(tool_dispatch.httpx, "AsyncClient", unexpected_client)
+
+    output = await execute_tool(
+        tool_name="sys_read_inbox",
+        arguments="{}",
+        session_inbox=asyncio.Queue(),
+        harness_client=None,
+    )
+
+    assert output == "Inbox is empty — no completed tasks."
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_error"),
+    [
+        ("{", "malformed JSON arguments"),
+        ("", "malformed JSON arguments"),
+        ("   ", "malformed JSON arguments"),
+        ("[]", "arguments must be a JSON object"),
+        ("42", "arguments must be a JSON object"),
+        ("null", "arguments must be a JSON object"),
+        ('"scalar"', "arguments must be a JSON object"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_execute_tool_rejects_non_object_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: str,
+    expected_error: str,
+) -> None:
+    """
+    Malformed or non-object argument payloads fail before tool dispatch.
+
+    A silent ``{}`` substitution would run a default/no-argument system
+    tool after bad input; the shared parser must reject these shapes and
+    the underlying OS-env handler must never be entered.
+    """
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    calls: list[object] = []
+
+    async def _spy_os_env_tool(*args: object, **kwargs: object) -> str:
+        calls.append((args, kwargs))
+        return json.dumps({"ok": True})
+
+    monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", _spy_os_env_tool)
+
+    output = await execute_tool(tool_name="sys_os_read", arguments=arguments)
+
+    assert json.loads(output) == {"error": expected_error}
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_accepts_empty_object_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Valid ``{}`` still reaches the tool with an empty argument dict."""
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    calls: list[dict[str, Any]] = []
+
+    async def _spy_os_env_tool(
+        tool_name: str,
+        args: dict[str, Any],
+        **_kwargs: object,
+    ) -> str:
+        del tool_name
+        calls.append(args)
+        return json.dumps({"ok": True})
+
+    monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", _spy_os_env_tool)
+
+    output = await execute_tool(tool_name="sys_os_read", arguments="{}")
+
+    assert json.loads(output) == {"ok": True}
+    assert calls == [{}]
+
+
+# ── End-to-end with real harness subprocess + real LLM ──
+
+
+@pytest.mark.skipif(
+    not os.environ.get("OPENAI_API_KEY"),
+    reason="OPENAI_API_KEY not set; runner→harness→LLM e2e skipped",
+)
+@pytest.mark.asyncio
+async def test_runner_dispatches_to_spawned_harness_with_real_llm(
+    started_manager: HarnessProcessManager,
+) -> None:
+    """The flagship architectural test.
+
+    Server-side httpx → runner FastAPI's
+    ``POST /v1/sessions/{conversation_id}/events?stream=true`` →
+    runner asks ``HarnessProcessManager`` to spawn / fetch the
+    per-conversation harness → uvicorn subprocess on a UDS →
+    test harness's ``run_turn`` → real OpenAI gpt-4o-mini → SSE
+    chunks stream back through harness UDS → runner's proxy_stream
+    → test httpx client.
+
+    Successful streaming with the expected event sequence proves:
+    1. The runner package uses the existing HarnessProcessManager
+       (no parallel impl).
+    2. A real harness subprocess is spawned per (conversation, harness).
+    3. The runner correctly relays the harness's SSE bytes.
+    4. The runner is exercising the architectural shape from
+       designs/RUNNER.md §4 — not just calling an LLM directly.
+    """
+    app = create_runner_app(
+        process_manager=started_manager,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        async with http.stream(
+            "POST",
+            "/v1/sessions/conv_runner_e2e_test/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "harness": _TEST_HARNESS_NAME,
+                "content": [{"role": "user", "content": "Reply with the single word 'pong'."}],
+                "model": "openai/gpt-4o-mini",
+                "instructions": "You echo single words.",
+                "connection_params": {"api_key": os.environ["OPENAI_API_KEY"]},
+            },
+            timeout=120.0,
+        ) as response:
+            assert response.status_code == 200, (
+                f"runner dispatch failed: {response.status_code} "
+                f"{(await response.aread()).decode('utf-8', errors='replace')}"
+            )
+            assert response.headers["content-type"].startswith("text/event-stream")
+            body = b"".join([chunk async for chunk in response.aiter_bytes()])
+
+    # Parse the SSE bytes back into events.
+    events = _parse_sse(body)
+    types = [t for t, _ in events]
+    # Must START with response.created and END with response.completed —
+    # proves both ends of the harness's emitted stream made it through
+    # the runner's proxy. A real LLM produces at least one delta in
+    # between.
+    assert types[0] == "response.created", (
+        f"first event must be response.created; got types={types}"
+    )
+    assert types[-1] == "response.completed", (
+        f"last event must be response.completed; got types={types}"
+    )
+    assert any(t == "response.output_text.delta" for t in types), (
+        f"expected text deltas from real LLM; got types={types}"
+    )
+    # The subprocess actually got spawned — verify by checking the
+    # manager's internal state. (Direct attribute access; the manager
+    # is a test-fixture instance so this is fine.)
+    assert "conv_runner_e2e_test" in started_manager._entries, (
+        "manager should have a spawned entry for the test conversation; "
+        "if missing, the runner didn't actually dispatch through "
+        "HarnessProcessManager.get_client"
+    )
+
+
+def _parse_sse(raw: bytes) -> list[tuple[str, dict]]:
+    """Decode SSE bytes into ``[(event_type, payload), ...]``."""
+    text = raw.decode("utf-8", errors="replace")
+    events: list[tuple[str, dict]] = []
+    current_type: str | None = None
+    current_data: list[str] = []
+    for line in text.split("\n"):
+        if line.startswith("event: "):
+            current_type = line[len("event: ") :]
+        elif line.startswith("data: "):
+            current_data.append(line[len("data: ") :])
+        elif line == "" and current_type is not None and current_data:
+            try:
+                payload = json.loads("\n".join(current_data))
+            except json.JSONDecodeError:
+                payload = {"_raw": "\n".join(current_data)}
+            events.append((current_type, payload))
+            current_type = None
+            current_data = []
+    return events
+
+
+def test_maybe_signal_changed_files_throttles_within_window() -> None:
+    """
+    ``_maybe_signal_changed_files`` emits at most one
+    ``session.changed_files.invalidated`` per throttle window per
+    session, then re-emits after the window elapses.
+
+    The monotonic ``now`` is injected so this is deterministic with no
+    real sleep. Regression target: a multi-file turn must collapse to
+    one refetch trigger (leading-edge throttle), not fire per write.
+    """
+    from omnigent.runner.tool_dispatch import (
+        _CHANGED_FILES_SIGNAL_THROTTLE_S,
+        _maybe_signal_changed_files,
+    )
+
+    published: list[dict[str, object]] = []
+
+    def _pub(_sid: str, event: dict[str, Any]) -> None:
+        published.append(event)
+
+    sid = "conv_changed_files_throttle_unique"
+    # First call emits immediately (leading edge).
+    _maybe_signal_changed_files(sid, _pub, now=100.0)
+    # Within the window — suppressed.
+    _maybe_signal_changed_files(sid, _pub, now=100.0 + _CHANGED_FILES_SIGNAL_THROTTLE_S / 2)
+    # After the window — emits again.
+    _maybe_signal_changed_files(sid, _pub, now=100.0 + _CHANGED_FILES_SIGNAL_THROTTLE_S + 0.01)
+
+    # 2 = first (leading) + post-window; the middle call was throttled.
+    # If 3, the throttle window is not being honored; if 1, the
+    # post-window re-emit is broken.
+    assert len(published) == 2, f"expected 2 signals (leading + post-window), got {len(published)}"
+    for event in published:
+        assert event["type"] == "session.changed_files.invalidated"
+        assert event["session_id"] == sid
+        assert event["environment_id"] == "default"
+
+    # A missing publisher or session id is a no-op (no crash, no emit).
+    _maybe_signal_changed_files(None, _pub, now=200.0)
+    _maybe_signal_changed_files(sid, None, now=200.0)
+    assert len(published) == 2
+
+
+def test_subagent_read_tools_are_runner_local() -> None:
+    """
+    ``sys_session_list`` and ``sys_session_get_history`` dispatch locally in the runner.
+
+    If this regresses, native harnesses that call these tools fall through to
+    spec-callable resolution and the user sees "not in local dispatch table"
+    instead of sub-agent recovery data.
+    """
+    from omnigent.runner.tool_dispatch import should_dispatch_locally
+
+    assert should_dispatch_locally("sys_session_list") is True
+    assert should_dispatch_locally("sys_session_get_history") is True
+    # get_info is a runner-local read like list/get_history; if it falls out of
+    # the local dispatch table the orchestrator's status checks break.
+    assert should_dispatch_locally("sys_session_get_info") is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "subagent_args",
+    [
+        pytest.param("continue", id="plain-string-contract"),
+        pytest.param({"input": "continue"}, id="object-input-contract"),
+    ],
+)
+async def test_sys_session_send_reuses_existing_child_session(
+    monkeypatch: pytest.MonkeyPatch,
+    subagent_args: str | dict[str, str],
+) -> None:
+    """
+    Re-sending to the same ``(agent, title)`` continues the existing child.
+
+    This catches the duplicate-create regression behind unreliable
+    continuation: if the runner POSTs ``/v1/sessions`` despite the existing
+    child row, the test fails and the user would see a duplicate-title server
+    error instead of a continuation. The parameterized ``args`` values also
+    prove the runner preserves the public plain-string contract while accepting
+    Nessie's object form.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param subagent_args: ``sys_session_send`` ``args`` payload.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    create_posts = 0
+    event_posts: list[dict[str, Any]] = []
+    dispatch_stamps: list[dict[str, Any]] = []
+    published: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal create_posts
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent":
+            return httpx.Response(
+                200,
+                json={"labels": {"omnigent.turn_actor": "bob@example.com"}},
+            )
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent/child_sessions"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "conv_existing",
+                            "tool": "claude",
+                            "session_name": "issue-1756",
+                            "busy": False,
+                        }
+                    ]
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_posts += 1
+            return httpx.Response(500, json={"error": "duplicate"})
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_existing":
+            dispatch_stamps.append(
+                {"events_before": len(event_posts), **json.loads(request.content)["labels"]}
+            )
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_existing/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "agent": "claude",
+                        "title": "issue-1756",
+                        "args": subagent_args,
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="claude")]),
+                session_inbox=session_inbox,
+                publish_event=_capturing_publish_event(published),
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_existing")
+            runner_app._session_inboxes_ref.pop("conv_parent", None)
+
+    payload = json.loads(output)
+    assert create_posts == 0, "continuation must not create a duplicate child session"
+    assert payload["conversation_id"] == "conv_existing"
+    assert payload["status"] == "launching"
+    assert "continued ok" not in payload["message"]
+    assert event_posts[0]["created_by"] == "bob@example.com"
+    assert event_posts[0]["data"]["content"][0]["text"] == "continue"
+    # The new turn's dispatch id is stamped on the child before its message
+    # is posted, so a restart can tell this turn from the drained one.
+    [stamp] = dispatch_stamps
+    assert stamp["events_before"] == 0
+    assert stamp[runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY].startswith("subagent_")
+    assert published[-1]["type"] == "session.child_session.updated"
+    assert published[-1]["child"]["current_task_status"] == "launching"
+    assert published[-1]["child"]["busy"] is False
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_named_child_retries_without_rejected_actor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing runner token cannot make new-child dispatch teardown the child."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[dict[str, Any]] = []
+    delete_posts = 0
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal delete_posts
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent_retry":
+            return httpx.Response(
+                200,
+                json={"labels": {"omnigent.turn_actor": "bob@example.com"}},
+            )
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent_retry/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            return httpx.Response(201, json={"id": "conv_child_retry"})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child_retry/events":
+            event_posts.append(json.loads(request.content))
+            if len(event_posts) == 1:
+                return httpx.Response(403, json={"error": "created_by rejected"})
+            return httpx.Response(202, json={"queued": True})
+        if request.method == "DELETE" and request.url.path == "/v1/sessions/conv_child_retry":
+            delete_posts += 1
+            return httpx.Response(204)
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"agent": "worker", "title": "retry", "args": "continue"}),
+                server_client=server_client,
+                conversation_id="conv_parent_retry",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child_retry")
+            runner_app._session_inboxes_ref.pop("conv_parent_retry", None)
+
+    payload = json.loads(output)
+    assert payload["conversation_id"] == "conv_child_retry"
+    assert payload["status"] == "launching"
+    assert len(event_posts) == 2
+    assert event_posts[0]["created_by"] == "bob@example.com"
+    assert "created_by" not in event_posts[1]
+    assert delete_posts == 0
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_existing_child_retries_without_rejected_actor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing runner token cannot make existing-child dispatch fail closed."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent_existing":
+            return httpx.Response(
+                200,
+                json={"labels": {"omnigent.turn_actor": "bob@example.com"}},
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_existing_retry":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_existing_retry",
+                    "parent_session_id": "conv_parent_existing",
+                    "title": "worker:retry",
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_existing_retry":
+            return httpx.Response(200, json={"ok": True})
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_existing_retry/events"
+        ):
+            event_posts.append(json.loads(request.content))
+            if len(event_posts) == 1:
+                return httpx.Response(403, json={"error": "created_by rejected"})
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_existing_retry", "args": "continue"}),
+                server_client=server_client,
+                conversation_id="conv_parent_existing",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_existing_retry")
+            runner_app._session_inboxes_ref.pop("conv_parent_existing", None)
+
+    payload = json.loads(output)
+    assert payload["conversation_id"] == "conv_existing_retry"
+    assert payload["status"] == "launching"
+    assert len(event_posts) == 2
+    assert event_posts[0]["created_by"] == "bob@example.com"
+    assert "created_by" not in event_posts[1]
+
+
+def _spec_with_subagent_harness(harness: str) -> SimpleNamespace:
+    """
+    Build a parent-spec stub declaring one ``worker`` sub-agent.
+
+    Mirrors the AP-style ``sub_agents`` shape ``_subagent_harness``
+    walks: ``executor.config["harness"]`` falling back to
+    ``executor.type``.
+
+    :param harness: The sub-agent's declared harness, e.g.
+        ``"codex-native"``.
+    :returns: A structural parent-spec stub for ``execute_tool``.
+    """
+    return SimpleNamespace(
+        sub_agents=[
+            SimpleNamespace(
+                name="worker",
+                executor=SimpleNamespace(type="omnigent", config={"harness": harness}),
+            )
+        ]
+    )
+
+
+_SUPERSIDE_CHAT_LABELS = {"omnigent.context.mode": "superside-chat"}
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_superside_chat_forwards_mode_label_to_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A superside-chat caller's mode label reaches the child's create body.
+
+    Before slice S3 this named-mode path (unlike ``sys_session_create``)
+    never forwarded ``labels`` at all, so a Sub-agent-Type child silently
+    dropped out of superside-chat mode.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    create_bodies: list[dict[str, Any]] = []
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent_labels":
+            return httpx.Response(200, json={"kind": "default"})
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent_labels/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_child_labels"})
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_child_labels/events"
+        ):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {"agent": "worker", "title": "auth", "args": {"input": "do it"}}
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_labels",
+                agent_spec=_spec_with_subagent_harness("claude-sdk"),
+                session_inbox=session_inbox,
+                labels=_SUPERSIDE_CHAT_LABELS,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child_labels")
+            runner_app._session_inboxes_ref.pop("conv_parent_labels", None)
+
+    payload = json.loads(output)
+    assert payload["status"] == "launching"
+    assert len(create_bodies) == 1
+    assert create_bodies[0]["labels"]["omnigent.context.mode"] == "superside-chat"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("override_args", "refusal"),
+    [
+        (
+            {"input": "do it", "model": "claude-sonnet-x"},
+            "must be one of foundation, builder, light",
+        ),
+        ({"input": "do it", "reasoning_effort": "max"}, "reasoning_effort must be one of"),
+    ],
+    ids=["model", "reasoning_effort"],
+)
+async def test_sys_session_send_superside_chat_refuses_dispatch_override(
+    override_args: dict[str, Any],
+    refusal: str,
+) -> None:
+    """A superside-chat caller may only pick fast/strong and low/medium/high (ADR 0007).
+
+    A raw model id or an unknown reasoning level is refused before any child exists.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    create_posts: list[str] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_posts.append(str(request.url))
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"agent": "worker", "title": "auth", "args": override_args}),
+                server_client=server_client,
+                conversation_id="conv_parent_override",
+                agent_spec=_spec_with_subagent_harness("claude-sdk"),
+                session_inbox=session_inbox,
+                labels=_SUPERSIDE_CHAT_LABELS,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child_override")
+            runner_app._session_inboxes_ref.pop("conv_parent_override", None)
+
+    assert output.startswith("Error:")
+    assert refusal in output
+    assert not create_posts, "override must be refused before any child is created"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_superside_chat_nesting_cap_refuses_coordinators_child() -> None:
+    """A sub-agent whose own parent is already a sub-agent cannot launch further.
+
+    docs/glossary.md Relationships: at most two levels below a chat.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    create_posts: list[str] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_coordinator_child":
+            return httpx.Response(
+                200,
+                json={
+                    "kind": "sub_agent",
+                    "parent_session_id": "conv_coordinator",
+                    "agent_id": "ag_parent",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_coordinator":
+            return httpx.Response(
+                200, json={"kind": "sub_agent", "parent_session_id": "conv_chat"}
+            )
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_coordinator_child/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_posts.append(str(request.url))
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {"agent": "worker", "title": "auth", "args": {"input": "do it"}}
+                ),
+                server_client=server_client,
+                conversation_id="conv_coordinator_child",
+                agent_spec=_spec_with_subagent_harness("claude-sdk"),
+                session_inbox=session_inbox,
+                labels=_SUPERSIDE_CHAT_LABELS,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child_nesting")
+            runner_app._session_inboxes_ref.pop("conv_coordinator_child", None)
+
+    assert output.startswith("Error:")
+    assert "nesting cap" in output
+    assert not create_posts
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_superside_chat_nesting_cap_allows_coordinator() -> None:
+    """A chat's direct sub-agent (a coordinator) may still launch its own."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    create_bodies: list[dict[str, Any]] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_coordinator_ok":
+            return httpx.Response(
+                200,
+                json={
+                    "kind": "sub_agent",
+                    "parent_session_id": "conv_chat_ok",
+                    "agent_id": "ag_parent",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_chat_ok":
+            # The coordinator's own parent: the top-level chat itself, so
+            # the nesting cap must allow the coordinator's launch.
+            return httpx.Response(200, json={"kind": "default"})
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_coordinator_ok/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_child_nesting_ok"})
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_child_nesting_ok/events"
+        ):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {"agent": "worker", "title": "auth", "args": {"input": "do it"}}
+                ),
+                server_client=server_client,
+                conversation_id="conv_coordinator_ok",
+                agent_spec=_spec_with_subagent_harness("claude-sdk"),
+                session_inbox=session_inbox,
+                labels=_SUPERSIDE_CHAT_LABELS,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child_nesting_ok")
+            runner_app._session_inboxes_ref.pop("conv_coordinator_ok", None)
+
+    assert len(create_bodies) == 1, output
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_superside_chat_type_concurrency_cap_refuses() -> None:
+    """A Sub-agent Type's own ``max_sessions`` (config.yaml) caps concurrent launches."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    create_posts: list[str] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    spec = SimpleNamespace(
+        sub_agents=[
+            SimpleNamespace(
+                name="worker",
+                executor=SimpleNamespace(type="omnigent", config={"harness": "claude-sdk"}),
+                max_sessions=1,
+            )
+        ]
+    )
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_type_cap":
+            return httpx.Response(200, json={"kind": "default", "agent_id": "ag_parent"})
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_type_cap/child_sessions"
+        ):
+            if "session_name" in request.url.params:
+                # The exact-(agent,title) lookup — no existing child.
+                return httpx.Response(200, json={"data": []})
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"id": "conv_running_1", "tool": "worker", "busy": True},
+                    ]
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_posts.append(str(request.url))
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps(
+                {"agent": "worker", "title": "auth-2", "args": {"input": "do it"}}
+            ),
+            server_client=server_client,
+            conversation_id="conv_type_cap",
+            agent_spec=spec,
+            session_inbox=session_inbox,
+            labels=_SUPERSIDE_CHAT_LABELS,
+        )
+
+    assert output.startswith("Error:")
+    assert "concurrency cap" in output
+    assert not create_posts
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_superside_chat_default_concurrency_cap_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tree-wide default cap (``OMNIGENT_SUBAGENT_MAX_CONCURRENT``) applies
+    across every Sub-agent Type, even under an uncapped Type."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setenv("OMNIGENT_SUBAGENT_MAX_CONCURRENT", "1")
+    create_posts: list[str] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_default_cap":
+            return httpx.Response(200, json={"kind": "default", "agent_id": "ag_parent"})
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_default_cap/child_sessions"
+        ):
+            if "session_name" in request.url.params:
+                return httpx.Response(200, json={"data": []})
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "conv_other_running", "tool": "drafter", "busy": True}]},
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_posts.append(str(request.url))
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps({"agent": "worker", "title": "auth", "args": {"input": "do it"}}),
+            server_client=server_client,
+            conversation_id="conv_default_cap",
+            agent_spec=_spec_with_subagent_harness("claude-sdk"),
+            session_inbox=session_inbox,
+            labels=_SUPERSIDE_CHAT_LABELS,
+        )
+
+    assert output.startswith("Error:")
+    assert "concurrency cap" in output
+    assert not create_posts
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_non_superside_chat_skips_new_caps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Outside superside-chat, no nesting/concurrency/override gating applies.
+
+    Same shape as the nesting-cap-refusal case (a sub-agent's sub-agent),
+    but with no ``omnigent.context.mode`` label the dispatch must behave
+    exactly as it did before slice S3.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    create_bodies: list[dict[str, Any]] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_plain_nested/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_child_plain_nested"})
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_child_plain_nested/events"
+        ):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "agent": "worker",
+                        "title": "auth",
+                        "args": {"input": "do it", "model": "databricks-claude-sonnet-4-6"},
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_plain_nested",
+                agent_spec=_spec_with_subagent_harness("claude-sdk"),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child_plain_nested")
+            runner_app._session_inboxes_ref.pop("conv_plain_nested", None)
+
+    assert len(create_bodies) == 1, output
+    assert create_bodies[0]["model_override"] == "databricks-claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_blocks_fresh_dispatch_when_harness_cli_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh dispatch whose harness CLI is absent fails loud, creates nothing.
+
+    Without this preflight a missing CLI surfaces only as a lazy first-turn
+    boot failure (the pi harness raises ImportError, which the parent sees as
+    a generic "turn failed" inbox item), and the orchestrator may re-dispatch
+    into the same wall. The tool must instead return an actionable error
+    naming the missing binary and install command, BEFORE creating any child
+    session.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.onboarding.harness_install import HarnessInstallSpec
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    # Override the autouse "all CLIs present" stub: pi's CLI is absent here.
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.missing_harness_cli",
+        lambda harness: HarnessInstallSpec("Pi", "pi", "@earendil-works/pi-coding-agent"),
+    )
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+
+    create_posts = 0
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        """Serve the fresh-create child lookup; count (and reject) any create."""
+        nonlocal create_posts
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent_nopi/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_posts += 1
+            return httpx.Response(201, json={"id": "conv_should_not_exist"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "agent": "worker",
+                        "title": "review-auth",
+                        "args": {"input": "review the diff"},
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_nopi",
+                agent_spec=_spec_with_subagent_harness("pi"),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_parent_nopi", None)
+
+    # The output is a plain error string (not a JSON status payload) naming
+    # the missing binary and how to install it — what the orchestrator/human
+    # needs to unblock. If this regresses, the dispatch would instead create a
+    # child that can never boot.
+    assert output.startswith("Error:")
+    assert "'pi' CLI" in output
+    assert "npm install -g @earendil-works/pi-coding-agent" in output
+    # No child was created — the guard returned before the create POST. A
+    # nonzero count would mean we spawned a worker doomed to fail at boot.
+    assert create_posts == 0
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_model_rejected_in_by_id_mode() -> None:
+    """
+    ``model`` plus ``session_id`` fails loud before any server call.
+
+    By-id mode always targets an existing session, where a model
+    override cannot take effect — the tool must reject it instead of
+    silently dropping the field.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests_seen = 0
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        """Count every request — none is expected."""
+        nonlocal requests_seen
+        requests_seen += 1
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "session_id": "conv_some_child",
+                        "args": {"input": "continue", "model": "claude-opus-4-8"},
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_by_id_model",
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_parent_by_id_model", None)
+
+    assert output.startswith("Error:"), output
+    assert "model" in output
+    # Rejected before lookup: a misaddressed override must not even read
+    # the target session.
+    assert requests_seen == 0
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_model_rejected_for_unplumbed_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``model`` for a harness without override plumbing fails loud.
+
+    Unknown harnesses have no runner-side model-override path, so
+    the persisted value would be silently ignored. The error must name
+    the harness so the orchestrator understands why the dispatch failed.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    create_posts = 0
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        """Serve the empty child lookup; count creates."""
+        nonlocal create_posts
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent_unplumbed/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_posts += 1
+            return httpx.Response(201, json={"id": "conv_never"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "agent": "worker",
+                        "title": "summarize",
+                        "args": {"input": "summarize this", "model": "some-model"},
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_unplumbed",
+                agent_spec=_spec_with_subagent_harness("unknown-harness"),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_parent_unplumbed", None)
+
+    assert output.startswith("Error:"), output
+    assert "unknown-harness" in output
+    # The unsupported dispatch must not create a child that would then
+    # silently run on the harness default.
+    assert create_posts == 0
+
+
+def _spec_with_real_subagent(harness: str) -> AgentSpec:
+    """
+    Build a real parent :class:`AgentSpec` with one ``worker`` sub-agent.
+
+    Unlike :func:`_spec_with_subagent_harness` (a structural stub), this
+    is a fully-typed spec the model-provider resolution can walk — the
+    normalization gate resolves ``executor.auth`` / ``profile`` / config
+    providers on the sub-spec.
+
+    :param harness: The sub-agent's declared harness, e.g.
+        ``"claude-native"``.
+    :returns: The parent spec.
+    """
+    return AgentSpec(
+        spec_version=1,
+        name="parent",
+        tools=ToolsConfig(agents=["worker"]),
+        sub_agents=[
+            AgentSpec(
+                spec_version=1,
+                name="worker",
+                executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
+            )
+        ],
+    )
+
+
+def _isolate_model_providers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, yaml_text: str
+) -> None:
+    """
+    Point provider resolution at an isolated config, no ambient creds.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir holding ``config.yaml``.
+    :param yaml_text: The config contents, e.g. a ``providers:`` block.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    (tmp_path / "config.yaml").write_text(yaml_text)
+
+
+@dataclass
+class _ModelSendResult:
+    """
+    Outcome of one fresh-create ``sys_session_send`` model dispatch.
+
+    :param output: The tool output string (JSON handle or ``Error:``).
+    :param create_bodies: The ``POST /v1/sessions`` bodies the mock
+        server captured — the persisted ``model_override`` lives here.
+    """
+
+    output: str
+    create_bodies: list[dict[str, Any]]
+
+
+async def _dispatch_model_send(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    agent_spec: Any,
+    model: str,
+    conv_id: str,
+) -> _ModelSendResult:
+    """
+    Drive one fresh-create ``sys_session_send`` carrying ``args.model``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param agent_spec: The parent spec under test.
+    :param model: The requested per-dispatch model id.
+    :param conv_id: A unique parent conversation id per test.
+    :returns: The tool output and the captured create bodies.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    create_bodies: list[dict[str, Any]] = []
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        """Serve fresh-create child lookup, create, and message POSTs."""
+        if (
+            request.method == "GET"
+            and request.url.path == f"/v1/sessions/{conv_id}/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_child_norm"})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child_norm/events":
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "agent": "worker",
+                        "title": "task",
+                        "args": {"input": "do the task", "model": model},
+                    }
+                ),
+                server_client=server_client,
+                conversation_id=conv_id,
+                agent_spec=agent_spec,
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child_norm")
+            runner_app._session_inboxes_ref.pop(conv_id, None)
+    return _ModelSendResult(output=output, create_bodies=create_bodies)
+
+
+@pytest.mark.asyncio
+async def test_sys_list_models_requires_agent_spec() -> None:
+    """
+    ``sys_list_models`` with no resolvable spec fails loud, not empty.
+
+    A silent ``{}`` would read as "no workers exist" — the error string
+    tells the orchestrator the runner couldn't resolve its spec.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    output = await execute_tool(
+        tool_name="sys_list_models",
+        arguments="{}",
+        agent_spec=None,
+        conversation_id="conv_list_models_nospec",
+    )
+    assert output.startswith("Error:")
+    assert "agent spec" in output
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_by_id_rejects_closed_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    By-id ``sys_session_send`` refuses closed direct children.
+
+    The close tool hands orchestrators a durable ``conversation_id``.
+    Without checking ``omnigent.closed=true`` in by-id mode, an
+    orchestrator could keep chatting with the exact child it had just
+    closed, bypassing the named lookup that skips closed rows.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts = 0
+    registrations: list[str] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    monkeypatch.setattr(
+        runner_app,
+        "register_child_session",
+        lambda child_id, **_kwargs: registrations.append(child_id),
+    )
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal event_posts
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_closed":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_closed",
+                    "title": "reviewer:auth",
+                    "parent_session_id": "conv_parent",
+                    "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                    "busy": False,
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_closed/events":
+            event_posts += 1
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "session_id": "conv_closed",
+                        "args": "please continue",
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent",
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_parent", None)
+
+    payload = json.loads(output)
+    assert payload["error"] == "session_closed"
+    assert payload["conversation_id"] == "conv_closed"
+    assert event_posts == 0
+    assert registrations == []
+
+
+_BY_ID_CHILD_IDENTITY_SCENARIOS = [
+    # A sys_session_create child: verbatim title, no sub_agent_name, and
+    # agent_name is the child's own agent.
+    pytest.param("wake-check", "responder", None, "responder", "wake-check", id="verbatim-title"),
+    # A named child continued by id: the "<agent>:<title>" parse wins, so
+    # the parent's agent_name never leaks into the label.
+    pytest.param(
+        "reviewer:auth", "orchestrator", "reviewer", "reviewer", "auth", id="parsed-title"
+    ),
+    # An Add-agent child continued by id: the "ui:<agent>:<label>" form
+    # parses the same way.
+    pytest.param(
+        "ui:claude-native-ui:1", "claude-native-ui", None, "claude-native-ui", "1", id="ui-title"
+    ),
+    # A renamed named child: the title no longer parses, and agent_name
+    # reports the parent when the sub-spec did not resolve, so
+    # sub_agent_name must outrank it.
+    pytest.param(
+        "wake-check", "orchestrator", "reviewer", "reviewer", "wake-check", id="sub-agent-name"
+    ),
+    # No title at all: the agent still comes from the snapshot and the
+    # instance title stays empty.
+    pytest.param(None, "responder", None, "responder", "", id="no-title"),
+    # Malformed agent fields: an empty sub_agent_name and a non-str
+    # agent_name both fall through to the last-resort label.
+    pytest.param("wake-check", 42, "", "agent", "wake-check", id="malformed-agent-fields"),
+]
+
+
+@pytest.mark.parametrize(
+    ("snapshot_title", "agent_name", "sub_agent_name", "expected_agent", "expected_title"),
+    _BY_ID_CHILD_IDENTITY_SCENARIOS,
+)
+@pytest.mark.asyncio
+async def test_sys_session_send_by_id_names_child_from_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot_title: str | None,
+    agent_name: object,
+    sub_agent_name: str | None,
+    expected_agent: str,
+    expected_title: str,
+) -> None:
+    """
+    By-id ``sys_session_send`` names the child from its snapshot.
+
+    A child dispatched by session id (``sys_session_create`` followed by
+    ``sys_session_send(session_id=...)``) keeps the verbatim title it was
+    created with and has no ``sub_agent_name``, so the
+    ``"<agent>:<title>"`` parse alone yields nothing. Everything that
+    identifies the child downstream (the work entry the wake notice is
+    rendered from, the child-to-parent registration, the launching event
+    on the parent stream, the returned handle, and the launching tool
+    result) must fall through to the snapshot's agent fields instead of
+    a literal ``agent`` with an empty title. A parsed title keeps winning
+    over those fields, ``sub_agent_name`` outranks ``agent_name``, and
+    malformed agent fields fall through to the last-resort label.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param snapshot_title: The child's stored title, e.g. ``"wake-check"``.
+    :param agent_name: The snapshot's bound agent name; a non-str value
+        stands in for malformed JSON.
+    :param sub_agent_name: The snapshot's ``sub_agent_name``, or ``None``.
+    :param expected_agent: The agent label the dispatch must resolve.
+    :param expected_title: The instance title the dispatch must resolve.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    registrations: list[dict[str, Any]] = []
+    published: list[dict[str, Any]] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    monkeypatch.setattr(
+        runner_app,
+        "register_child_session",
+        lambda child_id, **kwargs: registrations.append({"child_id": child_id, **kwargs}),
+    )
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_by_id_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_by_id_child",
+                    "title": snapshot_title,
+                    "agent_name": agent_name,
+                    "sub_agent_name": sub_agent_name,
+                    "parent_session_id": "conv_parent_by_id",
+                    "labels": {},
+                    "busy": False,
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_by_id_child":
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_by_id_child/events":
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_by_id_child", "args": "continue"}),
+                server_client=server_client,
+                conversation_id="conv_parent_by_id",
+                session_inbox=session_inbox,
+                publish_event=_capturing_publish_event(published),
+            )
+            entry = runner_app.get_subagent_work("conv_by_id_child")
+        finally:
+            runner_app.unregister_subagent_work("conv_by_id_child")
+            runner_app._session_inboxes_ref.pop("conv_parent_by_id", None)
+
+    assert entry is not None, output
+    assert (entry.agent, entry.title) == (expected_agent, expected_title)
+    assert registrations == [
+        {
+            "child_id": "conv_by_id_child",
+            "parent_session_id": "conv_parent_by_id",
+            "title": snapshot_title or "",
+            "tool": expected_agent,
+            "session_name": expected_title,
+        }
+    ]
+    # The launching event is the Agents rail's live row for the child.
+    [launching] = published
+    assert launching["type"] == "session.child_session.updated"
+    assert launching["child"]["tool"] == expected_agent
+    assert launching["child"]["session_name"] == expected_title
+    assert launching["child"]["title"] == (snapshot_title or "")
+    handle = json.loads(output)
+    assert (handle["agent"], handle["title"]) == (expected_agent, expected_title)
+    assert f"sub-agent {expected_agent} title {expected_title!r}" in handle["message"]
+    # The wake notice is rendered from the registered entry, so this is the
+    # line the parent reads when the child finishes.
+    notice = runner_app._format_subagent_wake_notice(
+        agent=entry.agent, title=entry.title, status="completed", pending=1
+    )
+    assert f"sub-agent {expected_agent}/{expected_title} finished" in notice
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_completion_drains_from_parent_inbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A completed async sub-agent turn arrives through ``sys_read_inbox``.
+
+    This proves ``sys_session_send`` no longer inlines the child result in the
+    tool result. If completion delivery is not wired, the drain returns the
+    empty-inbox sentinel instead of the child marker.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    create_bodies: list[dict[str, Any]] = []
+    label_patches: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        """Serve child-session create, lookup, and message POST requests."""
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent_inbox/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_child_inbox"})
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child_inbox":
+            label_patches.append(json.loads(request.content)["labels"])
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child_inbox/events":
+            return httpx.Response(202, json={"queued": True})
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_parent_inbox/policies/evaluate"
+        ):
+            return httpx.Response(200, json={"result": "POLICY_ACTION_UNSPECIFIED"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "agent": "worker",
+                        "title": "phase-a",
+                        "args": "run phase a",
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_inbox",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                session_inbox=session_inbox,
+            )
+            payload = json.loads(output)
+            assert payload["status"] == "launching"
+            assert "CHILD_MARKER" not in payload["message"]
+
+            runner_app.mark_subagent_work_terminal(
+                "conv_child_inbox",
+                status="completed",
+                output="CHILD_MARKER",
+            )
+            inbox_output = await execute_tool(
+                tool_name="sys_read_inbox",
+                arguments="{}",
+                server_client=server_client,
+                conversation_id="conv_parent_inbox",
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child_inbox")
+            runner_app._session_inboxes_ref.pop("conv_parent_inbox", None)
+
+    assert "sub-agent task conv_child_inbox completed" in inbox_output
+    assert "worker:phase-a returned: CHILD_MARKER" in inbox_output
+    # The dispatch id rides along with child creation, and the drain writes
+    # it back as the delivered-id receipt a runner restart checks.
+    dispatch_id = create_bodies[0]["labels"][runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY]
+    assert dispatch_id.startswith("subagent_")
+    assert label_patches == [{runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: dispatch_id}]
+
+
+@pytest.mark.asyncio
+async def test_subagent_inbox_cleanup_does_not_unregister_next_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Draining an old child result must not delete a newer turn's work entry.
+
+    Named sub-agents reuse the same child session. A parent can start a second
+    turn after the first has completed but before reading the first result. The
+    first inbox item's cleanup is guarded by the per-dispatch work id so it
+    cannot unregister the second running turn.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    parent_id = "conv_parent_reused_child"
+    child_id = "conv_reused_child"
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    lookup_count = 0
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        """Serve two sends to the same child and policy checks for drains."""
+        nonlocal lookup_count
+        if (
+            request.method == "GET"
+            and request.url.path == f"/v1/sessions/{parent_id}/child_sessions"
+        ):
+            lookup_count += 1
+            if lookup_count == 1:
+                return httpx.Response(200, json={"data": []})
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": child_id,
+                            "title": "worker:repeat",
+                            "sub_agent_name": "worker",
+                            "busy": False,
+                        }
+                    ]
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            return httpx.Response(201, json={"id": child_id})
+        if request.method == "PATCH" and request.url.path == f"/v1/sessions/{child_id}":
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == f"/v1/sessions/{child_id}/events":
+            return httpx.Response(202, json={"queued": True})
+        if (
+            request.method == "POST"
+            and request.url.path == f"/v1/sessions/{parent_id}/policies/evaluate"
+        ):
+            return httpx.Response(200, json={"result": "POLICY_ACTION_UNSPECIFIED"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            for prompt in ("first", "second"):
+                output = await execute_tool(
+                    tool_name="sys_session_send",
+                    arguments=json.dumps(
+                        {
+                            "agent": "worker",
+                            "title": "repeat",
+                            "args": prompt,
+                        }
+                    ),
+                    server_client=server_client,
+                    conversation_id=parent_id,
+                    agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+                    session_inbox=session_inbox,
+                )
+                assert json.loads(output)["status"] == "launching"
+                if prompt == "first":
+                    runner_app.mark_subagent_work_terminal(
+                        child_id,
+                        status="completed",
+                        output="FIRST_RESULT",
+                    )
+
+            first_drain = await execute_tool(
+                tool_name="sys_read_inbox",
+                arguments="{}",
+                server_client=server_client,
+                conversation_id=parent_id,
+                session_inbox=session_inbox,
+            )
+            current = runner_app.get_subagent_work(child_id)
+            assert current is not None, (
+                "Draining the first turn must not unregister the second turn's "
+                "active work entry for the reused child session."
+            )
+            assert current.status == "launching"
+
+            runner_app.mark_subagent_work_terminal(
+                child_id,
+                status="completed",
+                output="SECOND_RESULT",
+            )
+            second_drain = await execute_tool(
+                tool_name="sys_read_inbox",
+                arguments="{}",
+                server_client=server_client,
+                conversation_id=parent_id,
+                session_inbox=session_inbox,
+            )
+            assert runner_app.get_subagent_work(child_id) is None, (
+                "Draining the matching second turn must unregister terminal "
+                "work; otherwise the registry leaks completed child entries."
+            )
+        finally:
+            runner_app.unregister_subagent_work(child_id)
+            runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert "worker:repeat returned: FIRST_RESULT" in first_drain
+    assert "SECOND_RESULT" not in first_drain
+    assert "worker:repeat returned: SECOND_RESULT" in second_drain
+
+
+def _sse_text_turn(text: str) -> list[str]:
+    """Script one scaffold turn's SSE frames carrying ``text`` as output.
+
+    The runner's ``proxy_stream`` accumulates ``response.output_text.delta``
+    chunks and, on ``response.completed``, commits an assistant message to
+    ``_session_histories`` — which is what ``_extract_last_assistant_text``
+    reads for the sub-agent's delivered output. So a turn that emits
+    ``text`` here is the turn whose result the parent should receive.
+
+    :param text: Assistant text this turn streams, e.g. ``"FINAL"``.
+    :returns: SSE frames for a created → one-delta → completed turn.
+    """
+    return [
+        'event: response.created\ndata: {"type":"response.created",'
+        '"response":{"id":"resp_multiturn"}}\n\n',
+        "event: response.output_text.delta\ndata: "
+        + json.dumps({"type": "response.output_text.delta", "delta": text})
+        + "\n\n",
+        'event: response.completed\ndata: {"type":"response.completed",'
+        '"response":{"id":"resp_multiturn","status":"completed"}}\n\n',
+    ]
+
+
+class _GatedTwoTurnHarnessStream:
+    """Per-turn-scripted harness stream that blocks turn 1 mid-flight.
+
+    Turn 1 yields ``response.created`` + the intermediate text delta, sets
+    ``started`` (the sync gate so the test knows the turn is live and in
+    ``_active_turns``), then awaits ``release`` before yielding
+    ``response.completed``. This holds turn 1 active deterministically while
+    the test posts a second message (which buffers a continuation) — no
+    sleeps, no polling of runner internals. Turn 2 (and any later turn)
+    streams its scripted frames straight through.
+
+    :param turns: Per-turn SSE frame lists, indexed by call order.
+    :param call_index: Shared 1-based turn counter (mutated per ``stream``).
+    :param started: Set once turn 1 has emitted its intermediate delta.
+    :param release: Awaited by turn 1 before emitting ``response.completed``.
+    """
+
+    def __init__(
+        self,
+        turns: list[list[str]],
+        call_index: list[int],
+        started: asyncio.Event,
+        release: asyncio.Event,
+    ) -> None:
+        """Store scripted turns and the turn-1 synchronization events.
+
+        :param turns: Per-turn SSE frame lists, indexed by call order.
+        :param call_index: Shared 1-based turn counter; this stream reads
+            and advances it so each turn serves the next script.
+        :param started: Set once turn 1 has emitted its intermediate delta.
+        :param release: Gates turn 1's terminal ``response.completed``.
+        """
+        self._call_index = call_index
+        self._call_index[0] += 1
+        self._turn_number = self._call_index[0]
+        self._frames = turns[min(self._turn_number - 1, len(turns) - 1)]
+        self._started = started
+        self._release = release
+        self.status_code = 200
+
+    async def __aenter__(self) -> _GatedTwoTurnHarnessStream:
+        """Enter the stream context.
+
+        :returns: This stream.
+        """
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        """Exit without suppressing exceptions.
+
+        :param exc_type: Exception type from the context, if any.
+        :param exc: Exception value from the context, if any.
+        :param tb: Traceback from the context, if any.
+        :returns: None.
+        """
+        del exc_type, exc, tb
+
+    async def aiter_text(self) -> AsyncIterator[str]:
+        """Yield scripted frames, blocking turn 1 before it completes.
+
+        :returns: Async iterator of SSE frames.
+        """
+        if self._turn_number == 1:
+            # Emit created + the intermediate delta, then hand control back to
+            # the test (started) and wait (release) so turn 1 stays the active
+            # turn while the test buffers a continuation message.
+            yield self._frames[0]
+            yield self._frames[1]
+            self._started.set()
+            await self._release.wait()
+            yield self._frames[2]
+            return
+        for frame in self._frames:
+            yield frame
+
+
+class _GatedTwoTurnHarnessClient:
+    """Harness client whose ``stream`` returns the gated two-turn stream.
+
+    Also implements ``post`` (202) so the runner's best-effort mid-turn
+    injection forward — fired when the second message buffers — succeeds
+    quietly instead of raising into the buffering path.
+
+    :param turns: Per-turn SSE frame lists.
+    :param started: Set once turn 1 has emitted its intermediate delta.
+    :param release: Gates turn 1's terminal ``response.completed``.
+    """
+
+    def __init__(
+        self,
+        turns: list[list[str]],
+        started: asyncio.Event,
+        release: asyncio.Event,
+    ) -> None:
+        """Store the scripts and synchronization events.
+
+        :param turns: Per-turn SSE frame lists.
+        :param started: Set once turn 1 emits its intermediate delta.
+        :param release: Gates turn 1's terminal ``response.completed``.
+        """
+        self._turns = turns
+        self._started = started
+        self._release = release
+        self._call_index = [0]
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: dict[str, object],
+        timeout: float | None,
+    ) -> _GatedTwoTurnHarnessStream:
+        """Return the next gated turn stream.
+
+        :param method: HTTP method (ignored).
+        :param url: Harness endpoint path (ignored).
+        :param json: JSON body (ignored).
+        :param timeout: Request timeout (ignored).
+        :returns: Gated two-turn stream for the current turn.
+        """
+        del method, url, json, timeout
+        return _GatedTwoTurnHarnessStream(
+            self._turns, self._call_index, self._started, self._release
+        )
+
+    async def post(
+        self,
+        url: str,
+        *,
+        json: dict[str, object],
+        timeout: float | None,
+    ) -> httpx.Response:
+        """Accept the runner's mid-turn injection forward (best-effort).
+
+        :param url: Harness endpoint path (ignored).
+        :param json: Forwarded message body (ignored — the buffered copy is
+            what drives the continuation; this fake never echoes an
+            ``injection.consumed`` marker, so the buffer survives).
+        :param timeout: Request timeout (ignored).
+        :returns: A 202 so the forward is treated as accepted.
+        """
+        del url, json, timeout
+        return httpx.Response(202, json={"queued": True})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "policy_response", "expected_output", "blocked_output"),
+    [
+        pytest.param(
+            "completed",
+            {"result": "POLICY_ACTION_DENY", "reason": "secret output"},
+            "[Result suppressed by policy: secret output]",
+            "SECRET_MARKER",
+            id="completed-deny-suppresses",
+        ),
+        pytest.param(
+            "completed",
+            {"result": "POLICY_ACTION_ALLOW", "data": "<REDACTED>"},
+            "<REDACTED>",
+            "SECRET_MARKER",
+            id="completed-allow-data-transforms",
+        ),
+        pytest.param(
+            "failed",
+            {"result": "POLICY_ACTION_DENY", "reason": "failed secret output"},
+            "[Result suppressed by policy: failed secret output]",
+            "SECRET_MARKER",
+            id="failed-deny-suppresses",
+        ),
+    ],
+)
+async def test_sys_read_inbox_applies_subagent_tool_result_policy(
+    status: str,
+    policy_response: dict[str, Any],
+    expected_output: str,
+    blocked_output: str,
+) -> None:
+    """
+    ``sys_read_inbox`` evaluates delayed sub-agent output as TOOL_RESULT.
+
+    ``sys_session_send`` returns a launching handle immediately, so the
+    child output arrives after the original tool call. The delayed
+    output must still pass through Omnigent policy evaluation before the LLM
+    sees it in the inbox drain.
+
+    :param status: Terminal sub-agent status being drained.
+    :param policy_response: Fake Omnigent policy verdict body.
+    :param expected_output: Output expected in the drained inbox text.
+    :param blocked_output: Raw child output that policy must remove.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    session_inbox.put_nowait(
+        {
+            "type": "sub_agent",
+            "task_id": "conv_child_policy",
+            "handle_id": "conv_child_policy",
+            "conversation_id": "conv_child_policy",
+            "tool_name": "worker",
+            "agent": "worker",
+            "title": "phase-policy",
+            "status": status,
+            "output": "SECRET_MARKER",
+        }
+    )
+    policy_requests: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        """Capture the Omnigent policy evaluation request."""
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_parent_policy/policies/evaluate"
+        ):
+            policy_requests.append(json.loads(request.content))
+            return httpx.Response(200, json=policy_response)
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        inbox_output = await execute_tool(
+            tool_name="sys_read_inbox",
+            arguments="{}",
+            server_client=server_client,
+            conversation_id="conv_parent_policy",
+            session_inbox=session_inbox,
+        )
+
+    assert len(policy_requests) == 1, (
+        "Delayed sub-agent output must be policy-checked exactly once: "
+        "0 means raw output bypassed TOOL_RESULT policy; >1 means duplicate evaluation."
+    )
+    event = policy_requests[0]["event"]
+    assert event["type"] == "PHASE_TOOL_RESULT"
+    assert event["data"]["result"] == "SECRET_MARKER"
+    assert event["request_data"]["name"] == "sys_session_send"
+    assert event["request_data"]["args"] == {
+        "agent": "worker",
+        "title": "phase-policy",
+        "conversation_id": "conv_child_policy",
+    }
+    assert expected_output in inbox_output
+    assert blocked_output not in inbox_output
+
+
+@pytest.mark.asyncio
+async def test_sys_read_inbox_requeues_subagent_output_on_transient_policy_failure() -> None:
+    """
+    Transient policy-evaluation failures must not destroy child output.
+
+    The first drain receives a non-JSON policy response, so
+    ``sys_read_inbox`` must fail closed and hide the raw child output.
+    Because no real DENY/ASK/ALLOW verdict exists yet, the original
+    payload must remain retryable; otherwise the second drain could not
+    return the child result after the policy service recovers.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id = "conv_parent_policy_retry"
+    child_id = "conv_child_policy_retry"
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    runner_app._session_inboxes_ref[parent_id] = session_inbox
+    runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="worker",
+        title="retry-policy",
+    )
+    runner_app.mark_subagent_work_terminal(
+        child_id,
+        status="completed",
+        output="SECRET_RETRY_MARKER",
+    )
+    policy_attempts = 0
+    work_after_second_drain: object = "not-drained"
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        """
+        Fail policy evaluation once, then allow the retry.
+
+        :param request: Omnigent policy-evaluation request.
+        :returns: Non-JSON response on first call, allow verdict later.
+        """
+        nonlocal policy_attempts
+        if (
+            request.method == "POST"
+            and request.url.path == f"/v1/sessions/{parent_id}/policies/evaluate"
+        ):
+            policy_attempts += 1
+            if policy_attempts == 1:
+                return httpx.Response(200, content=b"not-json")
+            return httpx.Response(200, json={"result": "POLICY_ACTION_UNSPECIFIED"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            first_drain = await execute_tool(
+                tool_name="sys_read_inbox",
+                arguments="{}",
+                server_client=server_client,
+                conversation_id=parent_id,
+                session_inbox=session_inbox,
+            )
+            assert "[Result suppressed by policy: policy evaluation failed]" in first_drain
+            assert "SECRET_RETRY_MARKER" not in first_drain
+            assert runner_app.get_subagent_work(child_id) is not None, (
+                "A transient policy failure must not unregister completed "
+                "sub-agent work, or the real child output is lost permanently."
+            )
+            assert session_inbox.qsize() == 1, (
+                "The original payload must be requeued for a later policy "
+                "retry instead of being consumed by the failed drain."
+            )
+
+            second_drain = await execute_tool(
+                tool_name="sys_read_inbox",
+                arguments="{}",
+                server_client=server_client,
+                conversation_id=parent_id,
+                session_inbox=session_inbox,
+            )
+            work_after_second_drain = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert policy_attempts == 2
+    assert "worker:retry-policy returned: SECRET_RETRY_MARKER" in second_drain
+    assert work_after_second_drain is None
+
+
+@pytest.mark.asyncio
+async def test_sys_cancel_task_interrupts_non_native_subagent() -> None:
+    """
+    A non-native (in-process) sub-agent cancel must post ``interrupt``.
+
+    In-process harnesses (e.g. ``claude-sdk``) have no wrapper label. The
+    runner's ``stop_session`` handler 204 no-ops for them, so posting
+    ``stop_session`` would silently leave the child running and the parent
+    work entry stuck ``running``. ``interrupt`` is the path they honor —
+    ``_interrupted_sessions`` → ``_on_proxy_stream_end`` marks the turn
+    cancelled and wakes the parent. This guards against regressing to an
+    unconditional ``stop_session`` (which dropped in-process cancellation).
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id = "conv_parent_inproc_cancel"
+    child_id = "conv_child_inproc_cancel"
+    runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="reviewer",
+        title="analysis",
+        wrapper_label=None,  # in-process child has no native wrapper label
+    )
+    posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        """
+        Accept the interrupt; the in-process turn is cancelled out-of-band.
+
+        :param request: Request sent to the child session events route.
+        :returns: Accepted response (deferred cancel, child still running).
+        """
+        if request.method == "POST" and request.url.path == f"/v1/sessions/{child_id}/events":
+            posts.append(json.loads(request.content))
+            return httpx.Response(204)
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            cancel_output = json.loads(
+                await execute_tool(
+                    tool_name="sys_cancel_task",
+                    arguments=json.dumps({"task_id": child_id}),
+                    server_client=server_client,
+                    conversation_id=parent_id,
+                    session_async_tasks={},
+                )
+            )
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+
+    # The regression guard: a non-native child must route to interrupt, never
+    # ``stop_session``. ``data`` rides along for SessionEventInput compatibility
+    # with older servers.
+    assert posts == [{"type": "interrupt", "data": {}}]
+    # Not codex → generic (non-best-effort) pending result; the terminal
+    # status will arrive on the inbox once the interrupted turn ends.
+    assert cancel_output == {
+        "cancel_requested": True,
+        "cancel_confirmed": False,
+        "task_id": child_id,
+        "status": "launching",
+        "message": (
+            "Cancel requested; cancellation has not been confirmed yet. "
+            "Use sys_read_inbox to observe terminal status."
+        ),
+    }
+
+
+@pytest.mark.asyncio
+async def test_sys_cancel_task_rejects_foreign_tracked_entry() -> None:
+    """A tracked sub-agent can only be cancelled by its own Originating Chat.
+
+    docs/helpers.md: verify
+    ``sys_cancel_task`` refuses a cancel from a session that is not the
+    work entry's registered ``parent_session_id`` — the primary (non-evicted)
+    ownership guard, distinct from the eviction-recovery path covered by
+    ``test_sys_cancel_task_rejects_foreign_evicted_entry``.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import _cancel_subagent_task
+
+    child_id = "conv_child_tracked_foreign"
+    runner_app.register_subagent_work(
+        parent_session_id="conv_real_parent",
+        child_session_id=child_id,
+        agent="reviewer",
+        title="auth",
+    )
+    posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        posts.append(json.loads(request.content) if request.content else {})
+        return httpx.Response(204)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = await _cancel_subagent_task(
+                {"task_id": child_id},
+                conversation_id="conv_impostor_parent",
+                server_client=server_client,
+            )
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+
+    assert posts == [], "an unauthorized caller must never reach the child's event stream"
+    assert output == f"Error: no in-flight task with task_id {child_id}"
+
+
+class _CancelPane:
+    """Stand-in pane whose ``is_alive`` answer is fixed for the cancel matrix."""
+
+    def __init__(self, alive: bool) -> None:
+        self.alive = alive
+        self.probed = 0
+
+    async def is_alive(self) -> bool:
+        self.probed += 1
+        return self.alive
+
+
+class _CancelPaneRegistry:
+    """Registry that returns one pane for the expected native ``main`` slot."""
+
+    def __init__(self, pane: _CancelPane | None, terminal_name: str, task_id: str) -> None:
+        self.pane = pane
+        self.terminal_name = terminal_name
+        self.task_id = task_id
+
+    def get(
+        self, conversation_id: str, terminal_name: str, session_key: str
+    ) -> _CancelPane | None:
+        if (
+            conversation_id == self.task_id
+            and terminal_name == self.terminal_name
+            and session_key == "main"
+        ):
+            return self.pane
+        return None
+
+
+def _install_cancel_pane(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    wrapper_label: str,
+    task_id: str,
+    alive: bool | None,
+) -> _CancelPane | None:
+    """Install a fake terminal registry for one native child's ``main`` pane."""
+    from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
+
+    agent = native_coding_agent_for_wrapper_label(wrapper_label)
+    assert agent is not None, f"unknown wrapper {wrapper_label!r}"
+    pane = None if alive is None else _CancelPane(alive)
+    registry = _CancelPaneRegistry(pane, agent.terminal_name, task_id)
+
+    def _get_registry() -> _CancelPaneRegistry:
+        return registry
+
+    monkeypatch.setattr("omnigent.runtime.get_terminal_registry", _get_registry)
+    monkeypatch.setattr(
+        "omnigent.runner.tool_dispatch.get_terminal_registry",
+        _get_registry,
+        raising=False,
+    )
+    return pane
+
+
+async def _drive_cancel_matrix_row(
+    *,
+    parent_id: str,
+    child_id: str,
+    wrapper_label: str | None,
+    status: str,
+    http_status: int,
+    evicted: bool,
+    requesting_parent: str,
+) -> tuple[list[dict[str, Any]], Any]:
+    """Run ``_cancel_subagent_task`` for one matrix row and return posts + output."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import _cancel_subagent_task
+
+    if not evicted:
+        entry = runner_app.register_subagent_work(
+            parent_session_id=parent_id,
+            child_session_id=child_id,
+            agent="matrix_impl",
+            title="native",
+            wrapper_label=wrapper_label,
+        )
+        entry.status = status
+    posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{child_id}":
+            return httpx.Response(
+                200,
+                json={
+                    "id": child_id,
+                    "parent_session_id": parent_id,
+                    "labels": {"omnigent.wrapper": wrapper_label},
+                },
+            )
+        body = json.loads(request.content)
+        posts.append(body)
+        if http_status == 503:
+            return httpx.Response(503, json={"error": "native_stop_failed"})
+        if not evicted and body.get("type") == "stop_session":
+            updated = runner_app.get_subagent_work(child_id)
+            if updated is not None:
+                updated.status = "cancelled"
+        return httpx.Response(http_status)
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            raw = await _cancel_subagent_task(
+                {"task_id": child_id},
+                conversation_id=requesting_parent,
+                server_client=server_client,
+            )
+    finally:
+        if not evicted:
+            runner_app.unregister_subagent_work(child_id)
+
+    try:
+        output: Any = json.loads(raw)
+    except json.JSONDecodeError:
+        output = raw
+    return posts, output
+
+
+def _assert_unconfirmed_hard_stop(output: Any, *, task_id: str) -> None:
+    """A 503 hard-stop must not look like a cached terminal / absent result."""
+    assert isinstance(output, dict), f"expected JSON unconfirmed result, got {output!r}"
+    assert output.get("cancelled") is False
+    assert output.get("cancel_requested") is True
+    assert output.get("cancel_confirmed") is False
+    assert output.get("best_effort") is True
+    assert output.get("task_id") == task_id
+    assert output.get("status") not in {"absent", "cancelled"}
+    # Old masking collapsed 503 into these 3-key terminal shapes.
+    assert output != {"cancelled": False, "task_id": task_id, "status": "failed"}
+    assert output != {"cancelled": False, "task_id": task_id, "status": "absent"}
+    message = str(output.get("message", "")).lower()
+    assert "may still be running" in message
+    assert "not confirmed" in message
+
+
+def test_session_status_to_task_status_maps_known_values() -> None:
+    """
+    ``_session_status_to_task_status`` maps a session.status value to the
+    child-summary ``current_task_status`` (different vocabularies), and
+    returns None for unknown values so the caller omits the field.
+    """
+    from omnigent.runner.app import _session_status_to_task_status
+
+    assert _session_status_to_task_status("launching") == "launching"
+    assert _session_status_to_task_status("running") == "in_progress"
+    assert _session_status_to_task_status("waiting") == "in_progress"
+    assert _session_status_to_task_status("idle") == "completed"
+    assert _session_status_to_task_status("failed") == "failed"
+    assert _session_status_to_task_status("bogus") is None
+
+
+def test_truncate_child_preview_caps_with_ellipsis() -> None:
+    """
+    ``_truncate_child_preview`` returns short text unchanged and truncates
+    text past the cap to exactly the cap + a single ellipsis char (so the
+    child rail preview matches the server-side truncation).
+    """
+    from omnigent.runner.app import _CHILD_PREVIEW_MAX_CHARS, _truncate_child_preview
+
+    assert _truncate_child_preview("hello world") == "hello world"
+
+    long_text = "x" * (_CHILD_PREVIEW_MAX_CHARS + 50)
+    out = _truncate_child_preview(long_text)
+    assert out.endswith("…")
+    assert len(out) == _CHILD_PREVIEW_MAX_CHARS + 1
+
+
+def test_register_unregister_child_session_roundtrip() -> None:
+    """
+    ``register_child_session`` stores the parent fan-out metadata and
+    ``unregister_child_session`` drops it (used to mirror a child's
+    status/preview deltas onto the parent stream).
+    """
+    from omnigent.runner.app import (
+        _child_session_parents,
+        register_child_session,
+        unregister_child_session,
+    )
+
+    child_id = "conv_child_roundtrip_unique"
+    register_child_session(
+        child_id,
+        parent_session_id="conv_parent_roundtrip_unique",
+        title="reviewer:auth",
+        tool="reviewer",
+        session_name="auth",
+    )
+    meta = _child_session_parents.get(child_id)
+    assert meta is not None
+    assert meta.parent_id == "conv_parent_roundtrip_unique"
+    assert meta.title == "reviewer:auth"
+    assert meta.last_busy is None
+
+    unregister_child_session(child_id)
+    assert _child_session_parents.get(child_id) is None
+
+
+# ── sys_session_get_history / _list / _close runner dispatch ────────
+#
+# These verify the runner-local handler that makes get_history/list/close
+# work for harness agents (claude-sdk/pi), whose
+# Omnigent tool calls surface as action_required and route through
+# the runner — NOT the in-process inner Session. Confirmed empirically:
+# without this dispatch the runner returns "not in local dispatch
+# table"; with it, a live harness agent reads a sibling's items. The
+# handler calls the Omnigent server's existing REST endpoints, so tests use a
+# real httpx.AsyncClient backed by MockTransport (not a MagicMock) — the
+# code exercises the same request/response objects it sees in production.
+
+
+def _session_query_client(
+    handler: Callable[[httpx.Request], httpx.Response],
+) -> httpx.AsyncClient:
+    """
+    Build an AsyncClient whose requests are answered by ``handler``.
+
+    :param handler: Maps an ``httpx.Request`` to a canned
+        ``httpx.Response`` (routes by method + path).
+    :returns: An ``httpx.AsyncClient`` pointed at a fake Omnigent server.
+    """
+    return httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://server",
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_peek_returns_chronological_projected_items() -> None:
+    """
+    ``sys_session_get_history`` reads ``GET /items`` (newest-first), reverses to
+    chronological, projects each item, and labels with the target's
+    parsed agent/title from its snapshot — matching ``SysSessionGetHistoryTool``.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target/items":
+            assert request.url.params["order"] == "desc"
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "i2",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "found it"}],
+                        },
+                        {
+                            "id": "i1",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "where is the bug"}],
+                        },
+                    ],
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "title": "reviewer:auth"})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps({"conversation_id": "conv_target", "tail_items": 5}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert out["conversation_id"] == "conv_target"
+    assert out["agent"] == "reviewer"
+    assert out["title"] == "auth"
+    # Reversed to chronological (user ask first), and message text is
+    # extracted from the content blocks — proves the projection ran.
+    assert [(i["role"], i["text"]) for i in out["items"]] == [
+        ("user", "where is the bug"),
+        ("assistant", "found it"),
+    ]
+
+
+_REST_HISTORY_CONTENT_SCENARIOS = [
+    pytest.param(3000, 4000, "R" * 3000, id="raised-limit"),
+    pytest.param(3000, None, "R" * 2000 + " [truncated]", id="default-limit"),
+    # An explicit limit recovers one long item in full (a sub-agent
+    # handoff longer than the inbox delivery cap stays reachable).
+    pytest.param(13000, 50000, "R" * 13000, id="explicit-limit-recovers-long-item"),
+    # The total prompt budget still bounds a single read.
+    pytest.param(100050, 200000, "R" * 100000 + " [truncated]", id="budget-ceiling"),
+    # No REST request is expected because validation rejects before the GET.
+    pytest.param(None, 0, "content_max_chars must be >= 1", id="non-positive"),
+]
+
+
+@pytest.mark.parametrize(
+    ("content_length", "content_max_chars", "expected"),
+    _REST_HISTORY_CONTENT_SCENARIOS,
+)
+@pytest.mark.asyncio
+async def test_session_peek_rest_content_limit_scenario(
+    content_length: int | None,
+    content_max_chars: int | None,
+    expected: str,
+) -> None:
+    """Apply one history content-limit scenario through runner REST dispatch."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    content = "R" * content_length if content_length is not None else None
+    arguments: dict[str, object] = {"conversation_id": "conv_target"}
+    if content is not None:
+        arguments["tail_items"] = 1
+    if content_max_chars is not None:
+        arguments["content_max_chars"] = content_max_chars
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if content is None:
+            pytest.fail("REST request should not run for rejected arguments")
+        if request.url.path == "/v1/sessions/conv_target/items":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "i1",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": content}],
+                        }
+                    ],
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "title": "reviewer:auth"})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        payload = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps(arguments),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    if "error" in payload:
+        actual = payload["error"]
+    else:
+        assert payload["title"] == "auth"
+        actual = payload["items"][0]["text"]
+    assert actual == expected
+
+
+@pytest.mark.asyncio
+async def test_session_peek_rest_offset_pages_through_long_item() -> None:
+    """
+    ``content_offset_chars`` pages through one long item on the REST path.
+
+    Stepping the offset by the window size reconstructs a content field
+    longer than one window, so a long sub-agent handoff stays reachable
+    from a runner-bound parent.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    text = "BEGIN|" + ("0123456789" * 2000) + "|END"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target/items":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "i1",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}],
+                        }
+                    ],
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "title": "reviewer:auth"})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    window = 12000
+    windows: list[str] = []
+    async with _session_query_client(handler) as client:
+        for offset in (0, window):
+            payload = json.loads(
+                await _execute_session_query_tool(
+                    "sys_session_get_history",
+                    json.dumps(
+                        {
+                            "conversation_id": "conv_target",
+                            "tail_items": 1,
+                            "content_max_chars": window,
+                            "content_offset_chars": offset,
+                        }
+                    ),
+                    conversation_id="conv_caller",
+                    server_client=client,
+                )
+            )
+            windows.append(payload["items"][0]["text"])
+
+    assert windows[0] == text[:window] + " [truncated]"
+    # The second window reaches the true end: no marker, tail present.
+    assert windows[1] == text[window:]
+    assert windows[0].removesuffix(" [truncated]") + windows[1] == text
+
+
+@pytest.mark.asyncio
+async def test_session_peek_rest_rejects_invalid_offset() -> None:
+    """An invalid offset is rejected before any REST request is made."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("REST request should not run for rejected arguments")
+
+    async with _session_query_client(handler) as client:
+        payload = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps({"conversation_id": "conv_target", "content_offset_chars": -1}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert payload["error"] == "content_offset_chars must be >= 0"
+
+
+@pytest.mark.asyncio
+async def test_session_peek_appends_pending_elicitation_from_snapshot() -> None:
+    """
+    ``sys_session_get_history`` appends the target's parked elicitations (read
+    off its snapshot) after the stored items.
+
+    A parked elicitation never lands in the conversation store, so the
+    ``/items`` response ends at the last message. The snapshot's
+    ``pending_elicitations`` block is the only place the prompt lives;
+    get_history must read it and project a ``pending_elicitation`` item so the
+    parent agent isn't blind to a sub-agent awaiting input.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target/items":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "i1",
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "ask me 3 questions"}],
+                        },
+                    ],
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_target",
+                    "title": "reviewer:auth",
+                    "pending_elicitations": [
+                        {
+                            "type": "response.elicitation_request",
+                            "elicitation_id": "elicit_bio",
+                            "params": {
+                                "mode": "form",
+                                "message": "Answer 3 questions on human biology",
+                                "requestedSchema": {"properties": {"q1": {}, "q2": {}}},
+                            },
+                        }
+                    ],
+                },
+            )
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps({"conversation_id": "conv_target", "tail_items": 5}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    items = out["items"]
+    # 2 = 1 stored message + 1 synthesized pending elicitation. If 1,
+    # the snapshot's pending_elicitations weren't read/appended and the
+    # parent stays blind to the prompt.
+    assert len(items) == 2
+    # Stored item first (chronological), elicitation appended last.
+    assert items[0]["type"] == "message"
+    elicit = items[-1]
+    assert elicit["type"] == "pending_elicitation"
+    assert elicit["elicitation_id"] == "elicit_bio"
+    # Prompt + fields prove the snapshot payload reached the projector.
+    assert elicit["prompt"] == "Answer 3 questions on human biology"
+    assert elicit["fields"] == ["q1", "q2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status,expected_error",
+    [(404, "session_not_found"), (403, "session_out_of_tree")],
+)
+async def test_session_peek_maps_access_errors(status: int, expected_error: str) -> None:
+    """A 404/403 from ``GET /items`` maps to the in-process tool's typed errors."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"error": "x"})
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps({"conversation_id": "conv_other"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert out["error"] == expected_error
+    assert out["conversation_id"] == "conv_other"
+
+
+@pytest.mark.asyncio
+async def test_session_close_patches_tombstoned_title() -> None:
+    """
+    ``sys_session_close`` PATCHes a closed label and internal tombstone.
+
+    The title tombstone frees the DB unique slot so future
+    ``sys_session_send`` of the same ``(agent, title)`` creates a
+    fresh child. The ``omnigent.closed=true`` label is the
+    behavioral marker that direct write paths and clients consume.
+
+    The caller (``conv_caller``) and target (``conv_target``) share the
+    same ``root_conversation_id`` and the target is a sub-agent, so the
+    tree-scope gate passes and the PATCH is issued.
+    """
+    # _execute_session_query_tool is the runner's REST dispatch entry
+    # point for session-query tools — called directly here because these
+    # tests validate the REST path's tree-scoping (_session_close_via_rest)
+    # specifically, distinct from the in-process path covered in
+    # tests/tools/builtins/test_sys_session.py.
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    patched: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_target",
+                    "title": "reviewer:auth",
+                    "root_conversation_id": "conv_root",
+                    "parent_session_id": "conv_caller",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(
+                200,
+                json={"id": "conv_caller", "root_conversation_id": "conv_root"},
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_target":
+            patched.update(json.loads(request.content))
+            return httpx.Response(200, json={"id": "conv_target"})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_close",
+                json.dumps({"conversation_id": "conv_target"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    # Tombstone embeds the conv id so repeated closes stay unique, and
+    # the explicit label makes the closed state observable without
+    # exposing the suffix as UI text.
+    assert patched["title"] == "reviewer:auth:closed:conv_target"
+    assert patched["labels"] == {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
+    assert out == {
+        "closed": True,
+        "conversation_id": "conv_target",
+        "agent": "reviewer",
+        "title": "auth",
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_close_rejects_out_of_tree_target_without_patch() -> None:
+    """
+    ``sys_session_close`` refuses a target in a different spawn tree and
+    issues NO PATCH.
+
+    Close is a write: the REST path must enforce the same tree-scoping as
+    the in-process path. Here the target's ``root_conversation_id``
+    (``conv_other_root``) differs from the caller's (``conv_root``), so
+    the tool returns ``session_out_of_tree`` and the tombstone PATCH is
+    never sent — proving the target's title is left intact. Without the
+    gate, edit access alone would let an agent close a sub-agent in one
+    of its other, unrelated trees.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    patched = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal patched
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_target",
+                    "title": "reviewer:auth",
+                    "root_conversation_id": "conv_other_root",
+                    "parent_session_id": "conv_other_parent",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(
+                200,
+                json={"id": "conv_caller", "root_conversation_id": "conv_root"},
+            )
+        if request.method == "PATCH":
+            patched = True
+            return httpx.Response(200, json={"id": "conv_target"})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_close",
+                json.dumps({"conversation_id": "conv_target"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert out == {"error": "session_out_of_tree", "conversation_id": "conv_target"}
+    # The tombstone write must never have been issued.
+    assert patched is False
+
+
+@pytest.mark.asyncio
+async def test_session_close_rejects_top_level_target() -> None:
+    """
+    ``sys_session_close`` refuses a top-level session (no parent) even
+    when it shares the caller's root, and issues no PATCH.
+
+    A top-level session in the caller's own tree (its root) has no
+    ``parent_session_id``; close only operates on sub-agents, so the
+    tool returns ``session_not_a_sub_agent``.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    patched = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal patched
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_root":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_root",
+                    "title": "some top-level title",
+                    "root_conversation_id": "conv_root",
+                    "parent_session_id": None,
+                },
+            )
+        if request.method == "PATCH":
+            patched = True
+            return httpx.Response(200, json={"id": "conv_root"})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_close",
+                json.dumps({"conversation_id": "conv_root"}),
+                # Caller IS conv_root, so its self-snapshot is the same row.
+                conversation_id="conv_root",
+                server_client=client,
+            )
+        )
+    assert out == {"error": "session_not_a_sub_agent", "conversation_id": "conv_root"}
+    assert patched is False
+
+
+def test_agent_tools_are_runner_local() -> None:
+    """
+    ``sys_agent_get`` / ``sys_agent_download`` dispatch locally in the
+    runner. If this regresses, native harnesses calling them fall
+    through to spec-callable resolution and the orchestrator can't
+    inspect or fork agents.
+    """
+    from omnigent.runner.tool_dispatch import should_dispatch_locally
+
+    assert should_dispatch_locally("sys_agent_get") is True
+    assert should_dispatch_locally("sys_agent_download") is True
+    assert should_dispatch_locally("sys_agent_list") is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        pytest.param("sys_agent_get", id="get"),
+        pytest.param("sys_agent_download", id="download"),
+    ],
+)
+async def test_agent_tools_map_404_to_agent_not_found(
+    tool_name: str,
+    tmp_path: Path,
+) -> None:
+    """
+    Both agent tools map a 404 to ``agent_not_found`` — the orchestrator
+    gets a typed reason instead of a raw status. If the mapping
+    regressed, it couldn't tell "no such agent/session" from a transport
+    error.
+
+    :param tool_name: The agent tool under test.
+    :param tmp_path: Workspace dir (only the download path needs it).
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "missing"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name=tool_name,
+            arguments=json.dumps({"session_id": "conv_missing"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "agent_not_found"
+    assert info["session_id"] == "conv_missing"
+
+
+def test_session_create_is_runner_local() -> None:
+    """
+    ``sys_session_create`` dispatches locally in the runner. If it
+    regresses out of the local table, a native harness calling it falls
+    through to spec-callable resolution and the orchestrator can't spawn
+    child sessions.
+    """
+    from omnigent.runner.tool_dispatch import should_dispatch_locally
+
+    assert should_dispatch_locally("sys_session_create") is True
+
+
+@pytest.mark.asyncio
+async def test_session_list_global_sessions_filter_and_connectivity() -> None:
+    """
+    The global ``sessions`` view fetches GET /v1/sessions (forwarding the
+    ``agent_name`` filter), projects each row, and annotates
+    ``runner_online`` by checking each UNIQUE runner once. Proves: the
+    agent_name filter reaches the server; sessions are projected with
+    status + parentage; and connectivity is folded in without a
+    per-session status fan-out (two sessions share runner r1 → exactly
+    one /v1/runners/r1/status call).
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    runner_status_calls: list[str] = []
+    sessions_params: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/v1/sessions/conv_x/child_sessions":
+            return httpx.Response(200, json={"object": "list", "data": []})
+        if path == "/v1/sessions/conv_x":
+            return httpx.Response(200, json={"id": "conv_x", "parent_session_id": None})
+        if path == "/v1/sessions":
+            sessions_params.update(dict(request.url.params))
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "s1",
+                            "agent_name": "reviewer",
+                            "title": "auth",
+                            "status": "running",
+                            "runner_id": "r1",
+                            "parent_session_id": None,
+                        },
+                        {
+                            "id": "s2",
+                            "agent_name": "reviewer",
+                            "title": "payments",
+                            "status": "idle",
+                            "runner_id": "r1",
+                            "parent_session_id": None,
+                        },
+                    ],
+                },
+            )
+        if path == "/v1/runners/r1/status":
+            runner_status_calls.append("r1")
+            return httpx.Response(200, json={"runner_id": "r1", "online": True})
+        raise AssertionError(f"unexpected path {path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_list",
+                json.dumps({"agent_name": "reviewer"}),
+                conversation_id="conv_x",
+                server_client=client,
+            )
+        )
+
+    # agent_name forwarded to the server-side filter.
+    assert sessions_params.get("agent_name") == "reviewer"
+    assert sessions_params.get("visibility") == "all"
+    # Both sessions projected with status + connectivity from the single
+    # shared-runner status lookup.
+    assert out["sessions"] == [
+        {
+            "session_id": "s1",
+            "agent_name": "reviewer",
+            "title": "auth",
+            "status": "running",
+            "runner_id": "r1",
+            "runner_online": True,
+            "parent_session_id": None,
+        },
+        {
+            "session_id": "s2",
+            "agent_name": "reviewer",
+            "title": "payments",
+            "status": "idle",
+            "runner_id": "r1",
+            "runner_online": True,
+            "parent_session_id": None,
+        },
+    ]
+    # Connectivity resolved once per UNIQUE runner — two sessions share
+    # r1, so exactly one status call (not one per session). A count of 2
+    # would mean the dedup regressed into a per-session fan-out.
+    assert runner_status_calls == ["r1"]
+
+
+@pytest.mark.asyncio
+async def test_sys_agent_download_rejects_path_in_dest_filename(tmp_path: Path) -> None:
+    """
+    ``sys_agent_download`` rejects a ``dest_filename`` containing a path
+    separator (a traversal attempt) and writes nothing. If the guard
+    regressed, a bundle could be written outside the working directory.
+
+    :param tmp_path: Pytest temp dir used as the runner workspace.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b"data",
+            headers={"X-Agent-Name": "a", "X-Agent-Version": "1"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_agent_download",
+            arguments=json.dumps({"session_id": "conv_x", "dest_filename": "../escape.tar.gz"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    info = json.loads(output)
+    assert "error" in info
+    # Nothing was written anywhere under the workspace.
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_sys_agent_download_rejects_symlink_escape_from_cwd(tmp_path: Path) -> None:
+    """
+    ``sys_agent_download`` refuses to follow a symlink that redirects the
+    bundle write outside the os_env cwd. ``dest_filename`` is a bare name,
+    but if the cwd already holds a symlink of that name pointing elsewhere,
+    a naive ``write_bytes`` would clobber the symlink target outside the
+    sandbox. The realpath-containment guard must catch it and
+    write nothing to the outside target.
+
+    :param tmp_path: Pytest temp dir; holds both the workspace and an
+        outside directory the symlink points at.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_target = outside / "stolen.tar.gz"
+    # A symlink inside the workspace whose name matches the caller's
+    # dest_filename but whose target escapes the workspace.
+    (workspace / "escape.tar.gz").symlink_to(outside_target)
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b"payload",
+            headers={"X-Agent-Name": "a", "X-Agent-Version": "1"},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_agent_download",
+            arguments=json.dumps({"session_id": "conv_x", "dest_filename": "escape.tar.gz"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=workspace,
+        )
+
+    info = json.loads(output)
+    assert "error" in info
+    # The outside target was never created — the guard blocked the write.
+    assert not outside_target.exists()
+
+
+@pytest.mark.asyncio
+async def test_sys_agent_download_writes_bundle_to_workspace(tmp_path: Path) -> None:
+    """
+    ``sys_agent_download`` writes the fetched ``.tar.gz`` bytes into the
+    agent's os_env cwd (here ``runner_workspace`` = tmp_path) and returns
+    the path. Proves the full path: fetch bytes, derive the default
+    filename from the X-Agent-* headers, and persist to the agent-visible
+    disk. If the write regressed, the file wouldn't exist or the bytes
+    wouldn't match.
+
+    :param tmp_path: Pytest temp dir used as the runner workspace, so the
+        resolved os_env cwd is a real local directory.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    bundle_bytes = b"\x1f\x8b\x08fake-tar-gz-bytes"
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_x/agent/contents":
+            return httpx.Response(
+                200,
+                content=bundle_bytes,
+                headers={"X-Agent-Name": "my agent", "X-Agent-Version": "5"},
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_agent_download",
+            arguments=json.dumps({"session_id": "conv_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    info = json.loads(output)
+    # Default filename: agent name sanitized (space → "_") + version.
+    expected = tmp_path / "my_agent-v5.tar.gz"
+    assert info["path"] == str(expected)
+    assert info["bytes_written"] == len(bundle_bytes)
+    # The bundle actually landed on disk with the exact bytes — a
+    # mismatch means the write path or byte handling broke.
+    assert expected.read_bytes() == bundle_bytes
+
+
+@pytest.mark.asyncio
+async def test_sys_agent_get_projects_agent_metadata() -> None:
+    """
+    ``sys_agent_get`` projects ``GET /v1/sessions/{id}/agent`` into the
+    orchestrator-facing fields: agent_id, name, version, description,
+    harness, MCP server summaries, and policy summaries. If the
+    projection dropped a field or used the wrong key, the asserted
+    values would differ.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_x/agent":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "ag_777",
+                    "object": "agent",
+                    "name": "reviewer",
+                    "version": 4,
+                    "description": "Finds things",
+                    "created_at": 1,
+                    "harness": "claude-sdk",
+                    "mcp_servers": [{"name": "fs", "transport": "stdio", "args": []}],
+                    "policies": [{"name": "guard", "type": "label", "on": ["input"]}],
+                },
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_agent_get",
+            arguments=json.dumps({"session_id": "conv_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    # agent_id comes from AgentObject.id (not a top-level "agent_id").
+    assert info["agent_id"] == "ag_777"
+    assert info["name"] == "reviewer"
+    assert info["version"] == 4
+    assert info["harness"] == "claude-sdk"
+    # MCP/policy summaries pass through as-is so the orchestrator sees
+    # the agent's tool/guardrail surface.
+    assert info["mcp_servers"] == [{"name": "fs", "transport": "stdio", "args": []}]
+    assert info["policies"] == [{"name": "guard", "type": "label", "on": ["input"]}]
+
+
+@pytest.mark.asyncio
+async def test_sys_agent_list_degrades_when_sources_fail(tmp_path: Path) -> None:
+    """
+    A failing source degrades to an empty, retryable section rather than
+    failing the whole call or claiming that the source is exhausted. Here
+    the server 500s both list endpoints and no local config dir exists.
+
+    :param tmp_path: Workspace dir with no agent-config subdir.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "boom"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_agent_list",
+            arguments="{}",
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    info = json.loads(output)
+    assert info["builtins"] == []
+    assert info["session_agents"] == []
+    assert info["local_configs"] == []
+    assert info["page"]["has_more"] == {
+        "builtins": True,
+        "session_agents": True,
+        "local_configs": False,
+    }
+    assert isinstance(info["page"]["next_cursor"], str)
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_maps_agent_not_found() -> None:
+    """
+    A 404 from the create maps to ``agent_not_found`` so the LLM gets a
+    typed reason rather than a raw status. If the mapping regressed, the
+    orchestrator couldn't tell a bad agent_id from a transport failure.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "no agent"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_missing"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "agent_not_found"
+    assert info["agent_id"] == "ag_missing"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_spawns_child_under_caller() -> None:
+    """
+    ``sys_session_create`` POSTs a JSON create with
+    ``parent_session_id`` forced to the caller (child-only), passes the
+    agent_id, title, and a queued initial message, and returns a handle
+    carrying the new child's id. If parent_session_id weren't forced to
+    the caller, an orchestrator could create top-level/sibling sessions —
+    so the asserted request body is the security-critical check.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    captured: dict[str, Any] = {}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                201,
+                json={
+                    "id": "conv_child",
+                    "agent_id": "ag_x",
+                    "agent_name": "reviewer",
+                    "status": "idle",
+                },
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "title": "auth", "message": "start"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    # Child-only: parent forced to the caller; agent + title + queued
+    # message threaded through to the create body.
+    assert captured["parent_session_id"] == "conv_caller"
+    assert captured["agent_id"] == "ag_x"
+    assert captured["title"] == "auth"
+    assert captured["initial_items"][0]["data"]["content"][0]["text"] == "start"
+    handle = json.loads(output)
+    assert handle["conversation_id"] == "conv_child"
+    assert handle["agent_id"] == "ag_x"
+    assert handle["agent_name"] == "reviewer"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_rejects_non_string_model() -> None:
+    """A non-string 'model' must fail loud with a clear error, same as
+    sys_session_send — silently coercing it to None would let it skip the
+    superside-chat override refusal while the raw value still reached the
+    create body."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"server should never be called: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "model": 123}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert "invalid 'model'" in info["error"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_rejects_non_string_reasoning_effort() -> None:
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"server should never be called: {request.method} {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "reasoning_effort": {"bad": True}}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert "invalid 'reasoning_effort'" in info["error"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_forwards_superside_chat_mode_to_child() -> None:
+    """
+    A superside-chat caller's ``sys_session_create`` stamps
+    ``omnigent.context.mode=superside-chat`` on the child's create body —
+    a fork inherits the mode by the store copying labels wholesale, but a
+    sub-agent create sends a fresh body, so the mode must be forwarded
+    explicitly (see ``inheritable_context_labels``).
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    captured: dict[str, Any] = {}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"kind": "default"})
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_caller/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                201, json={"id": "conv_child", "agent_id": "ag_x", "agent_name": "reviewer"}
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            labels={
+                "omnigent.context.mode": "superside-chat",
+                "omnigent.ui": "terminal",  # not inheritable — must not ride along
+            },
+        )
+
+    assert captured["labels"] == {"omnigent.context.mode": "superside-chat"}
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_omits_labels_without_context_mode() -> None:
+    """A caller with no context-mode label (the default) sends no ``labels``
+    key at all — byte-for-byte the pre-existing body shape."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    captured: dict[str, Any] = {}
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured.update(json.loads(request.content))
+            return httpx.Response(
+                201, json={"id": "conv_child", "agent_id": "ag_x", "agent_name": "reviewer"}
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert "labels" not in captured
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "override_args",
+    [
+        {"agent_id": "ag_x", "model": "databricks-claude-sonnet-4-6"},
+        {"agent_id": "ag_x", "reasoning_effort": "high"},
+    ],
+    ids=["model", "reasoning_effort"],
+)
+async def test_sys_session_create_superside_chat_refuses_dispatch_override(
+    override_args: dict[str, Any],
+) -> None:
+    """``sys_session_create`` is the OTHER spawn path (besides
+    ``sys_session_send``) that must refuse a model/reasoning_effort
+    override in superside-chat sessions — same rule, same helper."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    create_posts: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_posts.append(str(request.url))
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(override_args),
+            server_client=server_client,
+            conversation_id="conv_create_override",
+            labels=_SUPERSIDE_CHAT_LABELS,
+        )
+
+    error = json.loads(output)["error"]
+    assert "not allowed in superside-chat" in error
+    assert not create_posts
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_superside_chat_nesting_cap_refuses() -> None:
+    """A coordinator's child cannot ``sys_session_create`` any further either."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    create_posts: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_create_nested":
+            return httpx.Response(
+                200, json={"kind": "sub_agent", "parent_session_id": "conv_create_coordinator"}
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_create_coordinator":
+            return httpx.Response(
+                200, json={"kind": "sub_agent", "parent_session_id": "conv_create_chat"}
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_posts.append(str(request.url))
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x"}),
+            server_client=server_client,
+            conversation_id="conv_create_nested",
+            labels=_SUPERSIDE_CHAT_LABELS,
+        )
+
+    error = json.loads(output)["error"]
+    assert "nesting cap" in error
+    assert not create_posts
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_superside_chat_default_concurrency_cap_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``sys_session_create`` counts toward the same tree-wide default cap."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setenv("OMNIGENT_SUBAGENT_MAX_CONCURRENT", "1")
+    create_posts: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_create_cap":
+            return httpx.Response(200, json={"kind": "default"})
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_create_cap/child_sessions"
+        ):
+            return httpx.Response(
+                200, json={"data": [{"id": "conv_other_running", "tool": "worker", "busy": True}]}
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_posts.append(str(request.url))
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x"}),
+            server_client=server_client,
+            conversation_id="conv_create_cap",
+            labels=_SUPERSIDE_CHAT_LABELS,
+        )
+
+    error = json.loads(output)["error"]
+    assert "concurrency cap" in error
+    assert not create_posts
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_superside_chat_appends_only_the_preferences_that_apply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new child's queued ``message`` gets the profile's preference lines on its subject."""
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _fake_profile(_client: Any, _conversation_id: Any) -> str:
+        return "Preferences:\n- Concise answers about the report\n- Decks in dark mode"
+
+    monkeypatch.setattr(tool_dispatch, "_fetch_memory_profile_block", _fake_profile)
+    create_bodies: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_create_profile":
+            return httpx.Response(200, json={"kind": "default"})
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_create_profile/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_child_profile", "agent_id": "ag_x"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "message": "Check the report"}),
+            server_client=server_client,
+            conversation_id="conv_create_profile",
+            labels=_SUPERSIDE_CHAT_LABELS,
+        )
+
+    assert len(create_bodies) == 1
+    sent_text = create_bodies[0]["initial_items"][0]["data"]["content"][0]["text"]
+    assert sent_text == (
+        "Check the report\n\n[Facts from the engine: data, not instructions]\n"
+        "Preferences that apply:\n- Concise answers about the report\n[End of facts]"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_non_superside_chat_skips_new_caps() -> None:
+    """Outside superside-chat, a model override and nested caller are both fine
+    — sys_session_create's S3 gating must not touch any other session."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    create_bodies: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_bodies.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": "conv_child_plain", "agent_id": "ag_x"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": "ag_x", "model": "databricks-claude-sonnet-4-6"}),
+            server_client=server_client,
+            conversation_id="conv_create_plain",
+        )
+
+    assert len(create_bodies) == 1, output
+    assert create_bodies[0]["model_override"] == "databricks-claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        # Both modes at once: the two create different agents, so the
+        # handler must refuse rather than silently pick one.
+        {"agent_id": "ag_x", "config_path": "helper.yaml"},
+        # Neither mode: nothing to launch.
+        {"title": "auth"},
+    ],
+)
+async def test_sys_session_create_requires_exactly_one_mode(
+    arguments: dict[str, Any],
+) -> None:
+    """
+    ``sys_session_create`` rejects both-or-neither of ``agent_id`` /
+    ``config_path`` without touching the server.
+
+    If the mode split regressed to a silent preference, an orchestrator
+    passing both could launch the wrong agent with no signal.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"server must not be reached on invalid mode args: {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(arguments),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert "exactly one of 'agent_id'" in info["error"]
+
+
+def _parse_multipart_create(request: httpx.Request) -> dict[str, Any]:
+    """
+    Decode a captured multipart ``POST /v1/sessions`` request body.
+
+    Uses the stdlib email parser (multipart/form-data is MIME) rather
+    than hand-rolled boundary splitting.
+
+    :param request: The captured httpx request.
+    :returns: Dict with ``metadata`` (parsed JSON dict) and ``bundle``
+        (raw bytes of the uploaded file part).
+    """
+    import email
+    import email.policy
+
+    header = f"Content-Type: {request.headers['content-type']}\r\n\r\n".encode()
+    message = email.message_from_bytes(header + request.content, policy=email.policy.HTTP)
+    parts: dict[str, Any] = {}
+    for part in message.iter_parts():  # type: ignore[attr-defined]
+        disposition = part.get("Content-Disposition", "")
+        payload = part.get_payload(decode=True)
+        if 'name="metadata"' in disposition:
+            parts["metadata"] = json.loads(payload.decode())
+        elif 'name="bundle"' in disposition:
+            parts["bundle"] = payload
+    return parts
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
+    tmp_path: Path,
+) -> None:
+    """
+    Bundle mode bundles a local agent config, POSTs the multipart
+    create with ``parent_session_id`` forced to the caller, queues the
+    optional message as the child's first event, and returns a handle
+    built from the server's created-agent identifiers.
+
+    The asserted multipart metadata is the security-critical check
+    (child-only, mirroring agent_id mode); the tarball content check
+    proves the local config actually traversed bundling — an empty
+    bundle would create a session the server rejects at first turn.
+    """
+    import io
+    import tarfile
+
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    config_text = "name: helper\nprompt: do helpful things\n"
+    (tmp_path / "helper.yaml").write_text(config_text)
+
+    create_requests: list[httpx.Request] = []
+    event_bodies: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_requests.append(request)
+            return httpx.Response(
+                201,
+                json={
+                    "session_id": "conv_child",
+                    "agent_id": "ag_new",
+                    "agent_name": "helper",
+                },
+            )
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
+            event_bodies.append(json.loads(request.content))
+            return httpx.Response(200, json={})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {"config_path": "helper.yaml", "title": "auth", "message": "start"}
+            ),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    # Exactly one multipart create; parent forced to the caller
+    # (child-only) and the title threaded into the metadata part.
+    assert len(create_requests) == 1, (
+        f"expected exactly one create POST, got {len(create_requests)}"
+    )
+    parts = _parse_multipart_create(create_requests[0])
+    assert parts["metadata"] == {"parent_session_id": "conv_caller", "title": "auth"}
+
+    # The uploaded bundle is a gzipped tar holding the authored config
+    # verbatim — proves the local file traversed materialize → tar.
+    with tarfile.open(fileobj=io.BytesIO(parts["bundle"]), mode="r:gz") as tf:
+        names = tf.getnames()
+        assert names == ["helper.yaml"]
+        member = tf.extractfile("helper.yaml")
+        assert member is not None
+        assert member.read().decode() == config_text
+
+    # The optional message was queued as the child's first user event —
+    # this is what starts the child's turn (same pattern as named send).
+    assert len(event_bodies) == 1
+    assert event_bodies[0]["data"]["content"][0]["text"] == "start"
+
+    handle = json.loads(output)
+    assert handle["conversation_id"] == "conv_child"
+    # agent_id/agent_name come from the server's CreatedSessionResponse,
+    # not the caller's args — the orchestrator needs the NEW agent's id.
+    assert handle["agent_id"] == "ag_new"
+    assert handle["agent_name"] == "helper"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_bundle_mode_forwards_superside_chat_mode(
+    tmp_path: Path,
+) -> None:
+    """The bundle-mode (``config_path``) create forwards the mode label
+    through the multipart ``metadata`` part too, same as agent_id mode."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    (tmp_path / "helper.yaml").write_text("name: helper\nprompt: do helpful things\n")
+    create_requests: list[httpx.Request] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"kind": "default"})
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_caller/child_sessions"
+        ):
+            return httpx.Response(200, json={"data": []})
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            create_requests.append(request)
+            return httpx.Response(201, json={"session_id": "conv_child", "agent_id": "ag_new"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "helper.yaml"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+            labels={"omnigent.context.mode": "superside-chat"},
+        )
+
+    parts = _parse_multipart_create(create_requests[0])
+    assert parts["metadata"]["labels"] == {"omnigent.context.mode": "superside-chat"}
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_config_path_escape_rejected(
+    tmp_path: Path,
+) -> None:
+    """
+    A ``config_path`` resolving outside the working directory is
+    refused before any disk read or server call.
+
+    This mirrors the sys_agent_download containment guard:
+    without it, an orchestrator could exfiltrate arbitrary host files
+    by bundling them into an uploaded agent.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    (tmp_path / "outside.yaml").write_text("name: outside\n")
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"server must not be reached on escape: {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "../outside.yaml"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=workdir,
+        )
+
+    info = json.loads(output)
+    assert "escapes the working directory" in info["error"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_config_not_found(tmp_path: Path) -> None:
+    """
+    A missing ``config_path`` returns the typed ``config_not_found``
+    error so the LLM can distinguish a bad path from a transport
+    failure, without any server call.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"server must not be reached: {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "nope.yaml"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    info = json.loads(output)
+    assert info["error"] == "config_not_found"
+    assert info["config_path"] == "nope.yaml"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_defaults_to_caller_session() -> None:
+    """
+    Omitting ``session_id`` describes the caller's own session — the
+    runner targets ``GET /v1/sessions/{conversation_id}``. With no
+    runner bound, connectivity is unknown (``None``) and no
+    runner-status call is made. If the default-to-caller logic
+    regressed, the request path would be wrong and the GET would 404.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requested_paths: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        if request.url.path == "/v1/sessions/conv_caller":
+            assert request.url.params["include_items"] == "false"
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_caller",
+                    "agent_id": "ag_self",
+                    "agent_name": "main",
+                    "status": "idle",
+                    "created_at": 1,
+                    "updated_at": 42,
+                    "runner_id": None,
+                    "pending_elicitations": [],
+                },
+            )
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments="{}",
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert info["session_id"] == "conv_caller"
+    # No runner bound → connectivity unknown, and the status endpoint is
+    # never queried (a stray /v1/runners call would mean the None-runner
+    # short-circuit regressed).
+    assert info["runner_online"] is None
+    assert info["last_activity_at"] == 42
+    assert info["pending_elicitations"] == []
+    assert info["pending_elicitation_count"] == 0
+    assert not any(p.startswith("/v1/runners") for p in requested_paths)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status_code,expected_error",
+    [
+        pytest.param(404, "session_not_found", id="not-found"),
+        pytest.param(403, "access_denied", id="forbidden"),
+        pytest.param(401, "access_denied", id="unauthorized"),
+    ],
+)
+async def test_sys_session_get_info_maps_error_statuses(
+    status_code: int,
+    expected_error: str,
+) -> None:
+    """
+    A 404 maps to ``session_not_found``; 401/403 map to
+    ``access_denied`` — so the LLM gets a typed reason instead of a raw
+    HTTP status. If the mapping regressed, the orchestrator couldn't
+    distinguish "no such session" from "you can't read it".
+
+    :param status_code: HTTP status the mocked Omnigent server returns.
+    :param expected_error: The typed error string the tool should emit.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"error": "x"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_missing"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    info = json.loads(output)
+    assert info["error"] == expected_error
+    assert info["session_id"] == "conv_missing"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_share_defaults_to_caller_and_puts_grant() -> None:
+    """
+    Omitting ``session_id`` shares the caller's own session: the runner
+    PUTs to ``/v1/sessions/{conversation_id}/permissions`` with the
+    grantee and the numeric level mapped from the friendly name. If the
+    default-to-caller logic or the name->level mapping regressed, the
+    request path or body would be wrong (and an agent's "share this
+    session" would silently hit the wrong session or wrong level).
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={"user_id": "alice@example.com", "conversation_id": "conv_caller", "level": 2},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "alice@example.com", "level": "edit"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            # Sharing a named user only needs the non-public tier enabled.
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC),
+        )
+
+    # Exactly one PUT to the caller's own permissions sub-resource, with
+    # level "edit" mapped to the server's numeric 2 (1=read/2=edit/3=manage).
+    assert requests == [
+        (
+            "PUT",
+            "/v1/sessions/conv_caller/permissions",
+            {"user_id": "alice@example.com", "level": 2},
+        )
+    ]
+    result = json.loads(output)
+    assert result == {
+        "shared": True,
+        "session_id": "conv_caller",
+        "user_id": "alice@example.com",
+        "level": "edit",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status_code,expected_error",
+    [
+        pytest.param(404, "session_not_found", id="not-found"),
+        pytest.param(403, "access_denied", id="forbidden"),
+        pytest.param(401, "access_denied", id="unauthorized"),
+    ],
+)
+async def test_sys_session_share_maps_error_statuses(
+    status_code: int,
+    expected_error: str,
+) -> None:
+    """
+    A 404 maps to ``session_not_found``; 401/403 map to ``access_denied``
+    — a typed reason instead of a raw status, matching the sibling
+    session tools so the LLM can distinguish "no such session" from
+    "you can't manage it".
+
+    :param status_code: HTTP status the mocked Omnigent server returns.
+    :param expected_error: The typed error string the tool should emit.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"detail": "x"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "alice@example.com", "session_id": "conv_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC),
+        )
+
+    result = json.loads(output)
+    assert result["error"] == expected_error
+    assert result["session_id"] == "conv_x"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_share_rejects_bad_level_without_calling_server() -> None:
+    """
+    An unknown ``level`` is rejected client-side before any PUT — so a
+    typo can't fall through to the server or silently skip the grant. A
+    request reaching the handler would mean the level validation
+    regressed.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    called = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "alice@example.com", "level": "admin"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            # Share enabled (non-public) so the call reaches level validation.
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC),
+        )
+
+    assert called is False  # validation must short-circuit before the PUT
+    assert "level must be one of" in json.loads(output)["error"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_share_surfaces_server_message_on_4xx() -> None:
+    """
+    A 4xx the typed branches don't claim (here the server's 400 for a
+    ``__public__`` grant above read level) surfaces the server's own
+    ``{"error": {"message": ...}}`` text rather than a bare "returned
+    400". If the detail-extraction regressed, the agent would see only
+    the status code and couldn't tell that public is read-only — the
+    exact actionable reason the server gave.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    # Mirrors the OmnigentError envelope the server's exception handler
+    # emits (omnigent/server/app.py) for the public + level>read guard.
+    server_message = "Public access is limited to read-only (level 1)"
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, json={"error": {"code": "INVALID_INPUT", "message": server_message}}
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps(
+                {"user_id": "__public__", "level": "edit", "session_id": "conv_x"}
+            ),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            # agent_session_sharing: public lets __public__ pass the runner
+            # gate and reach the server, which rejects level>read for public.
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.PUBLIC),
+        )
+
+    result = json.loads(output)
+    # The server's verbatim message is surfaced, not flattened to a status.
+    assert result["error"] == server_message
+    assert result["status_code"] == 400
+    assert result["session_id"] == "conv_x"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "share_policy",
+    [
+        pytest.param(None, id="no-spec"),
+        pytest.param(SharePolicy.NONE, id="share-none"),
+    ],
+)
+async def test_sys_session_share_disabled_without_share_flag(
+    share_policy: SharePolicy | None,
+) -> None:
+    """
+    With no spec (``None``) or ``agent_session_sharing: none``, the
+    runner refuses the grant client-side and never PUTs — the
+    ``agent_session_sharing`` flag is the real gate, not just tool
+    advertisement, so a prompt-injected call naming the tool can't
+    escalate. A PUT reaching the handler would mean the runner-side
+    policy gate regressed.
+
+    :param share_policy: The spec's ``agent_session_sharing`` policy
+        under test (or ``None`` for a missing spec).
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    called = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    spec = (
+        None
+        if share_policy is None
+        else AgentSpec(spec_version=1, agent_session_sharing=share_policy)
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "alice@example.com", "session_id": "conv_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=spec,
+        )
+
+    assert called is False  # the gate must short-circuit before the PUT
+    assert "not enabled" in json.loads(output)["error"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_share_non_public_rejects_public_grant() -> None:
+    """
+    Under ``agent_session_sharing: non-public`` a grant to a named user
+    is allowed, but a ``__public__`` grant is refused client-side before
+    any PUT — the
+    non-public tier must not be able to expose the transcript anonymously
+    even if the model (or an injection) asks for it. A PUT here would
+    mean the public sub-gate regressed.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    called = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "__public__", "session_id": "conv_x"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC),
+        )
+
+    assert called is False  # public sub-gate must short-circuit before the PUT
+    assert "public" in json.loads(output)["error"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_share_public_allows_public_grant() -> None:
+    """
+    Under ``agent_session_sharing: public`` a ``__public__`` read grant
+    passes the runner gate and PUTs to the permissions endpoint — the
+    positive case the
+    non-public/none gates exclude. If the gate wrongly blocked it, public
+    sharing would be impossible even when the spec explicitly opts in.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path, json.loads(request.content)))
+        return httpx.Response(
+            200,
+            json={"user_id": "__public__", "conversation_id": "conv_caller", "level": 1},
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_share",
+            arguments=json.dumps({"user_id": "__public__"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.PUBLIC),
+        )
+
+    # __public__ reached the server as a level-1 (read) grant on the caller.
+    assert requests == [
+        ("PUT", "/v1/sessions/conv_caller/permissions", {"user_id": "__public__", "level": 1})
+    ]
+    result = json.loads(output)
+    assert result == {
+        "shared": True,
+        "session_id": "conv_caller",
+        "user_id": "__public__",
+        "level": "read",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host_response", [httpx.Response(503), httpx.Response(200, text="bad")])
+async def test_sys_session_get_info_tolerates_host_readiness_failure(
+    host_response: httpx.Response,
+) -> None:
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "host_id": "host_1"})
+        if request.url.path == "/v1/hosts/host_1":
+            return host_response
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_target"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert json.loads(output)["configured_harnesses"] is None
+
+
+@pytest.mark.asyncio
+async def test_sys_session_get_info_reports_null_readiness_without_host() -> None:
+    """Skip the host lookup when the session has no bound host."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    host_calls: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "host_id": None})
+        if request.url.path.startswith("/v1/hosts/"):
+            host_calls.append(request.url.path)
+            return httpx.Response(404)
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": "conv_target"}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert json.loads(output)["configured_harnesses"] is None
+    assert host_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_failed_continuation_receipts_its_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A continued turn stamped on the child but never sent gets a receipt.
+
+    The dispatch id is written before the message post so a runner restart can
+    find the turn. When the post then fails, the child keeps that stamp with no
+    turn behind it; without the receipt, recovery would replay the previous
+    turn's result as this one after a restart.
+
+    :param monkeypatch: Stubs the runner-local child registration so the
+        dispatch runs without a live runner.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    label_patches: list[dict[str, str]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "parent_session_id": "conv_caller",
+                    "title": "reviewer:auth",
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+            label_patches.append(json.loads(request.content)["labels"])
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
+            return httpx.Response(503, json={"error": "child unavailable"})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_child", "args": "continue please"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="reviewer")]),
+                session_inbox=asyncio.Queue(),
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child")
+            runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    assert output.startswith("Error: failed to send message to child: 503")
+    assert runner_app.get_subagent_work("conv_child") is None
+    stamp, receipt = label_patches
+    dispatch_id = stamp[runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY]
+    assert dispatch_id.startswith("subagent_")
+    assert receipt == {runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: dispatch_id}
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_session_id_posts_to_direct_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``sys_session_send`` in by-session-id mode verifies the target is a
+    direct child of the caller, posts the message, and returns a running
+    handle. Proves the unified session_id mode: the message reaches the
+    existing child and the handle carries its id with ``status:running``
+    (the result is delivered asynchronously via ``sys_read_inbox``).
+
+    :param monkeypatch: Stubs the runner-local child registration so the
+        dispatch runs without a live runner.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    event_posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            # Target IS a direct child of the caller.
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "parent_session_id": "conv_caller",
+                    "title": "reviewer:auth",
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_child", "args": "continue please"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="reviewer")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_child")
+            runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    # Message reached the existing child; handle carries its id + running status.
+    assert event_posts[0]["data"]["content"][0]["text"] == "continue please"
+    handle = json.loads(output)
+    assert handle["conversation_id"] == "conv_child"
+    assert handle["status"] == "launching"
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_session_id_rejects_non_child() -> None:
+    """
+    By-session-id send refuses a target that is NOT a direct child of the
+    caller (``parent_session_id`` mismatch) — returning
+    ``session_out_of_tree`` and posting NO message. This is the
+    child-only safety guarantee: an orchestrator can't drive a sibling or
+    an unrelated session it merely has read access to. If the parentage
+    check regressed, the message would be posted and the assertion on
+    ``event_posts`` would fail.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    event_posts: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_other":
+            # Target's parent is someone ELSE, not the caller.
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_other",
+                    "parent_session_id": "conv_someone_else",
+                    "title": "x:y",
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_other/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps({"session_id": "conv_other", "args": "hi"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="reviewer")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_caller", None)
+
+    info = json.loads(output)
+    assert info["error"] == "session_out_of_tree"
+    # No message was posted to the non-child session.
+    assert event_posts == []
+
+
+@pytest.mark.parametrize("empty_output", ["", "   ", "\n\t "])
+def test_format_async_task_item_empty_subagent_completion_reads_as_no_output(
+    empty_output: str,
+) -> None:
+    """
+    An empty sub-agent completion renders "produced no output", not "returned:".
+
+    A native child that idles with no assistant text is delivered as ``""`` —
+    the runner deliberately avoids fabricating output from stale runner
+    history (see
+    ``test_external_status_idle_without_output_omits_stale_history_preview``).
+    The parent LLM must then see an explicit "produced no output" line rather
+    than a dangling ``"…returned: "`` that reads as a truncated/garbled handoff.
+
+    :param empty_output: An empty or whitespace-only child output.
+    """
+    from omnigent.runner.tool_dispatch import _format_async_task_item
+
+    line = _format_async_task_item(
+        {
+            "type": "sub_agent",
+            "handle_id": "conv_child_empty",
+            "agent": "worker",
+            "title": "phase-a",
+            "status": "completed",
+            "output": empty_output,
+        }
+    )
+    # Reads as no-output; the dangling content-free "returned:" must not appear.
+    # With the old formatter, an empty output rendered "…returned: ]" and this
+    # would fail on the missing "produced no output" / present "returned:".
+    assert "produced no output" in line
+    assert "returned:" not in line
+
+
+def test_format_async_task_item_nonempty_subagent_completion_shows_output() -> None:
+    """
+    A non-empty sub-agent completion still renders its returned text.
+
+    Guards against the empty-output branch swallowing a real result.
+    """
+    from omnigent.runner.tool_dispatch import _format_async_task_item
+
+    line = _format_async_task_item(
+        {
+            "type": "sub_agent",
+            "handle_id": "conv_child_real",
+            "agent": "worker",
+            "title": "phase-a",
+            "status": "completed",
+            "output": "review done: LGTM",
+        }
+    )
+    assert "returned: review done: LGTM" in line
+    assert "produced no output" not in line
+
+
+def test_format_async_task_item_truncated_subagent_output_names_retrieval_path() -> None:
+    """
+    A sub-agent handoff cut by the inbox delivery cap tells the parent how
+    to read the rest.
+
+    Delivery stays bounded (the wake prompt cannot grow without limit), but
+    the marker must name the child session and the retrieval tool — without
+    it the tail reads as silently lost.
+    """
+    from omnigent.runner.tool_dispatch import _INBOX_OUTPUT_MAX_CHARS, _format_async_task_item
+
+    long_output = "X" * (_INBOX_OUTPUT_MAX_CHARS + 8000)
+    line = _format_async_task_item(
+        {
+            "type": "sub_agent",
+            "conversation_id": "conv_child_long",
+            "handle_id": "conv_child_long",
+            "agent": "writer",
+            "title": "long-report",
+            "status": "completed",
+            "output": long_output,
+        }
+    )
+    assert "...[truncated 8000 chars" in line
+    assert "sys_session_get_history conversation_id=conv_child_long" in line
+    assert f"content_max_chars={len(long_output)}" in line
+
+
+def test_format_async_task_item_truncated_generic_task_keeps_plain_marker() -> None:
+    """
+    A truncated generic async-task output keeps the plain marker.
+
+    There is no session transcript to read a plain tool task's output back
+    from, so no retrieval hint must be fabricated.
+    """
+    from omnigent.runner.tool_dispatch import _INBOX_OUTPUT_MAX_CHARS, _format_async_task_item
+
+    line = _format_async_task_item(
+        {
+            "type": "async_tool",
+            "handle_id": "task_generic",
+            "tool_name": "sys_os_shell",
+            "status": "completed",
+            "output": "Y" * (_INBOX_OUTPUT_MAX_CHARS + 500),
+        }
+    )
+    assert "...[truncated 500 chars]" in line
+    assert "sys_session_get_history" not in line
+
+
+@pytest.mark.asyncio
+async def test_sys_session_send_rejects_both_session_id_and_named_target() -> None:
+    """
+    Supplying both ``session_id`` and ``agent``/``title`` fails loud.
+
+    The by-session-id and named ``(agent, title)`` modes can point at different
+    children, so silently letting ``session_id`` win would misroute the message
+    with no signal to the caller. The dispatch must reject the ambiguity before
+    making any server call.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    server_called = False
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        """
+        Fail the test if any server call is made.
+
+        :param request: Any Omnigent request — none should occur on the reject path.
+        :returns: A 404 (also records the unexpected call).
+        """
+        nonlocal server_called
+        server_called = True
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {
+                        "session_id": "conv_direct_child",
+                        "agent": "claude",
+                        "title": "issue-1",
+                        "args": "do the thing",
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_ambiguous",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="claude")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app._session_inboxes_ref.pop("conv_parent_ambiguous", None)
+
+    # The ambiguity is rejected with a fail-loud error naming both modes.
+    # Without the guard, session_id silently wins and routing proceeds into
+    # _send_to_existing_session (which would hit the server handler below).
+    assert "both 'session_id' and 'agent'/'title'" in output
+    assert server_called is False
+
+
+@pytest.mark.asyncio
+async def test_create_session_reinit_preserves_existing_inbox() -> None:
+    """
+    A reconnect re-POST of ``/v1/sessions`` must not wipe the session inbox.
+
+    The Omnigent server re-POSTs ``/v1/sessions`` for every bound conversation
+    on each runner WebSocket (re)connect — including in-process reconnects of a
+    still-alive runner after a transient blip. A sub-agent completion that lands
+    while the socket is down delivers its result into the parent's
+    ``_session_inboxes`` queue and latches the work entry ``delivered``, which
+    makes redelivery short-circuit. If the re-init blindly replaced the queue,
+    that already-delivered payload would be orphaned and the parent would drain
+    an empty inbox and hang forever. This test drives the real
+    ``POST /v1/sessions`` route twice for the same session id and asserts the
+    inbox (and a sentinel sitting in it) survives the second call.
+
+    :returns: None.
+    """
+    from omnigent.runner import app as runner_app
+
+    session_id = "conv_reinit_inbox_guard"
+    agent_id = "ag_reinit_inbox_guard"
+    # Real stub manager: get_client must succeed so create_session reaches the
+    # inbox-init lines. ``_FakeHarnessClient([])`` is never streamed on this path.
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    # Fresh-process hygiene: the inbox ref is a module-wide singleton, so clear
+    # any leftover from a prior test before exercising the route.
+    runner_app._session_inboxes_ref.pop(session_id, None)
+    sentinel = {"type": "subagent_result", "marker": "SURVIVE_REINIT"}
+    try:
+        async with _runner_test_client(app) as http:
+            first = await http.post(
+                "/v1/sessions",
+                json={"session_id": session_id, "agent_id": agent_id},
+            )
+            # 201 proves create_session ran end-to-end (past the inbox init)
+            # rather than short-circuiting (400 missing fields / 501 scaffold /
+            # 503 spawn failure), so the inbox we inspect next is route-created.
+            assert first.status_code == 201, (
+                f"First POST /v1/sessions should create the session (201); got "
+                f"{first.status_code} with body {first.text!r}."
+            )
+            assert first.json()["id"] == session_id
+
+            inbox_after_first = runner_app._session_inboxes_ref.get(session_id)
+            # The route must have installed a real inbox queue. If None, the
+            # init path didn't run and the rest of the test would be vacuous.
+            assert inbox_after_first is not None, (
+                "POST /v1/sessions did not create a session inbox; the "
+                "inbox-init line in create_session did not run."
+            )
+            # Stand in for a delivered sub-agent payload waiting to be drained.
+            inbox_after_first.put_nowait(sentinel)
+
+            second = await http.post(
+                "/v1/sessions",
+                json={"session_id": session_id, "agent_id": agent_id},
+            )
+            # The reconnect re-init must also succeed; a non-201 here would mean
+            # the simulated reconnect couldn't re-run the handler at all.
+            assert second.status_code == 201, (
+                f"Reconnect re-POST /v1/sessions should succeed (201); got "
+                f"{second.status_code} with body {second.text!r}."
+            )
+
+            inbox_after_second = runner_app._session_inboxes_ref.get(session_id)
+            # The load-bearing assertion: the inbox object is preserved across
+            # re-init. Without the ``if session_id not in _session_inboxes``
+            # guard, line ~4093 would assign a brand-new asyncio.Queue() here,
+            # so this would be a different object and the sentinel would vanish.
+            assert inbox_after_second is inbox_after_first, (
+                "Re-init replaced the session inbox with a new queue. The "
+                "guard in create_session must skip re-creating an existing "
+                "inbox or a delivered sub-agent payload is orphaned and the "
+                "parent hangs on an empty inbox."
+            )
+            # Content survives: the delivered payload is still drainable. A
+            # fresh empty queue would make this drain raise QueueEmpty.
+            assert inbox_after_second.get_nowait() == sentinel, (
+                "Sentinel payload did not survive the re-init; the parent's "
+                "delivered sub-agent result was lost when the inbox was wiped."
+            )
+    finally:
+        runner_app._session_inboxes_ref.pop(session_id, None)
+
+
+# ── approval-event flattening (elicitation-approval hang regression) ──────
+
+
+@pytest.mark.parametrize("second_turn", ["background", "known_harness"])
+@pytest.mark.asyncio
+async def test_unresolvable_sub_agent_warns_again_on_later_turns(
+    caplog: pytest.LogCaptureFixture,
+    second_turn: str,
+) -> None:
+    """A parent kept after a miss must not become a resolved child on turn 2.
+
+    Session creation misses on ``sub_agent_name``, warns, and caches the
+    PARENT spec for the session. Later turns read that cache instead of
+    resolving again, and decide "is this the already-resolved child?" by
+    comparing the cached spec's name against the requested name. A root
+    whose own name equals the requested sub-agent satisfies that equality,
+    so the cached parent answers as though it were the child — and the
+    warning that made turn 1 honest never fires again.
+
+    :param caplog: Pytest log capture, read once per turn.
+    :param second_turn: Which dispatch path drives the turn after create.
+    """
+    conv = f"conv_fallback_second_turn_{second_turn}"
+
+    root_spec = AgentSpec(
+        spec_version=1,
+        name="worker",
+        instructions="Root instructions.",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return root_spec
+
+    recorder = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    pm = _FakeProcessManager(recorder)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, pm),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            created = await http.post(
+                "/v1/sessions",
+                json={
+                    "session_id": conv,
+                    "agent_id": "ag_root",
+                    "sub_agent_name": "worker",
+                },
+            )
+        assert created.status_code == 201, created.text
+        assert "did not resolve" in caplog.text
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            if second_turn == "background":
+                bg = await http.post(
+                    f"/v1/sessions/{conv}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": "ag_root",
+                        "model": "x",
+                        "content": [{"role": "user", "content": "hi"}],
+                    },
+                )
+                assert bg.status_code == 202, bg.text
+                await _await_bg_turn_task(conv)
+                statuses = await _drain_published_statuses(
+                    app.state.session_event_queues, conv, until="idle", timeout=2.0
+                )
+                assert "failed" not in statuses
+            else:
+                streamed = await _post_stream_message(
+                    http,
+                    conv,
+                    agent_id="ag_root",
+                    harness="claude-sdk",
+                    instructions="Caller-supplied instructions.",
+                )
+                assert streamed.status_code == 200, streamed.text
+
+    assert "'worker'" in caplog.text and "did not resolve" in caplog.text, (
+        f"The {second_turn} turn reused a PARENT kept after a miss silently; "
+        f"warnings: {caplog.text!r}."
+    )
+    assert recorder.posted_bodies
+    composed = recorder.posted_bodies[-1].get("instructions")
+    assert isinstance(composed, str) and "Root instructions." in composed
+
+
+@pytest.mark.asyncio
+async def test_approval_event_flattened_for_harness_scaffold() -> None:
+    """A nested approval envelope is flattened to the scaffold's ApprovalEvent.
+
+    Regression for the elicitation-approval hang: the server forwards the
+    verdict as ``{"type": "approval", "data": {...}}``, but the harness
+    scaffold's ``ApprovalEvent`` requires ``elicitation_id`` / ``action`` /
+    ``content`` at the TOP level. If the runner forwards the envelope verbatim
+    the harness 422s and the parked ``ctx.elicit`` Future never resolves (the
+    turn hangs after a human approves). The runner must translate the envelope
+    into the flat event the scaffold validates — for every scaffold harness.
+    """
+    from omnigent.runtime.harnesses._scaffold import ApprovalEvent
+
+    captured: dict[str, Any] = {}
+
+    class _CapturingHarnessClient:
+        async def post(
+            self, url: str, *, json: dict[str, Any], timeout: float | None = None
+        ) -> httpx.Response:
+            captured["url"] = url
+            captured["body"] = json
+            return httpx.Response(204)
+
+    mgr = _FakeProcessManager(harness_client=cast(Any, _CapturingHarnessClient()))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, mgr),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            "/v1/sessions/conv_x/events",
+            json={
+                "type": "approval",
+                "data": {
+                    "elicitation_id": "elicit_x",
+                    "action": "accept",
+                    "content": {"note": "ok"},
+                },
+            },
+        )
+
+    assert resp.status_code == 204
+    # Forwarded body is FLAT — no ``data`` envelope.
+    assert captured["body"] == {
+        "type": "approval",
+        "elicitation_id": "elicit_x",
+        "action": "accept",
+        "content": {"note": "ok"},
+    }
+    # And it validates as the scaffold's ApprovalEvent (i.e. no 422).
+    ApprovalEvent.model_validate(captured["body"])
+
+
+@pytest.mark.asyncio
+async def test_approval_event_without_content_flattened() -> None:
+    """A decline verdict with no form content flattens without a ``content`` key."""
+    from omnigent.runtime.harnesses._scaffold import ApprovalEvent
+
+    captured: dict[str, Any] = {}
+
+    class _CapturingHarnessClient:
+        async def post(
+            self, url: str, *, json: dict[str, Any], timeout: float | None = None
+        ) -> httpx.Response:
+            captured["body"] = json
+            return httpx.Response(204)
+
+    mgr = _FakeProcessManager(harness_client=cast(Any, _CapturingHarnessClient()))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, mgr),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            "/v1/sessions/conv_y/events",
+            json={"type": "approval", "data": {"elicitation_id": "e2", "action": "decline"}},
+        )
+
+    assert resp.status_code == 204
+    assert captured["body"] == {"type": "approval", "elicitation_id": "e2", "action": "decline"}
+    ApprovalEvent.model_validate(captured["body"])
+
+
+@pytest.mark.asyncio
+async def test_decline_without_interrupt_lets_the_turn_carry_on() -> None:
+    """A decline marked ``interrupt: false`` resolves the approval but does not stop the turn."""
+    posted: list[dict[str, Any]] = []
+
+    class _CapturingHarnessClient:
+        async def post(
+            self, url: str, *, json: dict[str, Any], timeout: float | None = None
+        ) -> httpx.Response:
+            posted.append(json)
+            return httpx.Response(204)
+
+    mgr = _FakeProcessManager(harness_client=cast(Any, _CapturingHarnessClient()))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, mgr),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            "/v1/sessions/conv_z/events",
+            json={
+                "type": "approval",
+                "data": {"elicitation_id": "e3", "action": "decline", "interrupt": False},
+            },
+        )
+
+    assert resp.status_code == 204
+    assert {"type": "interrupt"} not in posted
+    assert posted == [{"type": "approval", "elicitation_id": "e3", "action": "decline"}]
+
+
+@pytest.mark.asyncio
+async def test_plain_decline_still_interrupts_the_turn() -> None:
+    posted: list[dict[str, Any]] = []
+
+    class _CapturingHarnessClient:
+        async def post(
+            self, url: str, *, json: dict[str, Any], timeout: float | None = None
+        ) -> httpx.Response:
+            posted.append(json)
+            return httpx.Response(204)
+
+    mgr = _FakeProcessManager(harness_client=cast(Any, _CapturingHarnessClient()))
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, mgr),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        await http.post(
+            "/v1/sessions/conv_w/events",
+            json={"type": "approval", "data": {"elicitation_id": "e4", "action": "decline"}},
+        )
+
+    assert posted[0] == {"type": "interrupt"}
+
+
+@pytest.mark.asyncio
+async def test_spawn_handle_round_trips_to_sys_cancel_async(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spawned handle can be passed directly to ``sys_cancel_async``."""
+    from omnigent.runner import tool_dispatch
+
+    async def _slow(**_kw: Any) -> str:
+        await asyncio.sleep(30)
+        return "late"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _slow)
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+    spawn_kw: dict[str, Any] = {
+        "server_client": None,
+        "terminal_registry": None,
+        "resource_registry": None,
+        "agent_spec": None,
+        "conversation_id": "conv_roundtrip",
+        "task_id": None,
+        "agent_id": None,
+        "agent_name": None,
+        "runner_workspace": None,
+        "mcp_manager": None,
+        "filesystem_registry": None,
+    }
+    handle_raw = tool_dispatch._spawn_async_tool(
+        {"tool": "slow", "args": "{}"},
+        session_inbox=inbox,
+        session_async_tasks=tasks,
+        **spawn_kw,
+    )
+    handle = json.loads(handle_raw)
+    assert handle["task_id"] == handle["handle_id"]
+    assert handle["status"] == "in_progress"
+    assert "sys_cancel_async" in handle["message"]
+    assert f"handle_id={handle['handle_id']!r}" in handle["message"]
+
+    bg_task, _evt = tasks[handle["handle_id"]]
+    cancel_raw = tool_dispatch._cancel_async_tool(
+        {"handle_id": handle["handle_id"]},
+        session_async_tasks=tasks,
+    )
+    assert json.loads(cancel_raw) == {
+        "cancelled": True,
+        "handle_id": handle["handle_id"],
+    }
+
+    await bg_task
+    assert inbox.get_nowait()["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_spawn_async_tool_cancels_losing_future_no_leak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_spawn_async_tool`` races the tool coro against ``cancel_event.wait()``
+    via ``asyncio.wait(FIRST_COMPLETED)``. The losing future must be cancelled
+    in BOTH branches, otherwise every ``sys_call_async`` permanently leaks one
+    pending task (the orphaned ``cancel_event.wait()`` on success, or the
+    orphaned tool coro on cancel).
+    """
+    from omnigent.runner import tool_dispatch
+
+    spawn_kw: dict[str, Any] = {
+        "server_client": None,
+        "terminal_registry": None,
+        "resource_registry": None,
+        "agent_spec": None,
+        "conversation_id": "conv_leak",
+        "task_id": None,
+        "agent_id": None,
+        "agent_name": None,
+        "runner_workspace": None,
+        "mcp_manager": None,
+        "filesystem_registry": None,
+    }
+
+    def _leaked(before: set[asyncio.Task[Any]]) -> list[str]:
+        cur = asyncio.current_task()
+        return [
+            t.get_name()
+            for t in asyncio.all_tasks()
+            if t not in before and t is not cur and not t.done()
+        ]
+
+    # Success path: tool finishes first, so cancel_event.wait() is the loser.
+    async def _fast(**_kw: Any) -> str:
+        return "ok"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _fast)
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+    before = set(asyncio.all_tasks())
+    tool_dispatch._spawn_async_tool(
+        {"tool": "noop", "args": "{}"},
+        session_inbox=inbox,
+        session_async_tasks=tasks,
+        **spawn_kw,
+    )
+    bg_task, _evt = next(iter(tasks.values()))
+    await bg_task
+    await asyncio.sleep(0)  # let the .cancel() propagate to the losing future
+    assert inbox.get_nowait()["status"] == "completed"
+    assert _leaked(before) == []
+
+    # Cancel path: cancel_event fires first, so the tool coro is the loser.
+    async def _slow(**_kw: Any) -> str:
+        await asyncio.sleep(30)
+        return "late"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _slow)
+    inbox = asyncio.Queue()
+    tasks = {}
+    before = set(asyncio.all_tasks())
+    tool_dispatch._spawn_async_tool(
+        {"tool": "slow", "args": "{}"},
+        session_inbox=inbox,
+        session_async_tasks=tasks,
+        **spawn_kw,
+    )
+    bg_task, evt = next(iter(tasks.values()))
+    await asyncio.sleep(0)  # let _bg reach asyncio.wait
+    evt.set()
+    await bg_task
+    await asyncio.sleep(0)
+    assert inbox.get_nowait()["status"] == "cancelled"
+    assert _leaked(before) == []
+
+
+@pytest.mark.asyncio
+async def test_spawn_async_tool_phase_tool_call_policy_deny(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``_spawn_async_tool`` evaluates PHASE_TOOL_CALL policy via the AP server
+    before dispatching.  A DENY verdict must suppress execution and push a
+    failed item to the inbox — the tool must never run.
+    """
+    from omnigent.runner import tool_dispatch
+
+    executed: list[str] = []
+
+    async def _should_not_run(**_kw: Any) -> str:
+        executed.append("ran")
+        return "should not reach"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _should_not_run)
+
+    policy_requests: list[dict[str, Any]] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and "/policies/evaluate" in request.url.path:
+            policy_requests.append(json.loads(request.content))
+            return httpx.Response(
+                200, json={"result": "POLICY_ACTION_DENY", "reason": "test deny"}
+            )
+        return httpx.Response(404)
+
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        tool_dispatch._spawn_async_tool(
+            {"tool": "sys_os_shell", "args": '{"command": "echo hi"}'},
+            session_inbox=inbox,
+            session_async_tasks=tasks,
+            server_client=server_client,
+            terminal_registry=None,
+            resource_registry=None,
+            agent_spec=None,
+            conversation_id="conv_policy_deny",
+            task_id=None,
+            agent_id=None,
+            agent_name=None,
+            runner_workspace=None,
+            mcp_manager=None,
+            filesystem_registry=None,
+        )
+        bg_task, _evt = next(iter(tasks.values()))
+        await bg_task
+
+    assert executed == [], "Tool must not execute when PHASE_TOOL_CALL is denied"
+    assert len(policy_requests) == 1
+    event = policy_requests[0]["event"]
+    assert event["type"] == "PHASE_TOOL_CALL"
+    assert event["data"]["name"] == "sys_os_shell"
+    # arguments must arrive as a dict so argument-aware policies (e.g. safety
+    # rules that inspect arguments.command) see the same structure every
+    # in-turn evaluation path delivers — not a raw JSON string.
+    assert isinstance(event["data"]["arguments"], dict), (
+        "arguments must be a dict, not a JSON string"
+    )
+    assert event["data"]["arguments"] == {"command": "echo hi"}
+
+    item = inbox.get_nowait()
+    assert item["status"] == "failed"
+    assert "policy" in item["output"].lower()
+
+
+@pytest.mark.asyncio
+async def test_spawn_async_tool_phase_tool_call_policy_allow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A PHASE_TOOL_CALL ALLOW verdict must let the tool execute normally.
+    """
+    from omnigent.runner import tool_dispatch
+
+    executed: list[str] = []
+
+    async def _fast(**_kw: Any) -> str:
+        executed.append("ran")
+        return "ok"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _fast)
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if "/policies/evaluate" in request.url.path:
+            return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"})
+        return httpx.Response(404)
+
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        tool_dispatch._spawn_async_tool(
+            {"tool": "sys_os_shell", "args": '{"command": "echo hi"}'},
+            session_inbox=inbox,
+            session_async_tasks=tasks,
+            server_client=server_client,
+            terminal_registry=None,
+            resource_registry=None,
+            agent_spec=None,
+            conversation_id="conv_policy_allow",
+            task_id=None,
+            agent_id=None,
+            agent_name=None,
+            runner_workspace=None,
+            mcp_manager=None,
+            filesystem_registry=None,
+        )
+        bg_task, _evt = next(iter(tasks.values()))
+        await bg_task
+
+    assert executed == ["ran"], "Tool must execute when PHASE_TOOL_CALL is allowed"
+    item = inbox.get_nowait()
+    assert item["status"] == "completed"
+    assert item["output"] == "ok"
+
+
+# ── cross-process lifecycle desync recovery ── ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_setup_cancel_does_not_leave_active_turn() -> None:
+    """Cancel during SETUP must not leave ``_active_turns`` stale.
+
+    A ``CancelledError`` raised before the streaming phase escapes
+    ``_run_turn_bg``'s ``except Exception``; without the dedicated
+    ``except asyncio.CancelledError`` clause nothing pops ``_active_turns``
+    and every later message buffers forever (the permanent-wedge mode).
+    """
+    conv = "conv_setup_cancel"
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        started.set()
+        # Park the turn in the SETUP phase (before the streaming phase).
+        await release.wait()
+        return AgentSpec(
+            spec_version=1,
+            name="claude-sdk-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_claude_sdk",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 202
+        await asyncio.wait_for(started.wait(), timeout=5.0)
+
+        active = app.state.active_turns
+        task = active.get(conv)
+        assert isinstance(task, asyncio.Task)
+
+        # Cancel during SETUP.
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+        # Slot cleared via terminal-cleanup path, not stale.
+        assert conv not in active
+
+
+@pytest.mark.asyncio
+async def test_desync_emits_user_visible_error() -> None:
+    """Recovered desync surfaces a distinct, non-retryable error code.
+
+    With no buffered continuation, ``_resync_turn_state`` publishes a
+    ``session.status: failed`` carrying ``runner_turn_context_desync`` — a
+    code intentionally absent from AP's retryable allowlist so the L2
+    classifier treats it as terminal instead of retry-looping.
+    """
+    conv = "conv_desync_visible"
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app):
+        # Drive the recovery entry directly (no live turn, no buffer).
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+        failed_event = await _drain_failed_status_event(
+            app.state.session_event_queues, conv, timeout=5.0
+        )
+
+    assert conv in app.state.desynced_sessions
+    assert failed_event is not None
+    error = failed_event.get("error")
+    assert isinstance(error, dict)
+    assert error["code"] == "runner_turn_context_desync"
+    assert error["message"]
+
+
+class _SetupBoom(BaseException):
+    """Non-Exception BaseException exercises the terminal-cleanup finally floor."""
+
+
+@pytest.mark.asyncio
+async def test_setup_base_exception_does_not_leave_active_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BaseException during SETUP must not leave ``_active_turns`` stale.
+
+    A non-``Exception`` ``BaseException`` raised in the BACKGROUND setup phase
+    (here the spawn-env build, the same background-only step the
+    spawn-env-failure test drives) escapes ``_run_turn_bg``'s
+    ``except Exception``. The real ``finally`` floor must still pop the slot —
+    otherwise every later message buffers forever (the permanent-wedge mode).
+    """
+    conv = "conv_setup_base_exc"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="claude-sdk-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        )
+
+    def _raising_build(
+        spec: object, *, cwd: object = None, workdir: object = None
+    ) -> dict[str, str]:
+        del spec, workdir
+        # A BaseException that is NOT an Exception subclass, raised inside the
+        # background setup phase (after the 202).
+        raise _SetupBoom("spawn-env aborted")
+
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._build_claude_sdk_spawn_env",
+        _raising_build,
+    )
+
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient([])),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_test_client(app) as http:
+        resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_claude_sdk",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 202
+
+        active = app.state.active_turns
+        # Wait for the background turn task to bind, then finish unwinding
+        # through the finally floor (the BaseException propagates out).
+        deadline = asyncio.get_running_loop().time() + 5.0
+        task: asyncio.Task[None] | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            candidate = active.get(conv)
+            if isinstance(candidate, asyncio.Task):
+                task = candidate
+                if task.done():
+                    break
+            elif task is not None:
+                # Slot already cleared by the finally floor.
+                break
+            await asyncio.sleep(0.02)
+
+        # The finally floor popped the slot despite the BaseException — never
+        # left stale (the permanent-wedge failure mode).
+        assert conv not in active
+        # The BaseException propagated out of the task (finally did not swallow).
+        assert task is not None
+        assert task.done() and not task.cancelled()
+        assert isinstance(task.exception(), _SetupBoom)
+
+
+# ── turn-context recovery ──────────────────────────────────────────────────
+#
+# Tests for harness↔runner turn-context recovery (``_resync_turn_state``),
+# policy-verdict delivery failures, and the three-factor causal chain.
+# Consolidated from former test_app_sessions_desync, test_evaluate_policy_desync,
+# and test_desync_live_repro modules.
+
+# ── Helpers shared across recovery tests ──────────────────────────────────
+
+
+def _recovery_request(text: str = "hi") -> _CreateResponseRequest:
+    return _CreateResponseRequest(model="agent", input=text)
+
+
+def _recovery_tool_result(call_id: str, output: str) -> _ToolResultEvent:
+    return _ToolResultEvent(type="tool_result", call_id=call_id, output=output)
+
+
+def _drain_recovery_status_events(queues: dict[str, Any], conv_id: str) -> list[dict[str, Any]]:
+    """Pop every queued ``session.status`` event for *conv_id*."""
+    queue = queues.get(conv_id)
+    out: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        event = queue.get_nowait()
+        if isinstance(event, dict) and event.get("type") == "session.status":
+            out.append(event)
+    return out
+
+
+# ── Verdict-delivery failure tests (from test_evaluate_policy_desync) ─────
+
+
+class _PolicyOkServerClient:
+    """Server client whose evaluate POST returns a real ALLOW verdict."""
+
+    async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+        del json, timeout
+        return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW", "reason": None})
+
+
+class _PolicyDeadChannelHarnessClient:
+    """Harness client whose verdict POST always raises a dead-channel error."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.attempts = 0
+        self._exc = exc
+
+    async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+        del json, timeout
+        self.attempts += 1
+        raise self._exc
+
+
+async def test_verdict_delivery_failure_retries_then_signals() -> None:
+    """A dead-channel verdict POST retries once, then fires on_delivery_failure."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _PolicyDeadChannelHarnessClient(httpx.RemoteProtocolError("peer closed connection"))
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_xyz",
+        evaluation_id="poleval_1",
+        phase="PHASE_TOOL_CALL",
+        data={"name": "mcp__github__merge_pull_request", "arguments": {}},
+        on_delivery_failure=_on_delivery_failure,
+    )
+
+    assert harness.attempts == 2
+    assert signaled == ["conv_xyz"]
+
+
+async def test_httpcore_read_error_is_treated_as_dead_channel() -> None:
+    """An httpcore-level read error also retries-then-signals."""
+    import httpcore
+
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _PolicyDeadChannelHarnessClient(httpcore.ReadError("read failed"))
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_abc",
+        evaluation_id="poleval_2",
+        phase="PHASE_LLM_REQUEST",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+    assert signaled == ["conv_abc"]
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ConnectError("connection refused"),
+        httpx.ConnectTimeout("connect timed out"),
+    ],
+)
+async def test_connect_failure_is_treated_as_dead_channel(exc: BaseException) -> None:
+    """A connect failure (subprocess already gone) retries-then-signals."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _PolicyDeadChannelHarnessClient(exc)
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_conn",
+        evaluation_id="poleval_conn",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+    assert signaled == ["conv_conn"]
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ReadTimeout("read timed out"),
+        httpx.WriteTimeout("write timed out"),
+        httpx.PoolTimeout("pool timed out"),
+    ],
+)
+async def test_delivery_timeout_is_treated_as_dead_channel(exc: BaseException) -> None:
+    """A verdict-delivery timeout retries-then-signals, not parks for 24h."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _PolicyDeadChannelHarnessClient(exc)
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_timeout",
+        evaluation_id="poleval_timeout",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+    assert signaled == ["conv_timeout"]
+
+
+async def test_non_2xx_verdict_response_retries_then_signals() -> None:
+    """A non-2xx verdict POST is an unacknowledged delivery: retry then signal."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    class _Non2xxHarness:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+            del json, timeout
+            self.attempts += 1
+            return httpx.Response(500, text="boom")
+
+    harness = _Non2xxHarness()
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_500",
+        evaluation_id="poleval_500",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+    assert signaled == ["conv_500"]
+
+
+async def test_non_transport_delivery_error_signals_without_retry() -> None:
+    """A non-transport delivery error signals without retry."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _PolicyDeadChannelHarnessClient(ValueError("malformed body"))
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_q",
+        evaluation_id="poleval_3",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 1
+    assert signaled == ["conv_q"]
+
+
+async def test_3xx_verdict_response_is_unacknowledged_and_signals() -> None:
+    """A 3xx verdict response is NOT a 2xx ack: retry then signal."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    class _RedirectHarness:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+            del json, timeout
+            self.attempts += 1
+            return httpx.Response(302, headers={"location": "/elsewhere"})
+
+    harness = _RedirectHarness()
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_3xx",
+        evaluation_id="poleval_3xx",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+    assert signaled == ["conv_3xx"]
+
+
+async def test_successful_delivery_does_not_signal() -> None:
+    """A clean delivery posts exactly once and never signals a recovery."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    class _OkHarness:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+            del json, timeout
+            self.attempts += 1
+            return httpx.Response(200, json={})
+
+    harness = _OkHarness()
+    await _evaluate_policy_via_omnigent(
+        server_client=_PolicyOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_ok",
+        evaluation_id="poleval_4",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 1
+    assert signaled == []
+
+
+# ── Turn-state recovery tests (from test_app_sessions_desync) ─────────────
+
+
+@pytest.mark.asyncio
+async def test_wedged_session_releases_and_recovers() -> None:
+    """A wedged turn with a buffered message releases promptly.
+
+    Simulates a turn parked on the 24h policy-evaluation future. ``_resync_turn_state``
+    must release it in milliseconds, flag the conversation as needing recovery, and let
+    the buffered continuation bind a fresh turn (which clears the flag).
+    """
+    conv = "conv_recovery_recover"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    forever = asyncio.Event()
+
+    async def _wedged_turn() -> None:
+        await forever.wait()
+
+    async with _recovery_runner_client(app) as http:
+        task = asyncio.create_task(_wedged_turn())
+        app.state.active_turns[conv] = task
+        try:
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "follow up"}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+
+            loop = asyncio.get_running_loop()
+            t0 = loop.time()
+            await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+            elapsed = loop.time() - t0
+
+            assert elapsed < 2.0, elapsed
+            assert task.cancelled() or task.done()
+            assert conv in app.state.desynced_sessions
+
+            deadline = loop.time() + 3.0
+            while loop.time() < deadline and conv in app.state.desynced_sessions:
+                await asyncio.sleep(0.02)
+            assert conv not in app.state.desynced_sessions
+        finally:
+            forever.set()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    queue = app.state.session_event_queues.get(conv)
+    recovery_failed = []
+    while queue is not None and not queue.empty():
+        event = queue.get_nowait()
+        if (
+            isinstance(event, dict)
+            and event.get("type") == "session.status"
+            and event.get("status") == "failed"
+            and isinstance(event.get("error"), dict)
+            and event["error"].get("code") == "runner_turn_context_desync"
+        ):
+            recovery_failed.append(event)
+    assert recovery_failed == []
+
+
+@pytest.mark.asyncio
+async def test_recovery_drains_buffer_when_turn_pops_active_slot() -> None:
+    """Recovery drains the buffer even when the cancelled turn self-pops."""
+    conv = "conv_recovery_selfpop"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    forever = asyncio.Event()
+
+    async def _wedged_turn() -> None:
+        try:
+            await forever.wait()
+        except asyncio.CancelledError:
+            app.state.active_turns.pop(conv, None)
+            raise
+
+    async with _recovery_runner_client(app) as http:
+        task = asyncio.create_task(_wedged_turn())
+        app.state.active_turns[conv] = task
+        try:
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "follow up"}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+
+            loop = asyncio.get_running_loop()
+            await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+            assert task.cancelled() or task.done()
+
+            deadline = loop.time() + 3.0
+            while loop.time() < deadline and conv in app.state.desynced_sessions:
+                await asyncio.sleep(0.02)
+            assert conv not in app.state.desynced_sessions
+        finally:
+            forever.set()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+@pytest.mark.asyncio
+async def test_recovery_stream_mode_forwards_interrupt() -> None:
+    """Stream-mode recovery clears the gate and forwards interrupt."""
+    conv = "conv_recovery_streammode"
+    harness = _RecoveryScriptedHarnessClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert conv not in app.state.active_turns
+    assert {"type": "interrupt"} in harness.patched_events
+
+
+class _DeadInterruptHarnessClient(_RecoveryScriptedHarnessClient):
+    """Scripted harness whose interrupt POST always raises (wedged/dead harness)."""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        raise httpx.ConnectError("harness gone")
+
+
+@pytest.mark.asyncio
+async def test_recovery_stream_mode_clears_gate_even_when_interrupt_fails() -> None:
+    """Stream-mode sentinel clears and buffer drains even on a dead interrupt."""
+    conv = "conv_recovery_streammode_dead"
+    harness = _DeadInterruptHarnessClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _recovery_runner_client(app) as http:
+        app.state.active_turns[conv] = None
+        resp = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag",
+                "model": "x",
+                "content": [{"role": "user", "content": "follow up"}],
+            },
+        )
+        assert resp.status_code == 202, resp.text
+
+        loop = asyncio.get_running_loop()
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+        deadline = loop.time() + 3.0
+        while loop.time() < deadline and conv in app.state.desynced_sessions:
+            await asyncio.sleep(0.02)
+        assert conv not in app.state.desynced_sessions
+
+
+class _InterruptEndsStreamHarnessClient(_RecoveryScriptedHarnessClient):
+    """Interrupt POST succeeds AND drives proxy_stream terminal bookkeeping."""
+
+    app: Any = None
+    conv: str = ""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            self.app.state.on_proxy_stream_end(self.conv)
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_recovery_stream_mode_publishes_single_terminal_status() -> None:
+    """Stream-mode no-buffer recovery publishes exactly ONE terminal status."""
+    conv = "conv_recovery_single_terminal"
+    harness = _InterruptEndsStreamHarnessClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    queue = app.state.session_event_queues.get(conv)
+    statuses: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        if isinstance(ev, dict) and ev.get("type") == "session.status":
+            statuses.append(ev)
+
+    assert len(statuses) == 1, statuses
+    assert statuses[0]["status"] == "failed"
+    assert statuses[0]["error"]["code"] == "runner_turn_context_desync"
+    assert {"type": "interrupt"} in harness.patched_events
+
+
+class _SlotSwapBaseException(BaseException):
+    """A non-Exception raised in setup to exercise the finally floor."""
+
+
+@pytest.mark.asyncio
+async def test_run_turn_bg_finalizer_identity_guard_spares_foreign_slot() -> None:
+    """F2: the ``_run_turn_bg`` finally floor must identity-compare before popping."""
+    conv = "conv_finalizer_identity"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+
+    foreign_task = asyncio.create_task(asyncio.Event().wait())
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        app.state.active_turns[conv] = foreign_task
+        raise _SlotSwapBaseException
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    try:
+        async with _recovery_runner_client(app) as http:
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "turn A"}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+
+            task = app.state.active_turns.get(conv)
+            assert isinstance(task, asyncio.Task)
+
+            with contextlib.suppress(BaseException):
+                await task
+
+        assert app.state.active_turns.get(conv) is foreign_task
+    finally:
+        foreign_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await foreign_task
+        app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.asyncio
+async def test_on_proxy_stream_end_spares_superseded_response() -> None:
+    """BLOCKING-1: a stale stream terminal must not clobber a newer turn's state."""
+    conv = "conv_stream_supersede"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    newer = asyncio.create_task(asyncio.Event().wait())
+    try:
+        app.state.active_turns[conv] = newer
+        app.state.live_response_id[conv] = "resp_new"
+
+        app.state.on_proxy_stream_end(conv, owner_response_id="resp_old")
+
+        assert app.state.active_turns.get(conv) is newer
+        assert app.state.live_response_id.get(conv) == "resp_new"
+        assert conv not in pm.cleared_in_flight
+
+        app.state.on_proxy_stream_end(conv, owner_response_id="resp_new")
+        assert conv not in app.state.active_turns
+        assert conv not in app.state.live_response_id
+        assert conv in pm.cleared_in_flight
+    finally:
+        newer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await newer
+        app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.asyncio
+async def test_resync_ownership_gate_ignores_superseded_delivery_failure() -> None:
+    """BLOCKING-2: a delayed verdict-delivery failure must not cancel a newer turn."""
+    conv = "conv_delivery_supersede"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        app.state.live_response_id[conv] = "resp_new"
+
+        await app.state.resync_turn_state(
+            conv, "verdict_delivery_channel_dead", owner_response_id="resp_old"
+        )
+
+    assert conv in app.state.active_turns
+    assert app.state.live_response_id.get(conv) == "resp_new"
+    queue = app.state.session_event_queues.get(conv)
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        assert not (
+            isinstance(ev, dict)
+            and ev.get("type") == "session.status"
+            and ev.get("status") == "failed"
+            and isinstance(ev.get("error"), dict)
+            and ev["error"].get("code") == "runner_turn_context_desync"
+        ), ev
+    app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.asyncio
+async def test_resync_clears_in_flight_marker_no_buffer() -> None:
+    """B1: an accepted no-buffer resync clears the process-manager in-flight marker."""
+    conv = "conv_resync_inflight"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        app.state.live_response_id[conv] = "resp_live"
+        pm.mark_in_flight(conv, "resp_live")
+        assert conv not in pm.cleared_in_flight
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert conv in pm.cleared_in_flight
+    queue = app.state.session_event_queues.get(conv)
+    failed = []
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        if (
+            isinstance(ev, dict)
+            and ev.get("type") == "session.status"
+            and ev.get("status") == "failed"
+            and isinstance(ev.get("error"), dict)
+            and ev["error"].get("code") == "runner_turn_context_desync"
+        ):
+            failed.append(ev)
+    assert len(failed) == 1, failed
+    app.state.active_turns.pop(conv, None)
+
+
+class _InterruptBindsContinuationClient(_RecoveryScriptedHarnessClient):
+    """On the recovery interrupt, bind a continuation AND drain the buffer."""
+
+    app: Any = None
+    conv: str = ""
+    continuation: asyncio.Task[None] | None = None
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            self.app.state.session_message_buffers.pop(self.conv, None)
+            self.continuation = asyncio.create_task(asyncio.Event().wait())
+            self.app.state.turn_bind_epoch[self.conv] = (
+                self.app.state.turn_bind_epoch.get(self.conv, 0) + 1
+            )
+            self.app.state.active_turns[self.conv] = self.continuation
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_resync_does_not_publish_failed_over_drained_continuation() -> None:
+    """NB3: a continuation that binds AND drains the buffer during teardown wins."""
+    conv = "conv_resync_cont_race"
+    harness = _InterruptBindsContinuationClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        app.state.session_message_buffers[conv] = [{"content": "follow up"}]
+        try:
+            await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+            assert app.state.active_turns.get(conv) is harness.continuation
+            queue = app.state.session_event_queues.get(conv)
+            while queue is not None and not queue.empty():
+                ev = queue.get_nowait()
+                assert not (
+                    isinstance(ev, dict)
+                    and ev.get("type") == "session.status"
+                    and ev.get("status") == "failed"
+                    and isinstance(ev.get("error"), dict)
+                    and ev["error"].get("code") == "runner_turn_context_desync"
+                ), ev
+        finally:
+            if harness.continuation is not None:
+                harness.continuation.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await harness.continuation
+            app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.asyncio
+async def test_resync_removes_completed_stale_task_and_publishes_terminal() -> None:
+    """BLOCKING (round 5): a COMPLETED task in the slot is a corpse, not a continuation."""
+    conv = "conv_resync_corpse"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    done_task = asyncio.create_task(asyncio.sleep(0))
+    await done_task
+    assert done_task.done()
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = done_task
+        app.state.live_response_id[conv] = "resp_dead"
+        pm.mark_in_flight(conv, "resp_dead")
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert conv not in app.state.active_turns
+    assert conv in pm.cleared_in_flight
+    queue = app.state.session_event_queues.get(conv)
+    failed = []
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        if (
+            isinstance(ev, dict)
+            and ev.get("type") == "session.status"
+            and ev.get("status") == "failed"
+            and isinstance(ev.get("error"), dict)
+            and ev["error"].get("code") == "runner_turn_context_desync"
+        ):
+            failed.append(ev)
+    assert len(failed) == 1, failed
+    assert conv not in app.state.active_turns
+
+
+class _CompleteTaskOnInterruptClient(_RecoveryScriptedHarnessClient):
+    """On the recovery interrupt, complete the wedged task so it arrives DONE."""
+
+    task: asyncio.Task[None] | None = None
+    release: asyncio.Event | None = None
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt":
+            if self.release is not None:
+                self.release.set()
+            if self.task is not None:
+                with contextlib.suppress(BaseException):
+                    await self.task
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_resync_clears_interrupt_token_when_task_completes_during_teardown() -> None:
+    """Round-6 pre-empt: a task that completes during teardown must not leak its token."""
+    conv = "conv_resync_token_leak"
+    harness = _CompleteTaskOnInterruptClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    release = asyncio.Event()
+
+    async def _turn() -> None:
+        await release.wait()
+
+    task = asyncio.create_task(_turn())
+    harness.task = task
+    harness.release = release
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = task
+        app.state.live_response_id[conv] = "resp_live"
+        pm.mark_in_flight(conv, "resp_live")
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert task.done()
+    assert conv not in app.state.interrupted_sessions
+    assert conv not in app.state.active_turns
+    app.state.active_turns.pop(conv, None)
+
+
+class _InterruptBindsStreamContinuationClient(_RecoveryScriptedHarnessClient):
+    """On the recovery interrupt, bind a NEW stream=true turn (None sentinel)."""
+
+    app: Any = None
+    conv: str = ""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            self.app.state.turn_bind_epoch[self.conv] = (
+                self.app.state.turn_bind_epoch.get(self.conv, 0) + 1
+            )
+            self.app.state.active_turns[self.conv] = None
+            self.app.state.live_response_id[self.conv] = "resp_new"
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_resync_does_not_clobber_stream_continuation_reusing_none_sentinel() -> None:
+    """BLOCKING (round 6): a new stream=true turn (None sentinel) is not a corpse."""
+    conv = "conv_resync_stream_reuse"
+    harness = _InterruptBindsStreamContinuationClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        app.state.live_response_id[conv] = "resp_old"
+        pm.mark_in_flight(conv, "resp_old")
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert conv in app.state.active_turns
+    assert app.state.live_response_id.get(conv) == "resp_new"
+    queue = app.state.session_event_queues.get(conv)
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        assert not (
+            isinstance(ev, dict)
+            and ev.get("type") == "session.status"
+            and ev.get("status") == "failed"
+            and isinstance(ev.get("error"), dict)
+            and ev["error"].get("code") == "runner_turn_context_desync"
+        ), ev
+    app.state.active_turns.pop(conv, None)
+
+
+class _ReplacementRunsToCompletionClient(_RecoveryScriptedHarnessClient):
+    """On the recovery interrupt, run a replacement turn to COMPLETION."""
+
+    app: Any = None
+    conv: str = ""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            st = self.app.state
+            st.turn_bind_epoch[self.conv] = st.turn_bind_epoch.get(self.conv, 0) + 1
+            st.active_turns[self.conv] = None
+            st.live_response_id[self.conv] = "resp_new"
+            st.on_proxy_stream_end(self.conv, owner_response_id="resp_new")
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_resync_does_not_clobber_replacement_that_finished_during_interrupt() -> None:
+    """BLOCKING (round 7): a replacement that starts AND finishes during teardown wins."""
+    conv = "conv_resync_replacement_done"
+    harness = _ReplacementRunsToCompletionClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _recovery_runner_client(app):
+        app.state.active_turns[conv] = None
+        app.state.live_response_id[conv] = "resp_old"
+        pm.mark_in_flight(conv, "resp_old")
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    queue = app.state.session_event_queues.get(conv)
+    statuses: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        if isinstance(ev, dict) and ev.get("type") == "session.status":
+            statuses.append(ev)
+
+    recovery_failed = [
+        s
+        for s in statuses
+        if s.get("status") == "failed"
+        and isinstance(s.get("error"), dict)
+        and s["error"].get("code") == "runner_turn_context_desync"
+    ]
+    assert recovery_failed == [], statuses
+    assert any(s.get("status") == "idle" for s in statuses), statuses
+    app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.asyncio
+async def test_delete_session_clears_all_paired_recovery_state() -> None:
+    """A deleted session must not leave recovery state that a same-id recreate inherits."""
+    conv = "conv_delete_recreate"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _recovery_runner_client(app) as http:
+        app.state.begin_turn_slot(conv)
+        app.state.desync_terminalized[conv] = app.state.turn_bind_epoch[conv]
+        app.state.desynced_sessions.add(conv)
+
+        resp = await http.request("DELETE", f"/v1/sessions/{conv}")
+        assert resp.status_code in (200, 204), resp.text
+
+    assert conv not in app.state.turn_bind_epoch
+    assert conv not in app.state.desync_terminalized
+    assert conv not in app.state.desynced_sessions
+
+    app.state.begin_turn_slot(conv)
+    app.state.on_proxy_stream_end(conv)
+    queue = app.state.session_event_queues.get(conv)
+    statuses = []
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        if isinstance(ev, dict) and ev.get("type") == "session.status":
+            statuses.append(ev)
+    assert any(s.get("status") == "idle" for s in statuses), statuses
+
+
+class _DeleteRecreateDuringInterruptClient(_RecoveryScriptedHarnessClient):
+    """On the recovery interrupt, simulate a same-id delete → recreate mid-await."""
+
+    app: Any = None
+    conv: str = ""
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            st = self.app.state
+            st.active_turns.pop(self.conv, None)
+            st.turn_bind_epoch.pop(self.conv, None)
+            st.desync_terminalized.pop(self.conv, None)
+            st.desynced_sessions.discard(self.conv)
+            st.begin_turn_slot(self.conv)
+            st.live_response_id[self.conv] = "resp_new"
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_resync_does_not_clobber_recreated_session_after_delete_mid_interrupt() -> None:
+    """BLOCKING-class (round 8): a same-id recreate during the interrupt await is not clobbered."""
+    conv = "conv_delete_mid_interrupt"
+    harness = _DeleteRecreateDuringInterruptClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _recovery_runner_client(app):
+        app.state.begin_turn_slot(conv)
+        app.state.live_response_id[conv] = "resp_old"
+        pm.mark_in_flight(conv, "resp_old")
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert conv in app.state.active_turns
+    assert app.state.live_response_id.get(conv) == "resp_new"
+    queue = app.state.session_event_queues.get(conv)
+    while queue is not None and not queue.empty():
+        ev = queue.get_nowait()
+        assert not (
+            isinstance(ev, dict)
+            and ev.get("type") == "session.status"
+            and ev.get("status") == "failed"
+            and isinstance(ev.get("error"), dict)
+            and ev["error"].get("code") == "runner_turn_context_desync"
+        ), ev
+    app.state.active_turns.pop(conv, None)
+
+
+class _NestedRecoveryDuringInterruptClient(_RecoveryScriptedHarnessClient):
+    """On the OLD recovery's interrupt, bind a replacement AND claim a nested token."""
+
+    app: Any = None
+    conv: str = ""
+    nested_epoch: int = 0
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if isinstance(json, dict) and json.get("type") == "interrupt" and self.app is not None:
+            st = self.app.state
+            st.begin_turn_slot(self.conv)
+            st.live_response_id[self.conv] = "resp_new"
+            self.nested_epoch = st.turn_bind_epoch[self.conv]
+            st.desync_terminalized[self.conv] = self.nested_epoch
+        return await super().post(url, json=json, timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_old_recovery_does_not_strip_nested_recovery_token() -> None:
+    """BLOCKING (round 9): the old recovery must not pop a nested recovery's token."""
+    conv = "conv_nested_recovery"
+    harness = _NestedRecoveryDuringInterruptClient([])
+    pm = _RecoveryFakeProcessManager(harness)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    harness.app = app
+    harness.conv = conv
+
+    async with _recovery_runner_client(app):
+        app.state.begin_turn_slot(conv)
+        app.state.live_response_id[conv] = "resp_old"
+        pm.mark_in_flight(conv, "resp_old")
+
+        await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
+
+    assert app.state.desync_terminalized.get(conv) == harness.nested_epoch
+
+
+# ── Three-factor causal chain tests (from test_desync_live_repro) ─────────
+
+_ADAPTER_LOGGER_RECOVERY = "omnigent.runtime.harnesses._executor_adapter"
+_APP_LOGGER_RECOVERY = "omnigent.runner.app"
+
+_ORPHAN_RESYNC_THRESHOLD_DEFAULT_RECOVERY = _ORPHAN_RESYNC_THRESHOLD
+
+
+class _DispatchParkingExecutor(_RecoveryExecutor):
+    """Inner executor that parks a REAL tool dispatch through production code."""
+
+    def __init__(self, events: list[_RecoveryExecutorEvent] | None = None) -> None:
+        self._events = events or []
+        self.interrupt_calls: list[str] = []
+        self.close_calls = 0
+        self.close_session_calls = 0
+
+    async def run_turn(
+        self,
+        messages: list[_RecoveryMessage],
+        tools: list[_RecoveryToolSpec],
+        system_prompt: str,
+        config: _RecoveryExecutorConfig | None = None,
+    ) -> Any:
+        await self._tool_executor("Bash", {"command": "ls"})  # type: ignore[attr-defined]
+        for event in self._events:
+            yield event
+
+    async def interrupt_session(self, session_key: str) -> bool:
+        self.interrupt_calls.append(session_key)
+        return True
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+    async def close_session(self, session_key: str) -> None:
+        del session_key
+        self.close_session_calls += 1
+
+    async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
+        del session_key, content
+        return True
+
+
+class _ChainOkServerClient:
+    """Server client whose ``/policies/evaluate`` returns ALLOW."""
+
+    async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+        del json, timeout
+        return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW", "reason": None})
+
+
+class _ChainDeadChannelHarnessClient:
+    """Harness client whose verdict POST raises a real dead-channel error."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.attempts = 0
+        self._exc = exc
+
+    async def post(self, _url: str, *, json: dict[str, Any], timeout: Any) -> httpx.Response:
+        del json, timeout
+        self.attempts += 1
+        raise self._exc
+
+
+class _HarnessInterruptClient:
+    """Harness HTTP client modelling the runner→harness interrupt hop."""
+
+    def __init__(self, pm: _ChainProcessManager) -> None:
+        self._pm = pm
+
+    async def post(
+        self, _url: str, *, json: dict[str, Any], timeout: Any = None
+    ) -> httpx.Response:
+        del timeout
+        if json.get("type") == "interrupt":
+            task = self._pm.consume_task
+            if task is not None and not task.done():
+                task.cancel()
+        return httpx.Response(200, json={})
+
+    def stream(self, _method: str, _url: str, **_kwargs: Any) -> _ChainEmptyStream:
+        return _ChainEmptyStream()
+
+
+class _ChainEmptyStream:
+    """Async-context-manager stub yielding a 200 response with no SSE frames."""
+
+    status_code = 200
+    headers: dict[str, str] = {}
+
+    async def __aenter__(self) -> _ChainEmptyStream:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        return None
+
+    async def aiter_text(self) -> Any:
+        return
+        yield  # pragma: no cover
+
+
+class _ChainProcessManager:
+    """Process-manager stub for the three-factor chain."""
+
+    handles_tool_dispatch = True
+
+    def __init__(self) -> None:
+        self._sessions: set[str] = set()
+        self.consume_task: asyncio.Task[None] | None = None
+        self.respawn_hook: Any = None
+        self.marked_in_flight: list[tuple[str, str]] = []
+        self.cleared_in_flight: list[str] = []
+
+    def set_respawn_hook(self, hook: Any) -> None:
+        self.respawn_hook = hook
+
+    async def get_client(self, conversation_id: str, harness: str, env: Any = None) -> Any:
+        del harness, env
+        self._sessions.add(conversation_id)
+        return _HarnessInterruptClient(self)
+
+    def has_session(self, conversation_id: str) -> bool:
+        return conversation_id in self._sessions
+
+    def has_active_turn(self, conversation_id: str) -> bool:
+        del conversation_id
+        return False
+
+    def mark_in_flight(self, conversation_id: str, response_id: str) -> None:
+        self.marked_in_flight.append((conversation_id, response_id))
+
+    def clear_in_flight(self, conversation_id: str) -> None:
+        self.cleared_in_flight.append(conversation_id)
+
+    async def forward_cancel(self, conversation_id: str) -> bool:
+        del conversation_id
+        return True
+
+    async def release(self, conversation_id: str) -> None:
+        self._sessions.discard(conversation_id)
+
+
+def _chain_request(text: str = "hi") -> _CreateResponseRequest:
+    return _CreateResponseRequest(model="agent", input=text)
+
+
+def _chain_tool_result(call_id: str, output: str) -> _ToolResultEvent:
+    return _ToolResultEvent(type="tool_result", call_id=call_id, output=output)
+
+
+def _chain_drain_status_events(queues: dict[str, Any], conv_id: str) -> list[dict[str, Any]]:
+    queue = queues.get(conv_id)
+    out: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        event = queue.get_nowait()
+        if isinstance(event, dict) and event.get("type") == "session.status":
+            out.append(event)
+    return out
+
+
+async def _chain_start_turn_stream(
+    adapter: ExecutorAdapter, request: _CreateResponseRequest
+) -> _StreamingResponse:
+    resp = await adapter._start_or_inject_turn(request)
+    assert isinstance(resp, _StreamingResponse), resp
+    return resp
+
+
+async def _chain_drain_stream(body_iterator: Any) -> None:
+    async for _chunk in body_iterator:
+        pass
+
+
+async def _chain_spin_until(predicate: Any, *, limit: int = 200) -> None:
+    for _ in range(limit):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition never became true")
+
+
+def _chain_wedged_dispatch_call_id(adapter: ExecutorAdapter) -> str | None:
+    for ctx in adapter._in_flight.values():
+        if ctx._pending_tool_calls:
+            return next(iter(ctx._pending_tool_calls))
+    return None
+
+
+async def _run_three_factor_chain(adapter: ExecutorAdapter) -> tuple[Any, str]:
+    """Wire factors 1→2→3 through real callsites and return the wedged state."""
+    conv = "conv_chain"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+
+    resp = await _chain_start_turn_stream(adapter, _chain_request("primary turn"))
+    consume_task: asyncio.Task[None] = asyncio.create_task(_chain_drain_stream(resp.body_iterator))
+    pm.consume_task = consume_task
+    await _chain_spin_until(lambda: _chain_wedged_dispatch_call_id(adapter) is not None)
+    app.state.active_turns[conv] = None
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        buffered = await client.post(
+            f"/v1/sessions/{conv}/events",
+            json={"type": "message", "role": "user", "content": "queued during the drop"},
+        )
+    assert buffered.status_code == 202
+    assert app.state.session_message_buffers.get(conv)
+
+    async def _on_delivery_failure(cid: str) -> None:
+        await app.state.resync_turn_state(cid, "verdict_delivery_channel_dead")
+
+    harness = _ChainDeadChannelHarnessClient(
+        httpx.RemoteProtocolError("Server disconnected without sending a response")
+    )
+    await _evaluate_policy_via_omnigent(
+        server_client=_ChainOkServerClient(),
+        harness_client=harness,
+        conversation_id=conv,
+        evaluation_id="poleval_chain",
+        phase="PHASE_TOOL_CALL",
+        data={"name": "mcp__github__merge_pull_request", "arguments": {}},
+        on_delivery_failure=_on_delivery_failure,
+    )
+    assert harness.attempts == 2
+
+    await asyncio.gather(consume_task, return_exceptions=True)
+    await _chain_spin_until(lambda: adapter._current_ctx is None)
+    return app, conv
+
+
+async def test_three_factor_chain_self_heals_and_recovers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Fix LIVE: the chained recovery fails CLOSED, self-heals, and recovers."""
+    executor = _DispatchParkingExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    with caplog.at_level(logging.ERROR, logger=_ADAPTER_LOGGER_RECOVERY):
+        app, conv = await _run_three_factor_chain(adapter)
+
+        verdict = await adapter._stable_policy_evaluator("PHASE_TOOL_CALL", {})
+        assert verdict.action == "POLICY_ACTION_DENY"
+
+        for _ in range(_ORPHAN_RESYNC_THRESHOLD):
+            result = await adapter._stable_tool_executor("Bash", {"command": "ls"})
+            assert result["code"] == _RUNNER_TURN_CONTEXT_DESYNC_CODE
+
+    text = caplog.text
+    assert "defaulting to POLICY_ACTION_DENY" in text
+    assert "returning ALLOW by default" not in text
+    assert "defaulting to POLICY_ACTION_ALLOW" not in text
+    assert "forcing Tier-1 SDK reset" in text
+    assert adapter._orphan_callback_count < _ORPHAN_RESYNC_THRESHOLD
+
+    statuses = _chain_drain_status_events(app.state.session_event_queues, conv)
+    assert all(
+        s.get("error", {}).get("code") != _RUNNER_TURN_CONTEXT_DESYNC_CODE for s in statuses
+    ), statuses
+    assert conv not in app.state.desync_terminalized
+
+    cont_executor = _DispatchParkingExecutor(events=[_RecoveryTurnComplete(response="ok")])
+    adapter._executor_factory = lambda: cont_executor
+    cont_resp = await _chain_start_turn_stream(adapter, _chain_request("continuation work"))
+    cont_consume: asyncio.Task[None] = asyncio.create_task(
+        _chain_drain_stream(cont_resp.body_iterator)
+    )
+
+    await _chain_spin_until(lambda: _chain_wedged_dispatch_call_id(adapter) is not None)
+    cont_call_id = _chain_wedged_dispatch_call_id(adapter)
+    assert cont_call_id is not None and cont_call_id != "call_inflight"
+
+    await adapter._handle_tool_result_event(_chain_tool_result(cont_call_id, "dispatched-live"))
+    await asyncio.gather(cont_consume, return_exceptions=True)
+    await _chain_spin_until(lambda: adapter._current_ctx is None)
+    assert adapter._orphan_callback_count == 0
+
+
+async def test_three_factor_chain_fix_disabled_reproduces_wedge(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NEGATIVE CONTROL: with the fix toggled OFF, the chain WEDGES (from real code)."""
+    monkeypatch.setattr(_adapter_mod_recovery, "FAIL_CLOSED_PHASES", ())
+    monkeypatch.setattr(_adapter_mod_recovery, "_ORPHAN_RESYNC_THRESHOLD", 10**9)
+
+    executor = _DispatchParkingExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    with caplog.at_level(logging.ERROR, logger=_ADAPTER_LOGGER_RECOVERY):
+        await _run_three_factor_chain(adapter)
+
+        verdict = await adapter._stable_policy_evaluator("PHASE_TOOL_CALL", {})
+        assert verdict.action == "POLICY_ACTION_ALLOW"
+
+        n_orphans = _ORPHAN_RESYNC_THRESHOLD_DEFAULT_RECOVERY * 2
+        for _ in range(n_orphans):
+            result = await adapter._stable_tool_executor("Bash", {"command": "ls"})
+            assert result["code"] == _RUNNER_TURN_CONTEXT_DESYNC_CODE
+
+    text = caplog.text
+    assert "policy evaluator fired with no active turn context (phase=PHASE_TOOL_CALL" in text
+    assert "defaulting to POLICY_ACTION_ALLOW" in text
+    assert "tool callback fired with no active turn context (tool=" in text
+    assert "returning error" in text
+    assert "forcing Tier-1 SDK reset" not in text
+    assert adapter._orphan_callback_count >= n_orphans
+
+
+async def test_runner_recovery_publishes_single_recovery_terminal_status() -> None:
+    """Fix LIVE (runner half): a recovery signal with NO buffer yields ONE status."""
+    conv = "conv_runner_recovery"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+    app.state.active_turns[conv] = None
+
+    async def _on_delivery_failure(cid: str) -> None:
+        await app.state.resync_turn_state(cid, "verdict_delivery_channel_dead")
+
+    harness = _ChainDeadChannelHarnessClient(
+        httpx.RemoteProtocolError("Server disconnected without sending a response")
+    )
+    await _evaluate_policy_via_omnigent(
+        server_client=_ChainOkServerClient(),
+        harness_client=harness,
+        conversation_id=conv,
+        evaluation_id="poleval_runner",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=_on_delivery_failure,
+    )
+
+    assert harness.attempts == 2
+    assert conv not in app.state.active_turns
+    statuses = _chain_drain_status_events(app.state.session_event_queues, conv)
+    assert len(statuses) == 1, statuses
+    assert statuses[0]["status"] == "failed"
+    assert statuses[0]["error"]["code"] == _RUNNER_TURN_CONTEXT_DESYNC_CODE
+    assert conv in app.state.desync_terminalized
+
+
+async def test_negative_control_runner_legacy_swallow_leaves_turn_wedged() -> None:
+    """NEGATIVE CONTROL (runner half): legacy log-and-swallow leaves the wedge."""
+    conv = "conv_legacy_wedge"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+    app.state.active_turns[conv] = None
+
+    harness = _ChainDeadChannelHarnessClient(
+        httpx.RemoteProtocolError("Server disconnected without sending a response")
+    )
+    await _evaluate_policy_via_omnigent(
+        server_client=_ChainOkServerClient(),
+        harness_client=harness,
+        conversation_id=conv,
+        evaluation_id="poleval_legacy",
+        phase="PHASE_TOOL_CALL",
+        data={},
+        on_delivery_failure=None,
+    )
+
+    assert conv in app.state.active_turns
+    assert _chain_drain_status_events(app.state.session_event_queues, conv) == []
+    assert conv not in app.state.desync_terminalized
+
+
+def _fake_entry(harness: str, model: str | None, returncode: int | None = None) -> Any:
+    """Build a ``_SubprocessEntry`` with a fake process + client."""
+    from omnigent.runtime.harnesses.process_manager import _SubprocessEntry
+
+    class _FakeProc:
+        def __init__(self, rc: int | None) -> None:
+            self.pid = 12345
+            self.returncode = rc
+
+    return _SubprocessEntry(
+        process=_FakeProc(returncode),  # type: ignore[arg-type]
+        client=object(),  # type: ignore[arg-type]
+        endpoint=None,  # type: ignore[arg-type]
+        harness=harness,
+        model=model,
+    )
+
+
+async def test_get_client_signals_resync_on_model_and_agent_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gap 1 (process-manager half): a model/agent-switch respawn fires the hook."""
+    from omnigent.runtime.harnesses.process_manager import (
+        HarnessProcessManager,
+        _model_env_key,
+    )
+
+    pm = HarnessProcessManager()
+    pm._started = True
+    signals: list[tuple[str, str, str]] = []
+
+    async def _hook(conv_id: str, reason: str, replaced_response_id: str) -> None:
+        signals.append((conv_id, reason, replaced_response_id))
+
+    pm.set_respawn_hook(_hook)
+
+    closed: list[Any] = []
+
+    async def _fake_close(entry: Any) -> None:
+        closed.append(entry)
+
+    async def _fake_spawn(conv_id: str, harness: str, env: Any) -> Any:
+        del conv_id
+        return _fake_entry(harness, (env or {}).get(_model_env_key(harness)))
+
+    monkeypatch.setattr(pm, "_close_entry", _fake_close)
+    monkeypatch.setattr(pm, "_spawn_entry", _fake_spawn)
+
+    conv = "conv_pm_switch"
+    harness = "claude-sdk"
+    model_key = _model_env_key(harness)
+
+    pm._entries[conv] = _fake_entry(harness, "model-A")
+    pm._in_flight_response_ids[conv] = "resp_live_1"
+
+    await pm.get_client(conv, harness, env={model_key: "model-B"})
+    assert signals == [(conv, "harness_respawn_model_switch", "resp_live_1")]
+    assert len(closed) == 1
+
+    signals.clear()
+    await pm.get_client(conv, harness, env={model_key: "model-B"})
+    assert signals == []
+
+    signals.clear()
+    pm._in_flight_response_ids[conv] = "resp_live_2"
+    await pm.get_client(conv, "pi", env={})
+    assert signals == [(conv, "harness_respawn_agent_switch", "resp_live_2")]
+
+    signals.clear()
+    pm._entries[conv] = _fake_entry("pi", "model-A")
+    pm._in_flight_response_ids.pop(conv, None)
+    await pm.get_client(conv, "pi", env={model_key: "model-B"})
+    assert signals == []
+
+    signals.clear()
+    pm._entries[conv] = _fake_entry("pi", None, returncode=1)
+    pm._in_flight_response_ids[conv] = "resp_dead"
+    await pm.get_client(conv, "pi", env={})
+    assert signals == []
+
+
+async def test_get_client_isolates_respawn_hook_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A raising respawn hook must NOT break harness acquisition."""
+    from omnigent.runtime.harnesses.process_manager import (
+        HarnessProcessManager,
+        _model_env_key,
+    )
+
+    pm = HarnessProcessManager()
+    pm._started = True
+
+    async def _boom_hook(conv_id: str, reason: str, replaced_response_id: str) -> None:
+        del conv_id, reason, replaced_response_id
+        raise RuntimeError("resync adapter blew up")
+
+    pm.set_respawn_hook(_boom_hook)
+
+    async def _fake_close(entry: Any) -> None:
+        del entry
+
+    spawned: list[Any] = []
+
+    async def _fake_spawn(conv_id: str, harness: str, env: Any) -> Any:
+        del conv_id
+        entry = _fake_entry(harness, (env or {}).get(_model_env_key(harness)))
+        spawned.append(entry)
+        return entry
+
+    monkeypatch.setattr(pm, "_close_entry", _fake_close)
+    monkeypatch.setattr(pm, "_spawn_entry", _fake_spawn)
+
+    conv = "conv_pm_hook_boom"
+    harness = "claude-sdk"
+    model_key = _model_env_key(harness)
+    pm._entries[conv] = _fake_entry(harness, "model-A")
+    pm._in_flight_response_ids[conv] = "resp_live"
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.runtime.harnesses.process_manager"):
+        client = await pm.get_client(conv, harness, env={model_key: "model-B"})
+
+    assert spawned
+    assert client is spawned[-1].client
+    assert pm._entries[conv] is spawned[-1]
+    assert "respawn resync hook failed" in caplog.text
+
+
+async def test_respawn_adapter_gates_on_active_turn() -> None:
+    """Gap 1 (runner gate): the respawn adapter only resyncs the MATCHING turn."""
+    conv = "conv_respawn_gate"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+    assert pm.respawn_hook is not None
+
+    await pm.respawn_hook(conv, "harness_respawn_model_switch", "resp_gone")
+    assert _chain_drain_status_events(app.state.session_event_queues, conv) == []
+    assert conv not in app.state.desync_terminalized
+
+    app.state.active_turns[conv] = None
+    app.state.live_response_id[conv] = "resp_new"
+    await pm.respawn_hook(conv, "harness_respawn_model_switch", "resp_old")
+    assert conv in app.state.active_turns
+    assert _chain_drain_status_events(app.state.session_event_queues, conv) == []
+
+    app.state.active_turns[conv] = None
+    app.state.live_response_id[conv] = "resp_wedged"
+    await pm.respawn_hook(conv, "harness_respawn_model_switch", "resp_wedged")
+    assert conv not in app.state.active_turns
+    statuses = _chain_drain_status_events(app.state.session_event_queues, conv)
+    assert len(statuses) == 1, statuses
+    assert statuses[0]["status"] == "failed"
+    assert statuses[0]["error"]["code"] == _RUNNER_TURN_CONTEXT_DESYNC_CODE
+
+
+async def _run_respawn_chain(
+    adapter: ExecutorAdapter,
+) -> tuple[Any, str, asyncio.Task[None], _ChainProcessManager]:
+    """Wire a real in-flight turn + buffered message, then fire the respawn hook."""
+    conv = "conv_respawn_chain"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+    assert pm.respawn_hook is not None
+
+    resp = await _chain_start_turn_stream(adapter, _chain_request("primary turn"))
+    consume_task: asyncio.Task[None] = asyncio.create_task(_chain_drain_stream(resp.body_iterator))
+    pm.consume_task = consume_task
+    await _chain_spin_until(lambda: _chain_wedged_dispatch_call_id(adapter) is not None)
+    app.state.active_turns[conv] = None
+    app.state.live_response_id[conv] = "resp_wedged"
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        buffered = await client.post(
+            f"/v1/sessions/{conv}/events",
+            json={"type": "message", "role": "user", "content": "after the switch"},
+        )
+    assert buffered.status_code == 202
+    assert app.state.session_message_buffers.get(conv)
+
+    assert adapter._orphan_callback_count == 0
+    await pm.respawn_hook(conv, "harness_respawn_model_switch", "resp_wedged")
+    return app, conv, consume_task, pm
+
+
+async def test_model_switch_mid_turn_orphan_burst_next_turn_recovers(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Gap 1+2 headline: mid-turn model switch → resync at respawn → recovers."""
+    executor = _DispatchParkingExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    with caplog.at_level(logging.ERROR, logger=_ADAPTER_LOGGER_RECOVERY):
+        app, conv, consume_task, pm = await _run_respawn_chain(adapter)
+
+        assert conv not in app.state.active_turns
+        await asyncio.gather(consume_task, return_exceptions=True)
+        await _chain_spin_until(lambda: adapter._current_ctx is None)
+        statuses = _chain_drain_status_events(app.state.session_event_queues, conv)
+        assert all(
+            s.get("error", {}).get("code") != _RUNNER_TURN_CONTEXT_DESYNC_CODE for s in statuses
+        ), statuses
+
+        await _chain_spin_until(
+            lambda: (
+                conv not in app.state.desynced_sessions
+                and not app.state.session_message_buffers.get(conv)
+                and conv in pm.cleared_in_flight
+            )
+        )
+        assert conv not in app.state.desynced_sessions
+        assert not app.state.session_message_buffers.get(conv)
+        assert conv in pm.cleared_in_flight
+
+        adapter._ensure_executor()
+        out = await adapter._stable_tool_executor("sys_os_shell", {"command": "ls"})
+        assert out["code"] == _RUNNER_TURN_CONTEXT_DESYNC_CODE
+        assert adapter._executor is None
+
+    assert "forcing Tier-1 SDK reset" in caplog.text
+
+    cont_executor = _DispatchParkingExecutor(events=[_RecoveryTurnComplete(response="ok")])
+    adapter._executor_factory = lambda: cont_executor
+    cont_resp = await _chain_start_turn_stream(adapter, _chain_request("continuation work"))
+    cont_consume: asyncio.Task[None] = asyncio.create_task(
+        _chain_drain_stream(cont_resp.body_iterator)
+    )
+    await _chain_spin_until(lambda: _chain_wedged_dispatch_call_id(adapter) is not None)
+    cont_call_id = _chain_wedged_dispatch_call_id(adapter)
+    assert cont_call_id is not None
+    await adapter._handle_tool_result_event(_chain_tool_result(cont_call_id, "dispatched-live"))
+    await asyncio.gather(cont_consume, return_exceptions=True)
+    await _chain_spin_until(lambda: adapter._current_ctx is None)
+    assert adapter._orphan_callback_count == 0
+
+
+async def test_respawn_without_hook_leaves_turn_wedged() -> None:
+    """NEGATIVE CONTROL (gap 1): no respawn signal → the turn stays wedged."""
+    conv = "conv_respawn_nohook"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.session_event_queues.pop(conv, None)
+    app.state.active_turns[conv] = None
+    app.state.session_message_buffers[conv] = [
+        {"content": "after the switch", "conversation_id": conv}
+    ]
+
+    assert conv in app.state.active_turns
+    assert _chain_drain_status_events(app.state.session_event_queues, conv) == []
+    assert conv not in app.state.desync_terminalized
+    assert app.state.session_message_buffers.get(conv)
+
+
+async def test_factor2_verdict_post_remoteprotocolerror_retries_then_signals() -> None:
+    """Factor #2: the verdict POST raising ``RemoteProtocolError`` signals recovery."""
+    signaled: list[str] = []
+
+    async def _on_delivery_failure(conv_id: str) -> None:
+        signaled.append(conv_id)
+
+    harness = _ChainDeadChannelHarnessClient(
+        httpx.RemoteProtocolError("Server disconnected without sending a response")
+    )
+    await _evaluate_policy_via_omnigent(
+        server_client=_ChainOkServerClient(),
+        harness_client=harness,
+        conversation_id="conv_factor2",
+        evaluation_id="poleval_factor2",
+        phase="PHASE_TOOL_CALL",
+        data={"name": "mcp__github__merge_pull_request", "arguments": {}},
+        on_delivery_failure=_on_delivery_failure,
+    )
+
+    assert harness.attempts == 2
+    assert signaled == ["conv_factor2"]
+
+
+async def test_factor3_new_message_lands_in_real_buffer(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Factor #3: a new message lands in the real ``buffering ...`` branch."""
+    conv = "conv_factor3"
+    pm = _ChainProcessManager()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.active_turns[conv] = None
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        with caplog.at_level(logging.INFO, logger=_APP_LOGGER_RECOVERY):
+            resp = await client.post(
+                f"/v1/sessions/{conv}/events",
+                json={"type": "message", "role": "user", "content": "second message"},
+            )
+
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["status"] == "buffered"
+    assert "buffering message for active turn" in caplog.text
+    buffered = app.state.session_message_buffers.get(conv)
+    assert buffered
+    assert buffered[-1]["content"] == "second message"
+    assert buffered[-1]["conversation_id"] == conv
+
+
+_CONTRACT_PARENT_WITH_CHILD = {
+    "name": "root",
+    "instructions": "Root instructions.",
+    "child": "worker",
+    "child_instructions": "Worker instructions.",
+}
+
+
+def _contract_root_spec(*, with_child: bool) -> AgentSpec:
+    """Build the contract test's parent spec, with or without the child."""
+    return AgentSpec(
+        spec_version=1,
+        name=_CONTRACT_PARENT_WITH_CHILD["name"],
+        instructions=_CONTRACT_PARENT_WITH_CHILD["instructions"],
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi"}),
+        sub_agents=(
+            [
+                AgentSpec(
+                    spec_version=1,
+                    name=_CONTRACT_PARENT_WITH_CHILD["child"],
+                    instructions=_CONTRACT_PARENT_WITH_CHILD["child_instructions"],
+                    executor=ExecutorSpec(type="omnigent", config={"harness": "pi"}),
+                )
+            ]
+            if with_child
+            else []
+        ),
+    )
+
+
+class _ContractSnapshotClient(NullServerClient):
+    """Session snapshot naming the requested sub-agent."""
+
+    def __init__(self, conv: str) -> None:
+        super().__init__()
+        self._conv = conv
+
+    async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
+        del kwargs
+        _conv = self._conv
+
+        class _Resp(NullServerClient._Response):
+            status_code = 200
+
+            def json(self) -> dict[str, object]:
+                return {"agent_id": "ag_contract_root", "sub_agent_name": "worker"}
+
+        if url.endswith(f"/v1/sessions/{_conv}"):
+            return _Resp()
+        return await super().get(url)
+
+
+_CONTRACT_CALLER_INSTRUCTIONS = "Caller-supplied instructions."
+
+
+def _contract_composed_instructions(*parts: str) -> str:
+    """Compose expected author/request text with framework guidance."""
+    return "\n\n".join((*parts, EMBEDDED_BROWSER_PRIORITY_INSTRUCTION))
+
+
+async def _contract_run_no_harness(
+    http: httpx.AsyncClient, conv: str, recording: _RecordingHarnessClient
+) -> dict[str, Any]:
+    """Adapter 1: direct ``?stream=true`` with no harness in the body."""
+    resp = await http.post(
+        f"/v1/sessions/{conv}/events?stream=true",
+        json={
+            "type": "message",
+            "role": "user",
+            "agent_id": "ag_contract_root",
+            "model": "x",
+            "content": [],
+        },
+    )
+    return {
+        "status": resp.status_code,
+        "error": (resp.json().get("error") if resp.status_code >= 400 else None),
+        "instructions": (
+            recording.posted_bodies[-1].get("instructions") if recording.posted_bodies else None
+        ),
+    }
+
+
+async def _contract_run_known_harness(
+    http: httpx.AsyncClient, conv: str, recording: _RecordingHarnessClient
+) -> dict[str, Any]:
+    """Adapter 2: direct ``?stream=true`` with the harness already known."""
+    resp = await http.post(
+        f"/v1/sessions/{conv}/events?stream=true",
+        json={
+            "type": "message",
+            "role": "user",
+            "agent_id": "ag_contract_root",
+            "harness": "pi",
+            "model": "x",
+            "content": [],
+            "instructions": _CONTRACT_CALLER_INSTRUCTIONS,
+        },
+    )
+    return {
+        "status": resp.status_code,
+        "error": (resp.json().get("error") if resp.status_code >= 400 else None),
+        "instructions": (
+            recording.posted_bodies[-1].get("instructions") if recording.posted_bodies else None
+        ),
+    }
+
+
+async def _contract_run_background(
+    http: httpx.AsyncClient, conv: str, recording: _RecordingHarnessClient
+) -> dict[str, Any]:
+    """Adapter 3: background non-stream dispatch."""
+    resp = await http.post(
+        f"/v1/sessions/{conv}/events",
+        json={
+            "type": "message",
+            "role": "user",
+            "agent_id": "ag_contract_root",
+            "model": "x",
+            "content": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    await _await_bg_turn_task(conv)
+    return {
+        "status": resp.status_code,
+        "terminal_status": None,  # populated by the caller with app.state access
+        "instructions": (
+            recording.posted_bodies[-1].get("instructions") if recording.posted_bodies else None
+        ),
+    }
+
+
+_CONTRACT_ADAPTERS = {
+    "no_harness": _contract_run_no_harness,
+    "known_harness": _contract_run_known_harness,
+    "background": _contract_run_background,
+}
+
+
+def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
+    """Build the scenario's ``spec_resolver``.
+
+    :param scenario: Contract scenario key.
+    :param calls: Mutable list each invocation appends to, so a scenario can
+        assert how many resolutions a path actually performed.
+    :returns: An async resolver matching that scenario's failure mode.
+    """
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec | None:
+        del session_id
+        calls.append(agent_id)
+        if scenario == "resolver_raises":
+            raise RuntimeError("contract: resolver unavailable")
+        if scenario == "resolver_none":
+            return None
+        return _contract_root_spec(with_child=(scenario != "child_missing"))
+
+    return _resolver
+
+
+@pytest.mark.parametrize(
+    "scenario, path, expected",
+    [
+        # child present: all paths select the same child spec.
+        pytest.param(
+            "child_present",
+            "no_harness",
+            {
+                "status": 200,
+                "instructions": _contract_composed_instructions("Worker instructions."),
+            },
+            id="child_present-no_harness",
+        ),
+        pytest.param(
+            "child_present",
+            "known_harness",
+            # same child; caller text composes additively on top.
+            {
+                "status": 200,
+                "instructions": _contract_composed_instructions(
+                    "Worker instructions.", _CONTRACT_CALLER_INSTRUCTIONS
+                ),
+            },
+            id="child_present-known_harness",
+        ),
+        pytest.param(
+            "child_present",
+            "background",
+            {
+                "terminal_status": "idle",
+                "instructions": _contract_composed_instructions("Worker instructions."),
+            },
+            id="child_present-background",
+        ),
+        # child missing: all paths agree — warn, fall back to the parent spec.
+        pytest.param(
+            "child_missing",
+            "no_harness",
+            {
+                "status": 200,
+                "error": None,
+                "instructions": _contract_composed_instructions("Root instructions."),
+            },
+            id="child_missing-no_harness-parent",
+        ),
+        pytest.param(
+            "child_missing",
+            "known_harness",
+            # same shape as child_present — caller text still composes additively.
+            {
+                "status": 200,
+                "instructions": _contract_composed_instructions(
+                    "Root instructions.", _CONTRACT_CALLER_INSTRUCTIONS
+                ),
+            },
+            id="child_missing-known_harness-parent",
+        ),
+        pytest.param(
+            "child_missing",
+            "background",
+            {
+                "status": 202,
+                "terminal_status": "idle",
+                "instructions": _contract_composed_instructions("Root instructions."),
+            },
+            id="child_missing-background-parent",
+        ),
+        # ── Resolver raises: same three-way split, different trigger.
+        pytest.param(
+            "resolver_raises",
+            "no_harness",
+            {"status": 503, "error": "spec_resolver_failed"},
+            id="resolver_raises-no_harness-503",
+        ),
+        pytest.param(
+            "resolver_raises",
+            "known_harness",
+            {"status": 200, "instructions": _CONTRACT_CALLER_INSTRUCTIONS},
+            id="resolver_raises-known_harness-degrades",
+        ),
+        pytest.param(
+            "resolver_raises",
+            "background",
+            {"status": 202, "terminal_status": "failed"},
+            id="resolver_raises-background-async-failure",
+        ),
+        # resolver returns None: treated the same as resolver_raises after #5505.
+        pytest.param(
+            "resolver_none",
+            "no_harness",
+            {"status": 503, "error": "spec_resolver_failed"},
+            id="resolver_none-no_harness-503",
+        ),
+        pytest.param(
+            "resolver_none",
+            "known_harness",
+            {"status": 200, "instructions": _CONTRACT_CALLER_INSTRUCTIONS},
+            id="resolver_none-known_harness-continues-unknown-spec",
+        ),
+        pytest.param(
+            "resolver_none",
+            "background",
+            # resolver called twice: once in bg setup, once in _resolve_harness_config.
+            {
+                "status": 202,
+                "terminal_status": "failed",
+                "resolver_calls": 2,
+            },
+            id="resolver_none-background",
+        ),
+        # cache hit: resolver_calls == 1 is the load-bearing assertion.
+        pytest.param(
+            "cache_holds_child",
+            "background",
+            {
+                "terminal_status": "idle",
+                "instructions": _contract_composed_instructions("Worker instructions."),
+                "resolver_calls": 1,
+            },
+            id="cache_holds_child-background-shortcut",
+        ),
+        pytest.param(
+            "cache_holds_child",
+            "known_harness",
+            {
+                "status": 200,
+                "instructions": _contract_composed_instructions(
+                    "Worker instructions.", _CONTRACT_CALLER_INSTRUCTIONS
+                ),
+                "resolver_calls": 1,
+            },
+            id="cache_holds_child-known_harness-shortcut",
+        ),
+        # no_harness path resolves a second time even with a cached child.
+        pytest.param(
+            "cache_holds_child",
+            "no_harness",
+            {
+                "status": 200,
+                "instructions": _contract_composed_instructions("Worker instructions."),
+                "resolver_calls": 2,
+            },
+            id="cache_holds_child-no_harness-resolves-again",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_cross_path_resolution_contract(
+    scenario: str,
+    path: str,
+    expected: dict[str, Any],
+) -> None:
+    """Pin the resolution behaviour matrix across all three dispatch paths.
+
+    Reading the table: ``child_present`` and ``child_missing`` are the
+    scenarios where all three paths agree, and for ``child_missing`` the
+    agreement is load-bearing — an unresolvable ``sub_agent_name`` gets one
+    answer (warn, then the parent's spec) no matter which transport asked.
+    The remaining scenarios still record transport-driven differences that
+    are intended: a synchronous 503, graceful degradation preserving the
+    caller's own instructions, and an asynchronous terminal ``failed``
+    against a 202 that has already gone out. Those differences come from
+    what each transport can report, not from differing answers.
+
+    If you change one path and a row here starts failing, that is the point:
+    decide whether the contract moved, do not quietly re-align the table.
+
+    :param scenario: Which resolution outcome the fake resolver produces.
+    :param path: Which dispatch path adapter drives the turn.
+    :param expected: Subset of the adapter's normalized result to assert.
+    """
+    conv = f"conv_contract_{scenario}_{path}"
+    calls: list[str] = []
+    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
+        spec_resolver=_contract_resolver_for(scenario, calls),
+        server_client=_ContractSnapshotClient(conv),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        if scenario == "cache_holds_child":
+            # Session-create resolves "worker" and caches the CHILD spec
+            # directly, which is the common real shape. The dispatch below
+            # must then reuse it rather than resolving again.
+            created = await http.post(
+                "/v1/sessions",
+                json={
+                    "session_id": conv,
+                    "agent_id": "ag_contract_root",
+                    "sub_agent_name": "worker",
+                },
+            )
+            assert created.status_code == 201, created.text
+            assert len(calls) == 1, f"session-create should resolve once, got {calls!r}"
+        result = await _CONTRACT_ADAPTERS[path](http, conv, recording)
+        if path == "background" and result.get("terminal_status") is None:
+            # Background adapter needs the app's queue to drain terminal status.
+            statuses = await _drain_published_statuses(
+                app.state.session_event_queues, conv, until="failed", timeout=2.0
+            )
+            result["terminal_status"] = statuses[-1] if statuses else None
+    result["resolver_calls"] = len(calls)
+
+    for key, want in expected.items():
+        assert result.get(key) == want, (
+            f"cross-path contract drift: scenario={scenario!r} path={path!r} "
+            f"key={key!r} expected {want!r}, got {result.get(key)!r}. "
+            f"Full observed result: {result!r}. If this change is intended, "
+            f"update the matrix deliberately — where paths differ, they differ "
+            f"because their transports report differently, not because they "
+            f"answer the same question differently."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _response_failed_event source propagation
+# ---------------------------------------------------------------------------
+
+
+def test_response_failed_event_default_source_is_execution() -> None:
+    """``_response_failed_event`` without explicit source encodes ``"execution"``."""
+    import json as _json
+
+    from omnigent.runner.app import _response_failed_event
+
+    raw = _response_failed_event({"code": "connection_error", "message": "dropped"})
+    payload = _json.loads(raw.decode().split("data: ", 1)[1])
+    assert payload["source"] == "execution"
+
+
+def test_response_failed_event_llm_source_is_preserved() -> None:
+    """``_response_failed_event(source="llm")`` encodes ``"llm"`` for inference faults."""
+    import json as _json
+
+    from omnigent.runner.app import _response_failed_event
+
+    raw = _response_failed_event(
+        {"code": "context_length_exceeded", "message": "too long"},
+        source="llm",
+    )
+    payload = _json.loads(raw.decode().split("data: ", 1)[1])
+    assert payload["source"] == "llm"
+
+
+# ---------------------------------------------------------------------------
+# Steering an in-flight sub-agent turn instead of bouncing the send.
+#
+# A sub-agent whose turn is still running used to make the parent's same-title /
+# same-session send bounce with "already has a launching or running turn",
+# leaving cancellation as the only lever. The runner now steers the child's
+# in-flight turn instead of refusing, on a path that keeps the turn's SINGLE
+# work entry rather than replacing it:
+#   * a locally-tracked running/waiting turn reuses its existing entry verbatim
+#     (no re-stamp, no re-register), so the one completion always maps to it;
+#   * a server-busy-but-untracked turn (e.g. after a runner restart) is adopted
+#     by registering one entry directly in "running" (not "launching", so the
+#     launch-timeout reaper leaves it alone) with a freshly stamped id.
+# On a post failure the child is never torn down: a reused turn stays tracked
+# and alive; an adopted registration is rolled back to the prior untracked
+# state. Only a child that has not started streaming yet ("launching") is
+# deferred with a transient retry. Together these close the completion-race,
+# post-failure, and false-reap hazards of a re-stamping continuation (Polly
+# review issues #1/#2/#3); the fresh register+stamp continuation path is used
+# only for a genuinely idle child.
+# ---------------------------------------------------------------------------
+
+
+def _running_child_server_handler(
+    parent_id: str,
+    child_id: str,
+    *,
+    stamped: list[str],
+    event_posts: list[dict[str, Any]],
+    create_posts: list[int],
+    child_busy: bool = False,
+    delete_posts: list[int] | None = None,
+    events_status: int = 200,
+) -> Any:
+    """Build a MockTransport handler for a named-mode in-flight-send test.
+
+    Serves the parent turn-actor label and a single matching child (busy flag
+    per ``child_busy``), records the stamped dispatch id on PATCH and the posted
+    message on the child's /events, and 500s any duplicate-create POST so an
+    accidental untracked create is caught. ``events_status`` forces the child's
+    /events response code (e.g. 500 to exercise a post failure), and any DELETE
+    of the child is recorded in ``delete_posts`` so a test can assert a still-live
+    turn is never torn down.
+    """
+    from omnigent.runner import app as runner_app
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path == f"/v1/sessions/{parent_id}":
+            return httpx.Response(
+                200, json={"labels": {"omnigent.turn_actor": "alice@example.com"}}
+            )
+        if request.method == "GET" and path == f"/v1/sessions/{parent_id}/child_sessions":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": child_id,
+                            "tool": "claude",
+                            "session_name": "merge-task",
+                            "busy": child_busy,
+                        }
+                    ]
+                },
+            )
+        if request.method == "POST" and path == "/v1/sessions":
+            create_posts.append(1)
+            return httpx.Response(500, json={"error": "duplicate"})
+        if request.method == "PATCH" and path == f"/v1/sessions/{child_id}":
+            labels = json.loads(request.content)["labels"]
+            stamped.append(labels[runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY])
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "DELETE" and path == f"/v1/sessions/{child_id}":
+            if delete_posts is not None:
+                delete_posts.append(1)
+            return httpx.Response(204)
+        if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(events_status, json={"ok": events_status < 400})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    return _handler
+
+
+async def _run_named_continuation(parent_id: str, handler: Any) -> str:
+    """Drive a named-mode ``sys_session_send`` continuation against ``handler``."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://server",
+    ) as server_client:
+        return await execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps(
+                {
+                    "agent": "claude",
+                    "title": "merge-task",
+                    "args": "stop and report where the merge stands",
+                }
+            ),
+            server_client=server_client,
+            conversation_id=parent_id,
+            agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="claude")]),
+            session_inbox=session_inbox,
+        )
+
+
+@pytest.mark.parametrize("work_status", ["running", "waiting"])
+@pytest.mark.asyncio
+async def test_named_send_reuses_tracked_in_flight_entry_without_restamp(
+    monkeypatch: pytest.MonkeyPatch,
+    work_status: str,
+) -> None:
+    """A same-title send to a locally-tracked running/waiting child reuses its entry.
+
+    Pre-PR this bounced with "already has a launching or running turn". The fix
+    must deliver the message while keeping the turn's SINGLE existing work entry:
+    no fresh dispatch id is stamped and no new entry is registered, so the one
+    in-flight completion always maps back to the original entry rather than being
+    orphaned under a replacement id (review issue #1). ``waiting`` (own turn
+    ended, descendants active) is steered the same way, not refused (review
+    issue #2).
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id, child_id = f"conv_parent_{work_status}", f"conv_child_{work_status}"
+    stamped: list[str] = []
+    event_posts: list[dict[str, Any]] = []
+    create_posts: list[int] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+
+    entry = runner_app.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="claude", title="merge-task"
+    )
+    entry.status = work_status
+    original_work_id = entry.work_id
+
+    handler = _running_child_server_handler(
+        parent_id, child_id, stamped=stamped, event_posts=event_posts, create_posts=create_posts
+    )
+    try:
+        output = await _run_named_continuation(parent_id, handler)
+        work = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert "already has a launching or running turn" not in output
+    payload = json.loads(output)
+    # A steered in-flight turn reports "running" (it continues the live turn),
+    # not "launching" (which would arm the launch-timeout reaper).
+    assert payload["status"] == "running"
+    assert payload["conversation_id"] == child_id
+    assert create_posts == [], "steering must not create a duplicate child session"
+    # The load-bearing invariant against misattribution: no re-stamp, and the
+    # entry is the same one (same work_id) that already tracks the in-flight turn.
+    assert stamped == [], "reusing a tracked in-flight turn must not re-stamp a new id"
+    assert work is not None and work.work_id == original_work_id
+    assert work.status == work_status
+    assert len(event_posts) == 1
+    assert event_posts[0]["created_by"] == "alice@example.com"
+    assert event_posts[0]["data"]["content"][0]["text"] == "stop and report where the merge stands"
+
+
+@pytest.mark.asyncio
+async def test_named_send_reused_in_flight_post_failure_keeps_tracking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed post to a reused in-flight turn must not destroy its tracking.
+
+    The original turn is still alive, so a post failure must leave its work entry
+    intact (and never delete the child) -- otherwise the running turn's eventual
+    result becomes untracked and undeliverable, a regression that was impossible
+    while such sends were refused (review issue #2).
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id, child_id = "conv_parent_postfail", "conv_child_postfail"
+    stamped: list[str] = []
+    event_posts: list[dict[str, Any]] = []
+    create_posts: list[int] = []
+    delete_posts: list[int] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+
+    entry = runner_app.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="claude", title="merge-task"
+    )
+    entry.status = "running"
+    original_work_id = entry.work_id
+
+    handler = _running_child_server_handler(
+        parent_id,
+        child_id,
+        stamped=stamped,
+        event_posts=event_posts,
+        create_posts=create_posts,
+        delete_posts=delete_posts,
+        events_status=500,
+    )
+    try:
+        output = await _run_named_continuation(parent_id, handler)
+        work = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert output.startswith("Error: failed to steer in-flight sub-agent")
+    # The still-running turn stays tracked under its original entry, and the
+    # child session is not deleted.
+    assert work is not None and work.work_id == original_work_id
+    assert work.status == "running"
+    assert delete_posts == [], "a reused, still-live turn must never be torn down"
+    assert create_posts == []
+
+
+@pytest.mark.asyncio
+async def test_named_send_adopts_busy_child_as_running_not_launching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server-busy child with no local work entry is adopted as a running turn.
+
+    After a runner restart the in-flight turn's local bookkeeping is gone, but the
+    server still reports the child busy. Pre-PR this was refused ("is already
+    running"); the fix adopts it -- stamping a dispatch id and registering one
+    entry so its result is delivered (review issue #1) -- and registers that entry
+    directly in ``running`` (not ``launching``), so the launch-timeout reaper
+    cannot fail a long-running steered turn whose buffered nudge is waiting for it
+    to yield (review issue #3).
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id, child_id = "conv_parent_busy", "conv_busy_child"
+    stamped: list[str] = []
+    event_posts: list[dict[str, Any]] = []
+    create_posts: list[int] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+
+    handler = _running_child_server_handler(
+        parent_id,
+        child_id,
+        stamped=stamped,
+        event_posts=event_posts,
+        create_posts=create_posts,
+        child_busy=True,
+    )
+    try:
+        output = await _run_named_continuation(parent_id, handler)
+        work = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert "already has a launching or running turn" not in output
+    assert "is already running" not in output
+    payload = json.loads(output)
+    assert payload["status"] == "running"
+    assert payload["conversation_id"] == child_id
+    assert create_posts == []
+    assert len(stamped) == 1, "an untracked server-busy turn must be adopted with one stamp"
+    # Adopted directly as running (not launching) so it is safe from the reaper,
+    # and the entry carries the freshly stamped id so its completion delivers.
+    assert work is not None and work.work_id == stamped[0]
+    assert work.status == "running"
+    assert len(event_posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The busy→ended race registers a fresh entry, not the drained one.
+
+    If the child's tracked turn completes (and is delivered/drained) between the
+    pre-post snapshot and the post, the server starts a brand-new turn. Because
+    the message is posted first and tracking is decided from the *post-settled*
+    work state, a stale terminal entry is not reused — a fresh entry is
+    registered so the new turn's completion is delivered rather than dropped
+    against the already-delivered entry (review issue #1). The stale entry here
+    stands in for that just-drained old turn; the server snapshot still reports
+    the child busy (the new turn).
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id, child_id = "conv_parent_ended", "conv_child_ended"
+    stamped: list[str] = []
+    event_posts: list[dict[str, Any]] = []
+    create_posts: list[int] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+
+    # A stale entry from the turn that just ended: terminal and already delivered.
+    stale = runner_app.register_subagent_work(
+        parent_session_id=parent_id, child_session_id=child_id, agent="claude", title="merge-task"
+    )
+    stale.status = "completed"
+    stale.delivered = True
+    stale_work_id = stale.work_id
+
+    handler = _running_child_server_handler(
+        parent_id,
+        child_id,
+        stamped=stamped,
+        event_posts=event_posts,
+        create_posts=create_posts,
+        child_busy=True,
+    )
+    try:
+        output = await _run_named_continuation(parent_id, handler)
+        work = runner_app.get_subagent_work(child_id)
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    payload = json.loads(output)
+    assert payload["status"] == "running"
+    # A fresh entry is registered under a NEW dispatch id (not the drained one),
+    # in "running", so the new turn's completion has a live entry to deliver to.
+    assert len(stamped) == 1
+    assert work is not None
+    assert work.work_id == stamped[0]
+    assert work.work_id != stale_work_id
+    assert work.status == "running"
+    assert work.delivered is False
+    assert len(event_posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_in_flight_send_serializes_concurrent_adopts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent sends to a busy, untracked child install exactly one entry.
+
+    Two parallel steers to the same server-busy child (no local work entry) must
+    not stamp divergent dispatch ids or clobber each other's registration. The
+    per-child classify/register lock serializes them: the first adopts the turn
+    (one stamp, one entry), the second finds it running and reuses it (no second
+    stamp), so a single coherent entry remains (review issue #2).
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    parent_id, child_id = "conv_parent_concurrent", "conv_child_concurrent"
+    stamped: list[str] = []
+    event_posts: list[dict[str, Any]] = []
+    create_posts: list[int] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+
+    handler = _running_child_server_handler(
+        parent_id,
+        child_id,
+        stamped=stamped,
+        event_posts=event_posts,
+        create_posts=create_posts,
+        child_busy=True,
+    )
+
+    async def _one_send(server_client: httpx.AsyncClient) -> str:
+        return await execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps(
+                {"agent": "claude", "title": "merge-task", "args": "stop and report"}
+            ),
+            server_client=server_client,
+            conversation_id=parent_id,
+            agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="claude")]),
+            session_inbox=asyncio.Queue(),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            outputs = await asyncio.gather(_one_send(server_client), _one_send(server_client))
+            work = runner_app.get_subagent_work(child_id)
+        finally:
+            runner_app.unregister_subagent_work(child_id)
+            runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert all(json.loads(o)["status"] == "running" for o in outputs)
+    assert len(event_posts) == 2, "both concurrent sends deliver their message"
+    # Exactly one dispatch id is stamped (the adopt); the second send reuses the
+    # now-running entry. Both handles point at the same coherent work entry.
+    assert len(stamped) == 1, f"concurrent adopts must not stamp divergent ids: {stamped}"
+    assert work is not None and work.work_id == stamped[0]
+    assert work.status == "running"
+
+
+def test_in_flight_send_lock_is_cleaned_up_with_child_work() -> None:
+    """The per-child in-flight-send lock does not leak past the child's work.
+
+    ``in_flight_send_lock`` inserts into a process-global map; without a cleanup
+    path a long-lived runner accumulates one lock per steered child forever
+    (review issue #2). Unregistering the child's work — directly or via session
+    teardown — must remove its lock.
+    """
+    from omnigent.runner import app as runner_app
+
+    # Direct unregister of a child clears its lock.
+    child_id = "conv_lockleak_child"
+    runner_app.register_subagent_work(
+        parent_session_id="conv_lockleak_parent",
+        child_session_id=child_id,
+        agent="claude",
+        title="merge-task",
+    )
+    runner_app.in_flight_send_lock(child_id)
+    assert child_id in runner_app._in_flight_send_locks
+    runner_app.unregister_subagent_work(child_id)
+    assert child_id not in runner_app._in_flight_send_locks
+
+    # Session teardown clears the parent's and every child's lock.
+    parent_id, child_a, child_b = "conv_teardown_parent", "conv_teardown_a", "conv_teardown_b"
+    for cid in (child_a, child_b):
+        runner_app.register_subagent_work(
+            parent_session_id=parent_id, child_session_id=cid, agent="claude", title=cid
+        )
+        runner_app.in_flight_send_lock(cid)
+    runner_app.in_flight_send_lock(parent_id)
+    try:
+        runner_app.unregister_subagent_work_for_session(parent_id)
+        assert parent_id not in runner_app._in_flight_send_locks
+        assert child_a not in runner_app._in_flight_send_locks
+        assert child_b not in runner_app._in_flight_send_locks
+    finally:
+        for cid in (parent_id, child_a, child_b):
+            runner_app._in_flight_send_locks.pop(cid, None)
+            runner_app.unregister_subagent_work(cid)
+
+
+@pytest.mark.asyncio
+async def test_named_send_defers_when_child_turn_still_launching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child whose turn has not started streaming defers with a retry.
+
+    There is no active turn yet and posting now could race a parallel start, so
+    the send returns a transient "still starting ... retry" error and posts
+    nothing -- distinct from both the old blanket refusal and the tracked
+    continuation used once the turn is running.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[dict[str, Any]] = []
+
+    monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
+    monkeypatch.setattr(runner_app, "register_child_session", lambda *a, **k: None)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent_launch":
+            return httpx.Response(
+                200, json={"labels": {"omnigent.turn_actor": "alice@example.com"}}
+            )
+        if (
+            request.method == "GET"
+            and request.url.path == "/v1/sessions/conv_parent_launch/child_sessions"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {
+                            "id": "conv_launching_coder",
+                            "tool": "claude",
+                            "session_name": "merge-task",
+                            "busy": False,
+                        }
+                    ]
+                },
+            )
+        if (
+            request.method == "POST"
+            and request.url.path == "/v1/sessions/conv_launching_coder/events"
+        ):
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    # Default status of freshly registered work is "launching".
+    runner_app.register_subagent_work(
+        parent_session_id="conv_parent_launch",
+        child_session_id="conv_launching_coder",
+        agent="claude",
+        title="merge-task",
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {"agent": "claude", "title": "merge-task", "args": "please stop and report"}
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_launch",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="claude")]),
+                session_inbox=session_inbox,
+            )
+        finally:
+            runner_app.unregister_subagent_work("conv_launching_coder")
+            runner_app._session_inboxes_ref.pop("conv_parent_launch", None)
+
+    assert "already has a launching or running turn" not in output
+    assert "still starting its turn" in output
+    assert "retry the send in a moment" in output
+    assert event_posts == [], "a launching turn is not posted into"
+
+
+@pytest.mark.asyncio
+async def test_send_by_session_id_reuses_running_child_without_restamp() -> None:
+    """By-session-id send steers a running direct child reusing its one entry.
+
+    The by-id path shares the fix: a locally-tracked running child is steered
+    into its in-flight turn without a re-stamp or a new entry, rather than bounced
+    with "already has a launching or running turn". Keeping the single existing
+    entry is what keeps the turn's one completion deliverable and correctly
+    attributed (review issue #1).
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    event_posts: list[dict[str, Any]] = []
+    stamped: list[str] = []
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_parent_byid":
+            return httpx.Response(
+                200, json={"labels": {"omnigent.turn_actor": "alice@example.com"}}
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_byid_coder":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_byid_coder",
+                    "parent_session_id": "conv_parent_byid",
+                    "title": "claude:merge-task",
+                    "busy": False,
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_byid_coder":
+            labels = json.loads(request.content)["labels"]
+            stamped.append(labels[runner_app.SUBAGENT_DISPATCH_ID_LABEL_KEY])
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_byid_coder/events":
+            event_posts.append(json.loads(request.content))
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(404, json={"error": str(request.url)})
+
+    entry = runner_app.register_subagent_work(
+        parent_session_id="conv_parent_byid",
+        child_session_id="conv_byid_coder",
+        agent="claude",
+        title="merge-task",
+    )
+    entry.status = "running"
+    original_work_id = entry.work_id
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_send",
+                arguments=json.dumps(
+                    {"session_id": "conv_byid_coder", "args": "please stop and report"}
+                ),
+                server_client=server_client,
+                conversation_id="conv_parent_byid",
+                agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="claude")]),
+                session_inbox=session_inbox,
+            )
+            work = runner_app.get_subagent_work("conv_byid_coder")
+        finally:
+            runner_app.unregister_subagent_work("conv_byid_coder")
+            runner_app._session_inboxes_ref.pop("conv_parent_byid", None)
+
+    assert "already has a launching or running turn" not in output
+    payload = json.loads(output)
+    assert payload["status"] == "running"
+    assert payload["conversation_id"] == "conv_byid_coder"
+    assert stamped == [], "reusing a tracked in-flight turn must not re-stamp a new id"
+    assert work is not None and work.work_id == original_work_id
+    assert work.status == "running"
+    assert len(event_posts) == 1
+    assert event_posts[0]["created_by"] == "alice@example.com"
+    assert event_posts[0]["data"]["content"][0]["text"] == "please stop and report"
+
+
+_SSE_RESPONSE_FAILED_SIGN_IN = (
+    "event: response.failed\ndata: "
+    '{"type":"response.failed","response":{"status":"failed"},'
+    '"error":{"message":"The agent is waiting for a sign-in in this session\'s terminal.",'
+    '"code":"databricks_sign_in_pending"}}\n\n'
+)
+_SIGN_IN_PROMPT_SCREEN = (
+    "dbcert: If the browser does not open automatically, please open the following URL:\n"
+    "\n\thttps://databricks.okta.com/oauth2/v1/authorize?client_id=0oa1&state=T4IU\n\n"
+)
+_SIGNED_IN_SCREENS = {
+    # Codex draws inline: dbcert's lines stay above its banner.
+    "codex-native": (
+        _SIGN_IN_PROMPT_SCREEN + "dbcert: All credentials successfully written\n"
+        "╭── OpenAI Codex (v0.156.1) ──╮\n"
+        "› Ask Codex to do anything\n"
+    ),
+    # Claude Code takes the alternate screen: only its composer is visible.
+    "claude-native": "─" * 16 + "\n❯ \n" + "─" * 16 + "\n  Opus 4.8\n",
+}

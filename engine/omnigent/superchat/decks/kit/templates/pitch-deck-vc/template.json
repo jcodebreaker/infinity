@@ -1,0 +1,35 @@
+{
+  "id": "pitch-deck-vc",
+  "name": "Pitch Deck",
+  "tagline": "Big, confident startup",
+  "description": "Clean white with big heavy type and one electric blue; confident, startup-clear.",
+  "best_for": "pitches, launches, product and strategy asks",
+  "category": "bold",
+  "mode": "light",
+  "upstream": "https://github.com/lewislulu/html-ppt-skill",
+  "source": "nexu-io/open-design design-templates/html-ppt/assets/themes/pitch-deck-vc.css@802708f",
+  "license": "MIT (see LICENSE); fonts SIL OFL 1.1 (see ../../fonts/OFL-*.txt)",
+  "fonts": [
+    {
+      "family": "Inter",
+      "weight": 400,
+      "style": "normal",
+      "file": "Inter-400.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Inter",
+      "weight": 600,
+      "style": "normal",
+      "file": "Inter-600.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Inter",
+      "weight": 800,
+      "style": "normal",
+      "file": "Inter-800.ttf",
+      "license": "OFL-inter.txt"
+    }
+  ]
+}

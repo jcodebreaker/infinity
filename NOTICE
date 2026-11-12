@@ -1,0 +1,106 @@
+Superchat
+Copyright 2026 the Superchat authors
+
+Superchat began as a fork of Rakazo, Copyright 2026 Rakazo contributors, licensed under the Apache
+License 2.0 (see LICENSE).
+
+Superchat's 3D illustrations (web/app/public/illustrations) are from Microsoft's
+Fluent Emoji (https://github.com/microsoft/fluentui-emoji), Copyright (c)
+Microsoft Corporation, licensed under the MIT License.
+
+Superchat's decks (slide decks the assistant authors, the deck viewer, and the PowerPoint and PDF export)
+contain portions modified from Open Design (https://github.com/nexu-io/open-design, commit
+802708f), Copyright the Open Design authors, licensed under the Apache License 2.0 (see LICENSE).
+Each ported file carries a "Portions modified from nexu-io/open-design <path>@802708f,
+Apache-2.0; changes: ..." header naming its source file and what changed:
+apps/desktop/src/main/deck-capture.ts and pdf-export.ts (the page-side export logic and print
+rules, host/share/deck-export/deck-capture-page.js and host/bin/superchat-deck-export),
+apps/desktop/tests/main/pptx-editable-fidelity, pptx-layered-background and pptx-cjk-typeface
+tests (host/share/deck-export/*.test.ts), and packages/contracts/src/prompts/
+deck-framework.ts with runtime/deck-protocol.ts (the deck skeleton and navigation protocol,
+engine/omnigent/superchat/decks/kit/skeleton.html).
+
+Deck editing on the canvas ports ideas and code from Open Design's edit mode, also Apache-2.0
+at commit 802708f: apps/web/src/edit-mode/bridge.ts (the in-frame selection, inline text edit and
+hover logic, rewritten as web/app/src/features/artifacts/editor/html/bridge.js),
+apps/web/src/edit-mode/source-patches.ts (the patch kinds, rewritten in Python as
+engine/omnigent/superchat/artifacts/patches.py), the manual edit panel (rewritten small as
+web/app/src/features/artifacts/editor/html/StylePanel.tsx), and the attached-preview-comments
+block (web/app/src/features/artifacts/editor/html-ask.ts). The untrusted-text sanitizer
+(web/app/src/features/artifacts/editor/html/sanitize.ts) is modified from the Omnigent web
+client's designModePrompt.ts, which this repository vendored under the same Apache License 2.0.
+
+The PowerPoint export vendors dom-to-pptx 2.0.1 (https://github.com/atharva9167j/dom-to-pptx),
+MIT License, Copyright (c) 2025 Atharva Dharmendra Jagtap and dom-to-pptx contributors, as the
+browser bundle Open Design ships; its license is kept in
+host/share/deck-export/vendor/dom-to-pptx/LICENSE.
+
+Charts in HTML decks. The chart slide recipes (engine/omnigent/superchat/decks/kit/charts)
+are the chart-bar, chart-line, chart-pie and chart-radar slides of Open Design's html-ppt
+design template (design-templates/html-ppt/templates/single-page, commit 802708f), MIT, Copyright
+(c) 2026 lewis (charts/LICENSE-html-ppt), plus the fixed-height chart container rule of its
+skills/data-report skill; each recipe carries its "Portions modified from" header. They draw with
+Chart.js 4.4.3 (MIT, Copyright (c) 2014-2024 Chart.js Contributors), vendored unchanged in
+engine/omnigent/superchat/decks/kit/vendor/chart.js. The PowerPoint export reads each
+Chart.js chart and writes a native chart through a small patch to the vendored dom-to-pptx
+(host/share/deck-export/vendor/dom-to-pptx/README.md). The native-object test helper
+(engine/tests/superchat/decks/pptx_native.py) is ported from Open Design's humanize-ppt
+plugin (plugins/community/humanize-ppt/scripts/pptx_qa.py, commit 802708f), MIT, Copyright (c) 2026
+LearnPrompt.
+
+Dashboards. The dashboard page template (host/share/dashboard/template.html), which
+superchat-dashboard fills from the person's files, is modified from Open Design's data-report skill
+(skills/data-report/example.html, commit 802708f), Apache-2.0, and carries its "Portions modified
+from" header: the report header, the KPI cards with a sparkline and change, the chart grid with its
+fixed-height chart boxes and the data table. It inlines the same vendored Chart.js 4.4.3 (MIT) as
+the decks.
+
+The deck themes (engine/omnigent/superchat/decks/kit/templates, 18 of them) are rewritten
+from MIT-licensed Open Design design templates, each keeping its LICENSE file beside the theme and a
+"Design derived from ..." header in its theme.css. From zarazhangrui/beautiful-html-templates
+(Copyright (c) 2026 Zara Zhang): Blue Professional, Editorial Tri-Tone, Cartesian. From
+lewislulu/html-ppt-skill (Copyright (c) 2026 lewis), as shipped in Open Design's html-ppt template
+at 802708f: Corporate Clean, Minimal White, Swiss Grid, Arctic Cool, Academic Paper, Editorial Serif,
+Japanese Minimal, Magazine Bold, Bauhaus, Midcentury, Pitch Deck VC, Sharp Mono, Nord and Tokyo
+Night. From op7418/guizang-ppt-skill (Copyright (c) 2026 op7418): Magazine Mono. Gradients and
+shadows were dropped so every theme exports to native PowerPoint shapes. The Nord theme uses the Nord
+palette (Arctic Ice Studio, Copyright (c) 2016-present Sven Greb, MIT) and the Tokyo Night theme the
+Tokyo Night palette (enkia, Copyright (c) 2018 enkia, MIT). Their fonts
+(kit/fonts) are Latin subsets of Space Grotesk, Inter, Bricolage Grotesque, Instrument Serif,
+JetBrains Mono, Newsreader, Playfair Display and Archivo Black, each under the SIL Open Font
+License 1.1 with its license text (OFL-*.txt) beside the font files.
+
+The native PowerPoint skill (host/share/pptx/skill/pptx-generator) is a port of the
+pptx-generator skill from MiniMax-AI/skills (https://github.com/MiniMax-AI/skills, commit
+60aaae52bb2af8162732751a4332f62a5fef518b, path skills/pptx-generator), Copyright (c) 2026 MiniMax,
+licensed under the MIT License; the license text is kept beside the skill in
+host/share/pptx/skill/pptx-generator/LICENSE. Each ported file carries a "Portions
+from MiniMax-AI/skills <path>@60aaae5, MIT; changes: ..." header. The host image installs
+PptxGenJS 4.0.1 (MIT, Copyright (c) Brent Ely), react, react-dom, react-icons, sharp, python-pptx
+and markitdown for it, each under its own permissive license, and applies the upstream PptxGenJS
+fixes for gitbrent/PptxGenJS issue 1531 and pull requests 1537 and 1540
+(host/share/pptx/runtime/patches).
+
+Two small chat behaviors port ideas and wording from nao (https://github.com/getnao/nao, Copyright
+2025 nao Labs, commit 5bde830), Apache-2.0 (see LICENSE); only files without the "@license
+Enterprise" header were used. Each ported file carries a "Portions modified from getnao/nao
+<path>@5bde830, Apache-2.0; changes: ..." header:
+engine/omnigent/superchat/cards/tools.py (the `ask_clarification` and `suggest_follow_ups`
+tools, from apps/shared/src/tools/clarification.ts and suggest-follow-ups.ts; they emit Superchat's reply
+cards instead of nao's tool-call UI), and the memory extraction rules in
+engine/omnigent/memory/upkeep.py, engine/omnigent/superchat/daily_notes/
+quiet_moment.py and engine/agents/templates/AGENTS.md (from apps/backend/src/components/ai/
+memory-system-prompt.tsx and agents/memory/memory-extractor-llm.ts: standing instructions apart
+from profile facts, instructions gated on permanence signals, supersede on change). Superchat's
+recurring-task support (the assistant writes the RRULE, the server validates it and previews the next
+fire times) is its own design: nao's cron-nlp.ts was read for the idea only and no code or prompt
+from it is used.
+
+Superchat's file-search guidance (the "The person's files" section of engine/agents/templates/AGENTS.md)
+and the shape of its files_* tools (search by keywords, by meaning, hybrid with a model rerank; get
+and multi-get; status) are adapted from the pi-qmd extension and its qmd-knowledge skill
+(https://github.com/hjanuschka/pi-qmd, commit 8266056, skills/qmd-knowledge/SKILL.md), Copyright (c)
+hjanuschka, licensed under the MIT License (declared in its package.json and README; the repository
+ships no separate LICENSE file), which wraps qmd (https://github.com/tobi/qmd, MIT, Copyright (c)
+Tobi Lutke). No qmd or pi-qmd code is included: the tools are re-implemented in Python over SQLite
+FTS5 and sqlite-vec (engine/omnigent/superchat/knowledge).

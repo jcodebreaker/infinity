@@ -1,0 +1,45 @@
+.deepsec/
+node_modules
+__pycache__/
+*.py[cod]
+dist
+build
+coverage
+.playwright-report
+.playwright-cli
+test-results
+playwright-report
+*.tsbuildinfo
+.env
+.env.local
+.env.*.local
+# A machine's own Compose overrides (mirrors, CA bundle): docs/setup.md, Builds.
+docker-compose.local.yaml
+data
+web/app/**/data
+.tmp
+.DS_Store
+web/app/dist
+*.log
+.vercel
+.cache
+artifacts
+!web/app/src/features/artifacts
+backups
+test-report
+verify-report
+.astro
+.deploy.lock
+.last-deployed-revision
+design/
+PRODUCT_PLAN.md
+
+# Lingui compiled catalogs — Vite plugin compiles .po at build time
+web/app/src/locales/**/*.mjs
+web/app/src/locales/**/*.js
+playwright-report-www
+engine/scripts/.evals-chat
+# Model-call traces copied out of a host (engine/scripts/llm_trace.py)
+llm-trace/
+# Round views logged by the engine (engine/scripts/ux_log.py)
+ux-log/

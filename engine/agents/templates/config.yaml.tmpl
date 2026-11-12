@@ -1,0 +1,97 @@
+# GENERATED FILE — do not edit by hand. Edit engine/agents/templates/ (config.yaml.tmpl,
+# AGENTS.md, agents/<type>/config.yaml), then run `node engine/agents/render-agents.mjs`.
+#
+# Superchat's Assistant bundle (docs/architecture.md), backing
+# `omnigent.context.mode=superside-chat` Conversations. Runs on the {{HARNESS_NAME}} harness, with
+# Sub-agent Types (worker, notes, editor) under agents/<type>/: the Assistant launches one by its
+# declared name, never by naming a model. The prompt (AGENTS.md) carries the Assistant's voice;
+# per-turn Memory, Rollover and the Activity Feed all come from Omnigent itself
+# (ADR 0001, docs/adr/0006-omnigent-owns-everything.md).
+spec_version: 1
+name: {{BUNDLE_NAME}}
+description: >-
+  Superchat's Assistant: the person's one long-running assistant, which does one-turn work itself,
+  hands long, parallel or other-folder work to worker Helpers, and keeps the Conversation bounded
+  with Omnigent's own Rollover and Memory.
+
+{{SKILLS_FILTER}}
+executor:
+  type: omnigent
+  # No model named here: a chat runs on the model picked in Settings > Models (the person's
+  # default, else the organization's, else the connection's own first model).
+  config:
+    harness: {{HARNESS}}
+{{EXECUTOR_EXTRA}}
+
+interaction:
+  conversational: true
+  modalities:
+    input: [text, file]
+    output: [text]
+
+# Shell and file tools (sys_os_*) run in the host's workspace. The host is the isolation
+# boundary, so no inner sandbox and no approval prompts.
+os_env:
+  type: caller_process
+  cwd: /home/superchat/workspace
+  sandbox:
+    type: none
+    # A session opened on a Project starts in its folder; file tools still reach the workspace.
+    write_paths: [/home/superchat/workspace]
+
+tools:
+  # The Conversation's whole tool list, named one by one: this list is the single place that says
+  # what the Assistant can call. Left out on purpose: the inbox, session listing, info and closing,
+  # task cancelling (a Helper's result arrives as a message, running work is listed in front of
+  # each message, and Stop belongs to the person), the vault
+  # (no browser tool is granted), memory_get and memory_explain (recall_get reads a claim),
+  # files_vsearch and files_multi_get (files_query and files_get cover them). files_status and files_query also serve the web's file panel relays.
+  allow:
+    - "sys_os_*"
+    - memory_remember
+    - memory_search
+    - memory_forget
+    - session_history
+    - recall
+    - recall_get
+    - context_brief
+    - state_close
+    # Only the topic the person picked up (the server refuses any other key).
+    - topics_update
+    # How the person said to be reached unasked (ADR 0038); the server refuses any other caller.
+    - reach_rules
+    - open_project
+    - start_helper
+    - message_helper
+    # A capped Helper result says to read the rest here.
+    - sys_session_get_history
+    - "sys_scheduled_task_*"
+    - artifact_save
+    - artifact_list
+    - artifact_delete
+    - artifact_outline
+    - artifact_publish
+    - artifact_keep_updated
+    - artifact_stop_updating
+    - artifact_live_settings
+    - files_search
+    - files_query
+    - files_get
+    - files_read_page
+    - files_status
+    - "deck_*"
+    # The deck layouts (skills/decks), read when it builds a deck.
+    - load_skill
+    - render_card
+    - ask_clarification
+    - suggest_follow_ups
+    - checklist
+  # The Sub-agent Types this Assistant may launch, see agents/<dir>/. Each has its own
+  # executor and max_sessions; a turn launches one by its declared `name`, never by naming a
+  # model (docs/glossary.md "Sub-agent Type").
+  agents:
+    - worker
+    # System-started only (daily-note passes): no Helper role, so start_helper never picks it.
+    - notes
+    # A file's studio chat (ADR 0024), made by the engine; no Helper role either.
+    - editor

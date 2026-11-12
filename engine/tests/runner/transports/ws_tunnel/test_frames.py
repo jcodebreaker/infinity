@@ -1,0 +1,409 @@
+"""Tests for the WS tunnel frame protocol.
+
+Each frame type round-trips through encode → decode unchanged.
+Decode rejects malformed input cleanly. Body encoding picks utf-8
+for text content, base64 for binary.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from omnigent.runner.transports.ws_tunnel.frames import (
+    EVENT_INGEST_CAPABILITY,
+    EventAckFrame,
+    EventBatchFrame,
+    EventReadyFrame,
+    FrameKind,
+    HelloFrame,
+    PingFrame,
+    PongFrame,
+    RequestCancelFrame,
+    RequestFrame,
+    ResponseBodyFrame,
+    ResponseEndFrame,
+    ResponseHeadFrame,
+    decode_body,
+    decode_frame,
+    encode_body,
+    encode_frame,
+    is_text_content_type,
+)
+
+# ── Round-trip per frame kind ────────────────────────────
+
+
+@pytest.mark.parametrize("events", [[], [{}], [{"type": 123}]])
+def test_event_batch_encoder_rejects_invalid_events(events: list[dict[str, object]]) -> None:
+    with pytest.raises(ValueError, match=r"event\.batch requires"):
+        encode_frame(EventBatchFrame(id="batch-1", session_id="session-1", events=events))
+
+
+def test_event_ingest_frames_round_trip() -> None:
+    hello = HelloFrame(
+        runner_version="0.1.2",
+        frame_protocol_version=1,
+        capabilities=[EVENT_INGEST_CAPABILITY],
+    )
+    assert decode_frame(encode_frame(hello)) == hello
+    ready = EventReadyFrame()
+    batch = EventBatchFrame(
+        id="batch-1",
+        session_id="session-1",
+        events=[{"type": "external_output_text_delta", "data": {"delta": "hi"}}],
+    )
+    ack = EventAckFrame(id="batch-1", applied=0, error="busy", retryable=True)
+    for frame in (ready, batch, ack, EventAckFrame(id="batch-1", applied=1)):
+        assert decode_frame(encode_frame(frame)) == frame
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        {"kind": "event.batch", "id": "b", "session_id": "s", "events": []},
+        {"kind": "event.batch", "id": "b", "session_id": "s", "events": [{}]},
+        {"kind": "event.ack", "id": "b", "applied": -1},
+        {"kind": "event.ack", "id": "b", "applied": True},
+        {"kind": "event.ack", "id": "b", "applied": 0, "error": 123},
+    ],
+)
+def test_event_ingest_rejects_malformed_frames(frame: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        decode_frame(json.dumps(frame))
+
+
+def test_hello_round_trip() -> None:
+    f = HelloFrame(
+        runner_version="0.1.2",
+        frame_protocol_version=1,
+        harnesses=["claude-sdk", "codex"],
+        envs=["os_sandbox"],
+        connection_id="c0ffee01",
+    )
+    decoded = decode_frame(encode_frame(f))
+    assert isinstance(decoded, HelloFrame)
+    assert decoded.runner_version == "0.1.2"
+    assert decoded.connection_id == "c0ffee01"
+    assert decoded.frame_protocol_version == 1
+    assert decoded.harnesses == ["claude-sdk", "codex"]
+    assert decoded.envs == ["os_sandbox"]
+    assert decoded.direct_attach_port is None
+    assert decoded.direct_attach_token is None
+    assert decoded.capabilities == []
+
+
+def test_hello_attachment_capability_round_trip() -> None:
+    """New capabilities survive hello; legacy hellos keep their original shape."""
+    from omnigent.harnesses.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+
+    legacy = HelloFrame(runner_version="0.14.0", frame_protocol_version=1)
+    assert "capabilities" not in json.loads(encode_frame(legacy))
+    legacy.capabilities = [CAP_FILESYSTEM_ATTACHMENTS]
+    decoded = decode_frame(encode_frame(legacy))
+    assert isinstance(decoded, HelloFrame)
+    assert decoded.capabilities == [CAP_FILESYSTEM_ATTACHMENTS]
+
+
+def test_hello_round_trip_with_direct_attach_advert() -> None:
+    f = HelloFrame(
+        runner_version="0.1.2",
+        frame_protocol_version=1,
+        direct_attach_port=54321,
+        direct_attach_token="tok_abc",
+    )
+    decoded = decode_frame(encode_frame(f))
+    assert isinstance(decoded, HelloFrame)
+    assert decoded.direct_attach_port == 54321
+    assert decoded.direct_attach_token == "tok_abc"
+
+
+def test_hello_without_advert_omits_direct_attach_keys_on_wire() -> None:
+    """Advert-less hellos keep the pre-advert wire shape byte-compatible."""
+    wire = json.loads(encode_frame(HelloFrame(runner_version="0.1.2", frame_protocol_version=1)))
+    assert "direct_attach_port" not in wire
+    assert "direct_attach_token" not in wire
+    assert "connection_id" not in wire
+    decoded = decode_frame(json.dumps(wire))
+    assert isinstance(decoded, HelloFrame)
+    assert decoded.connection_id is None
+
+
+def test_hello_decode_drops_half_present_direct_attach_advert() -> None:
+    """Port and token only mean anything together; a lone field is noise."""
+    wire = json.loads(
+        encode_frame(
+            HelloFrame(
+                runner_version="0.1.2",
+                frame_protocol_version=1,
+                direct_attach_port=54321,
+                direct_attach_token="tok_abc",
+            )
+        )
+    )
+    del wire["direct_attach_token"]
+    decoded = decode_frame(json.dumps(wire))
+    assert isinstance(decoded, HelloFrame)
+    assert decoded.direct_attach_port is None
+    assert decoded.direct_attach_token is None
+
+
+def test_request_round_trip_with_body_and_query_string() -> None:
+    f = RequestFrame(
+        id="req_abc",
+        method="POST",
+        path="/v1/responses",
+        query_string="background=true",
+        headers=[["content-type", "application/json"]],
+        body='{"agent_id": "agent_x"}',
+        encoding="utf-8",
+        stream=True,
+    )
+    decoded = decode_frame(encode_frame(f))
+    assert isinstance(decoded, RequestFrame)
+    assert decoded.id == "req_abc"
+    assert decoded.method == "POST"
+    assert decoded.path == "/v1/responses"
+    assert decoded.query_string == "background=true"
+    assert decoded.headers == [["content-type", "application/json"]]
+    assert decoded.body == '{"agent_id": "agent_x"}'
+    assert decoded.encoding == "utf-8"
+    assert decoded.stream is True
+
+
+def test_request_round_trip_with_null_body() -> None:
+    """GET requests have no body — encoded as null, decoded as None."""
+    f = RequestFrame(id="req_g", method="GET", path="/health", body=None)
+    decoded = decode_frame(encode_frame(f))
+    assert isinstance(decoded, RequestFrame)
+    assert decoded.body is None
+
+
+def test_response_head_round_trip() -> None:
+    f = ResponseHeadFrame(
+        id="req_abc",
+        status=200,
+        headers=[["content-type", "text/event-stream"]],
+    )
+    decoded = decode_frame(encode_frame(f))
+    assert isinstance(decoded, ResponseHeadFrame)
+    assert decoded.status == 200
+    assert decoded.headers == [["content-type", "text/event-stream"]]
+
+
+def test_response_body_round_trip_utf8() -> None:
+    f = ResponseBodyFrame(id="req_abc", body="data: {...}\n\n", encoding="utf-8")
+    decoded = decode_frame(encode_frame(f))
+    assert isinstance(decoded, ResponseBodyFrame)
+    assert decoded.body == "data: {...}\n\n"
+    assert decoded.encoding == "utf-8"
+
+
+def test_response_body_round_trip_base64() -> None:
+    """Binary bodies (file downloads) ride as base64 — preserve encoding marker."""
+    f = ResponseBodyFrame(id="req_x", body="iVBORw0KGgoAAAA", encoding="base64")
+    decoded = decode_frame(encode_frame(f))
+    assert isinstance(decoded, ResponseBodyFrame)
+    assert decoded.encoding == "base64"
+
+
+def test_response_end_round_trip() -> None:
+    f = ResponseEndFrame(id="req_abc")
+    decoded = decode_frame(encode_frame(f))
+    assert isinstance(decoded, ResponseEndFrame)
+    assert decoded.id == "req_abc"
+    assert decoded.error is None
+
+
+def test_response_end_with_error_round_trip() -> None:
+    """Error-flagged end frames carry the error string through encode/decode."""
+    f = ResponseEndFrame(id="req_xyz", error="runner_stream_error")
+    encoded = encode_frame(f)
+    decoded = decode_frame(encoded)
+    assert isinstance(decoded, ResponseEndFrame)
+    assert decoded.id == "req_xyz"
+    assert decoded.error == "runner_stream_error"
+    # The wire format must include the "error" key when set.
+    wire = json.loads(encoded)
+    assert wire.get("error") == "runner_stream_error"
+
+
+def test_response_end_clean_omits_error_key() -> None:
+    """Clean end frames must NOT include an "error" key on the wire."""
+    f = ResponseEndFrame(id="req_abc")
+    wire = json.loads(encode_frame(f))
+    assert "error" not in wire
+
+
+def test_request_cancel_round_trip() -> None:
+    f = RequestCancelFrame(id="req_abc", reason="client_disconnected")
+    decoded = decode_frame(encode_frame(f))
+    assert isinstance(decoded, RequestCancelFrame)
+    assert decoded.reason == "client_disconnected"
+
+
+def test_ping_pong_round_trip() -> None:
+    p = PingFrame(ts=1709654400000)
+    decoded_p = decode_frame(encode_frame(p))
+    assert isinstance(decoded_p, PingFrame)
+    assert decoded_p.ts == 1709654400000
+
+    o = PongFrame(ts=1709654400000)
+    decoded_o = decode_frame(encode_frame(o))
+    assert isinstance(decoded_o, PongFrame)
+    assert decoded_o.ts == 1709654400000
+
+
+# ── Decode failure modes ─────────────────────────────────
+
+
+def test_decode_rejects_invalid_json() -> None:
+    with pytest.raises(ValueError, match="not valid JSON"):
+        decode_frame("{not json")
+
+
+def test_decode_rejects_non_object_root() -> None:
+    """A JSON array or scalar isn't a frame; reject loudly."""
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        decode_frame("[1, 2, 3]")
+
+
+def test_decode_rejects_missing_kind() -> None:
+    with pytest.raises(ValueError, match="missing 'kind'"):
+        decode_frame(json.dumps({"id": "x"}))
+
+
+def test_decode_rejects_unknown_kind() -> None:
+    """An unknown kind string surfaces an explicit "unknown frame kind"
+    error rather than silently treating it as an empty frame."""
+    with pytest.raises(ValueError, match="unknown frame kind"):
+        decode_frame(json.dumps({"kind": "fake.unknown_kind"}))
+
+
+def test_decode_rejects_request_missing_required_fields() -> None:
+    """A request frame with no method/path is structurally invalid."""
+    payload = json.dumps({"kind": "request", "id": "x"})
+    with pytest.raises(ValueError):
+        decode_frame(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(
+            {
+                "kind": "hello",
+                "runner_version": "1",
+                "frame_protocol_version": 1,
+                "harnesses": 123,
+            },
+            id="hello-harnesses-not-list",
+        ),
+        pytest.param(
+            {"kind": "request", "id": "r", "method": "GET", "path": "/", "headers": 123},
+            id="request-headers-not-list",
+        ),
+        pytest.param(
+            {"kind": "request", "id": "r", "method": "GET", "path": "/", "stream": "yes"},
+            id="request-stream-not-bool",
+        ),
+        pytest.param(
+            {"kind": "request", "id": "r", "method": "GET", "path": "/", "body": 123},
+            id="request-body-not-string",
+        ),
+        pytest.param(
+            {"kind": "response.head", "id": "r", "status": 200, "headers": [["ok"]]},
+            id="response-header-not-pair",
+        ),
+        pytest.param(
+            {"kind": "ws.frame", "ch_id": "ch_1", "data": 123},
+            id="ws-frame-data-not-string",
+        ),
+        pytest.param(
+            {"kind": "ws.close", "ch_id": "ch_1", "code": "1000"},
+            id="ws-close-code-not-int",
+        ),
+    ],
+)
+def test_decode_rejects_malformed_optional_fields(payload: dict[str, object]) -> None:
+    """Bad optional fields raise ``ValueError``, not incidental exceptions.
+
+    :param payload: Malformed frame payload.
+    :returns: None.
+    """
+    with pytest.raises(ValueError):
+        decode_frame(json.dumps(payload))
+
+
+# ── Body encoding helpers ────────────────────────────────
+
+
+def test_is_text_content_type_recognizes_standard_types() -> None:
+    assert is_text_content_type("application/json")
+    assert is_text_content_type("application/json; charset=utf-8")
+    assert is_text_content_type("text/event-stream")
+    assert is_text_content_type("text/plain")
+    assert is_text_content_type("application/jsonl")
+
+
+def test_is_text_content_type_rejects_binary() -> None:
+    assert not is_text_content_type("image/png")
+    assert not is_text_content_type("application/octet-stream")
+    assert not is_text_content_type("application/pdf")
+
+
+def test_encode_body_picks_utf8_for_text() -> None:
+    body, encoding = encode_body(b'{"x": 1}', "application/json")
+    assert encoding == "utf-8"
+    assert body == '{"x": 1}'
+
+
+def test_encode_body_picks_base64_for_binary() -> None:
+    body, encoding = encode_body(b"\x89PNG", "image/png")
+    assert encoding == "base64"
+    # decode_body round-trips back to the same bytes.
+    assert decode_body(body, encoding) == b"\x89PNG"
+
+
+def test_decode_body_round_trips_both_encodings() -> None:
+    assert decode_body("hello", "utf-8") == b"hello"
+    assert decode_body("aGVsbG8=", "base64") == b"hello"
+
+
+def test_decode_body_rejects_unknown_encoding() -> None:
+    with pytest.raises(ValueError, match="unknown body encoding"):
+        decode_body("x", "utf-7")
+
+
+# ── Wire compatibility ──────────────────────────────────
+
+
+def test_encoded_kind_uses_canonical_string() -> None:
+    """Frame kinds on the wire match the documented values."""
+    assert json.loads(encode_frame(PingFrame(ts=1)))["kind"] == "ping"
+    assert json.loads(encode_frame(PongFrame(ts=1)))["kind"] == "pong"
+    assert json.loads(encode_frame(ResponseEndFrame(id="x")))["kind"] == "response.end"
+    assert json.loads(encode_frame(EventReadyFrame()))["kind"] == "event.ready"
+    assert (
+        json.loads(encode_frame(EventBatchFrame(id="x", session_id="s", events=[{"type": "x"}])))[
+            "kind"
+        ]
+        == "event.batch"
+    )
+    assert json.loads(encode_frame(EventAckFrame(id="x", applied=1)))["kind"] == "event.ack"
+    # The dot-separated kinds are the load-bearing assertion — a
+    # refactor that flipped them to "responseEnd" or "RESPONSE_END"
+    # would break wire compat with any client outside the test suite.
+
+
+def test_frame_kind_enum_values_match_design() -> None:
+    """The FrameKind enum's wire values are the design-spec strings."""
+    assert FrameKind.HELLO.value == "hello"
+    assert FrameKind.REQUEST.value == "request"
+    assert FrameKind.RESPONSE_HEAD.value == "response.head"
+    assert FrameKind.RESPONSE_BODY.value == "response.body"
+    assert FrameKind.RESPONSE_END.value == "response.end"
+    assert FrameKind.REQUEST_CANCEL.value == "request.cancel"
+    assert FrameKind.PING.value == "ping"
+    assert FrameKind.PONG.value == "pong"

@@ -1,0 +1,194 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          # The retired-words step diffs against the base branch.
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - name: Translation catalogs are up to date
+        run: |
+          pnpm --filter @superchat/web intl:extract
+          git diff --exit-code -- web/app/src/locales || {
+            echo "::error::Run 'pnpm --filter @superchat/web intl:extract' and commit the catalogs."
+            exit 1
+          }
+      - name: No retired words on added lines (ADR 0029)
+        env:
+          BASE: origin/${{ github.base_ref || 'main' }}
+        run: python3 engine/scripts/retired_words.py "$BASE"
+
+  check:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+
+  build:
+    name: Production builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+
+  engine:
+    name: Engine (Python)
+    runs-on: ubuntu-latest
+    # The suite takes 30 to 59 minutes on a hosted runner; 45 cancelled green runs.
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      # uv reads engine/.python-version (3.12) and installs that interpreter.
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: engine/uv.lock
+      - run: uv sync --locked --group dev
+      # The locked ruff (dev group), so a new ruff release cannot turn the job red on its own.
+      - name: Ruff
+        run: |
+          uv run --no-sync ruff check .
+          uv run --no-sync ruff format --check .
+      - name: Layer contracts (ADR 0019)
+        run: uv run --no-sync lint-imports
+      # xdist reports a dead worker only as "node down". Record every SIGTERM
+      # and SIGKILL the kernel delivers, and the worker pids, so the trace
+      # shows who killed a worker, or that nobody did and it exited itself.
+      - name: Trace signals
+        run: |
+          t=/sys/kernel/tracing
+          echo 65536 | sudo tee "$t/buffer_size_kb" > /dev/null
+          echo 'sig == 9 || sig == 15' | sudo tee "$t/events/signal/signal_generate/filter" > /dev/null
+          echo 1 | sudo tee "$t/events/signal/signal_generate/enable" > /dev/null
+      - name: Tests
+        run: |
+          (while sleep 15; do echo "$(date -u +%T) $(pgrep -d ' ' -f 'sys.stdin.readline')"; done) > "$RUNNER_TEMP/workers.log" &
+          uv run --no-sync pytest tests -q -p no:randomly -n auto -m "not databricks" --durations=30
+      - name: Who stopped the workers
+        if: always()
+        run: |
+          sort -u -k2 "$RUNNER_TEMP/workers.log" | head -n 40
+          pids=$(cut -d' ' -f2- "$RUNNER_TEMP/workers.log" | tr ' ' '\n' | grep . | sort -u)
+          sudo cat /sys/kernel/tracing/trace > "$RUNNER_TEMP/signals.txt"
+          echo "signals recorded: $(grep -vc '^#' "$RUNNER_TEMP/signals.txt")"
+          for p in $pids; do grep -E " pid=$p " "$RUNNER_TEMP/signals.txt" || true; done
+          sudo dmesg | grep -iE "out of memory|killed process" || echo "no OOM kills"
+
+  host-tests:
+    name: Host scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: engine/.python-version
+      # The host scripts (host/bin) run in the host image, not the engine venv; the dashboard
+      # tests need pandas.
+      - run: pip install pandas pytest
+      - run: pytest host/tests -q -p no:randomly
+
+  deploy-production:
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      vars.PRODUCTION_DEPLOY_ENABLED == 'true'
+    needs: [lint, check, build, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: production
+      cancel-in-progress: false
+    environment:
+      name: production
+    steps:
+      - name: Configure production SSH identity
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.PRODUCTION_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.PRODUCTION_SSH_KNOWN_HOSTS }}
+        run: |
+          test -n "$SSH_PRIVATE_KEY"
+          test -n "$SSH_KNOWN_HOSTS"
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/superchat-production"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/superchat-production" "$HOME/.ssh/known_hosts"
+          ssh-keygen -y -f "$HOME/.ssh/superchat-production" >/dev/null
+
+      - name: Deploy successful main revision
+        env:
+          SSH_HOST: ${{ secrets.PRODUCTION_SSH_HOST }}
+          SSH_USER: ${{ secrets.PRODUCTION_SSH_USER }}
+        run: |
+          test -n "$SSH_HOST"
+          test -n "$SSH_USER"
+          ssh -F /dev/null \
+            -i "$HOME/.ssh/superchat-production" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts" \
+            "$SSH_USER@$SSH_HOST" deploy-main

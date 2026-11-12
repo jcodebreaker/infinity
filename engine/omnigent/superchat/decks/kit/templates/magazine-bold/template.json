@@ -1,0 +1,42 @@
+{
+  "id": "magazine-bold",
+  "name": "Magazine Bold",
+  "tagline": "Huge magazine headlines",
+  "description": "Cream stock, huge black Playfair headlines, one orange spot colour.",
+  "best_for": "cover stories, column-style talks, monthly briefs with a strong voice",
+  "category": "editorial",
+  "mode": "light",
+  "upstream": "https://github.com/lewislulu/html-ppt-skill",
+  "source": "nexu-io/open-design design-templates/html-ppt/assets/themes/magazine-bold.css@802708f",
+  "license": "MIT (see LICENSE); fonts SIL OFL 1.1 (see ../../fonts/OFL-*.txt)",
+  "fonts": [
+    {
+      "family": "Inter",
+      "weight": 400,
+      "style": "normal",
+      "file": "Inter-400.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Inter",
+      "weight": 600,
+      "style": "normal",
+      "file": "Inter-600.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Playfair Display",
+      "weight": 600,
+      "style": "normal",
+      "file": "PlayfairDisplay-600.ttf",
+      "license": "OFL-playfairdisplay.txt"
+    },
+    {
+      "family": "Playfair Display",
+      "weight": 800,
+      "style": "normal",
+      "file": "PlayfairDisplay-800.ttf",
+      "license": "OFL-playfairdisplay.txt"
+    }
+  ]
+}

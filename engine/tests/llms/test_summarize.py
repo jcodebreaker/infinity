@@ -1,0 +1,123 @@
+"""Unit tests for ``omnigent.llms.summarize`` helpers."""
+
+from __future__ import annotations
+
+import pytest
+
+from omnigent.llms.summarize import build_summarization_input
+
+
+@pytest.mark.parametrize("last_role", ["user", "assistant"])
+def test_summarization_renders_notices_without_extra_user_turns(last_role: str) -> None:
+    from omnigent.harnesses.native_attachments import framework_notice_block, resize_notice
+
+    dimensions = {"width": 6000, "height": 4000}
+    content = [
+        {"type": "input_text", "text": "inspect image"},
+        framework_notice_block(dimensions),
+    ]
+    messages = [{"role": "user", "content": content}]
+    if last_role == "assistant":
+        messages.append({"role": "assistant", "content": "answer"})
+
+    result = build_summarization_input(messages)
+
+    assert result[0] == {
+        "role": "system",
+        "content": [{"type": "input_text", "text": resize_notice(dimensions)}],
+    }
+    assert result[1] == {"role": "user", "content": content[:1]}
+    assert result[-1]["role"] == "user"
+    assert len(result) == (4 if last_role == "assistant" else 2)
+    assert len(content) == 2
+
+
+def test_build_summarization_input_appends_trigger_when_last_role_is_assistant() -> None:
+    """
+    A conversation ending in an assistant message must gain a
+    trailing user turn so providers that reject assistant-message
+    prefill (e.g. Databricks Claude) accept the request.
+    """
+    messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi there"},
+    ]
+
+    result = build_summarization_input(messages)
+
+    # Original messages preserved at the front.
+    assert result[:2] == messages, (
+        "Original conversation must be preserved; failure means the helper rewrote prior turns."
+    )
+    # A new user turn was appended.
+    assert len(result) == 3, (
+        f"Expected 3 items (2 original + trigger), got {len(result)}. "
+        "Failure means the trigger turn was not appended after an assistant "
+        "final message."
+    )
+    assert result[-1]["role"] == "user", (
+        "Trigger turn must be role=user so the chat-completions request ends on a user turn."
+    )
+    # Original list must not be mutated.
+    assert len(messages) == 2, "Helper must not mutate the caller's list."
+
+
+def test_build_summarization_input_skips_trigger_when_last_role_is_user() -> None:
+    """
+    A conversation already ending in a user message must NOT gain a
+    second user turn — some providers reject consecutive same-role
+    messages and the existing user turn is already a valid final
+    position.
+    """
+    messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi there"},
+        {"role": "user", "content": "summarize"},
+    ]
+
+    result = build_summarization_input(messages)
+
+    assert result == messages, (
+        "Helper must return the conversation unchanged when it already "
+        "ends with a user message; failure means a redundant trigger turn "
+        "was appended, which can produce consecutive user turns."
+    )
+    # Must be a copy — mutating result must not affect caller.
+    result.append({"role": "user", "content": "extra"})
+    assert len(messages) == 3, "Helper must return a copy, not the input list."
+
+
+def test_build_summarization_input_appends_trigger_when_last_item_is_tool_output() -> None:
+    """
+    A conversation ending in a function_call_output (becomes
+    role=tool after chat-completions conversion) must gain a
+    trailing user turn — tool messages aren't a valid final position
+    for the summarization request.
+    """
+    messages = [
+        {"role": "user", "content": "run X"},
+        {"type": "function_call", "call_id": "c1", "name": "x", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "done"},
+    ]
+
+    result = build_summarization_input(messages)
+
+    assert len(result) == 4, (
+        f"Expected trigger turn appended after tool output, got {len(result)} items."
+    )
+    assert result[-1]["role"] == "user"
+
+
+def test_state_file_form_does_not_conflict_with_the_plain_text_line() -> None:
+    """A caller that asks for a headed form must not also be told "no markup"; callers that
+    give no form keep the plain-text line."""
+    from omnigent.context.rollover import state_file_summarizer_instruction
+    from omnigent.llms.summarize import build_summarization_prompt
+
+    messages = [{"type": "message", "role": "user", "content": "hi"}]
+    headed = build_summarization_prompt(
+        messages, extra_instructions=state_file_summarizer_instruction()
+    )
+    assert "no markup" not in headed
+    assert "'## Context checkpoint" in headed
+    assert "no markup" in build_summarization_prompt(messages)

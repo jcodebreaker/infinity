@@ -1,0 +1,347 @@
+"""Integration tests for the explicit ``compact`` control event.
+
+The web-UI ``/compact`` command and compact button POST
+``{"type": "compact"}`` to ``POST /v1/sessions/{id}/events``. Per
+``designs/CLAUDE_NATIVE.md`` ("Control events dispatch on the runner"),
+the Omnigent server forwards the control to the bound runner and lets the
+runner's harness-specific handler own the operation.
+
+The runner's dispatch contract (verified in
+``tests/runner/test_app_sessions_native.py``):
+
+* Native harnesses inject ``/compact`` into the vendor TUI and return
+  **200** on success or **5xx** on failure.
+* SDK harnesses return **204** (no-op) because their context is controlled
+  entirely by the vendor harness; the server surfaces a 400 error.
+* A failed injection (pane not attached) returns **503**.
+
+These tests pin the Omnigent side of that contract by stubbing the runner's
+HTTP response and asserting the correct server behaviour.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from typing import Any
+
+import httpx
+import pytest
+
+from omnigent.runtime.compaction import CompactionResult
+from tests.server.helpers import create_test_agent
+
+pytestmark = pytest.mark.asyncio
+
+
+async def _create_session(client: httpx.AsyncClient, agent_id: str) -> str:
+    """
+    Create a bare session bound to *agent_id* and return its id.
+
+    :param client: The test HTTP client.
+    :param agent_id: Agent id to bind, e.g. ``"ag_abc123"``.
+    :returns: The new session id, e.g. ``"conv_abc123"``.
+    """
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent_id, "initial_items": []},
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+def _fake_runner_returning(compact_status: int) -> tuple[httpx.AsyncClient, list[dict[str, Any]]]:
+    """
+    Build a mock runner client that returns *compact_status* for compact.
+
+    The transport records every ``{"type": "compact"}`` body it sees so
+    the test can assert the Omnigent server actually forwarded the control,
+    and returns *compact_status* for those POSTs (204 for any other
+    runner POST so unrelated session traffic passes through).
+
+    :param compact_status: HTTP status the fake runner returns for a
+        ``compact`` ``/events`` POST, e.g. ``200`` (native handled),
+        ``204`` (SDK no-op), or ``503`` (pane not attached).
+    :returns: The mock ``httpx.AsyncClient`` and the list that captures
+        forwarded compact bodies.
+    """
+    captured: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Record compact POSTs and return the configured status."""
+        if request.method != "POST":
+            return httpx.Response(204)
+        body: dict[str, Any] | None = None
+        if request.content:
+            try:
+                body = json.loads(request.content)
+            except json.JSONDecodeError:
+                body = None
+        if isinstance(body, dict) and body.get("type") == "compact":
+            captured.append(body)
+            return httpx.Response(compact_status)
+        return httpx.Response(204)
+
+    runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    return runner, captured
+
+
+async def test_compact_returns_error_when_runner_noops(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 204 from the runner (SDK harness) surfaces a clear 400 error.
+
+    SDK harnesses own their own context; the server cannot compact on their
+    behalf. The 204 no-op signals "not handled here" and the server must
+    reject the request rather than attempting AP-side compaction.
+    """
+    from omnigent.runtime import set_runner_client
+
+    async def _must_not_run(**_: Any) -> CompactionResult:
+        raise AssertionError("compact_conversation_now must not run when the runner returned 204")
+
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow.compact_conversation_now",
+        _must_not_run,
+    )
+
+    runner, captured = _fake_runner_returning(204)
+    set_runner_client(runner)
+    try:
+        agent = await create_test_agent(client)
+        sid = await _create_session(client, agent["id"])
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "compact", "data": {}},
+        )
+    finally:
+        await runner.aclose()
+        set_runner_client(None)
+
+    assert resp.status_code == 400, resp.text
+    assert "/compact is not available" in resp.text
+    # Control was still forwarded before the error.
+    assert captured == [{"type": "compact"}], (
+        f"AP server must forward compact to the runner before returning the error; "
+        f"got {captured!r}."
+    )
+
+
+async def test_compact_sdk_harness_no_runner_returns_not_available(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A compact request for an SDK-harness session with no runner returns a
+    clear 400 "not available for this session type" error.
+    """
+    agent = await create_test_agent(
+        client,
+        name="sdk-no-runner-compact",
+        executor={"type": "omnigent", "config": {"harness": "pi"}},
+        include_llm=False,
+    )
+    sid = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={"type": "compact", "data": {}},
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "/compact is not available" in resp.text
+
+
+# ── external_compaction_status: terminal-observed compaction edge ────────
+#
+# The claude-native forwarder posts external_compaction_status when Claude
+# Code's PreCompact / post-compaction SessionStart(source=compact) hooks
+# fire, so the web UI brackets Claude's own terminal compaction with the
+# same "Compacting conversation…" spinner the AP-side path drives.
+
+
+async def test_external_compaction_status_anchors_started_at_to_first_report(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Repeated in_progress reports carry one stable compaction start.
+
+    A long compaction posts external_compaction_status("in_progress") on
+    every status poll. Every republished SSE must carry the started_at of
+    the FIRST report — that anchor is what lets the web UI fold repeats
+    into one spinner and keep the elapsed counter truthful across a page
+    reload. completed/failed must clear the anchor so the next compaction
+    starts a fresh clock.
+    """
+    from omnigent.server.routes._sessions import helpers as sessions_helpers
+
+    published: list[tuple[str, dict[str, Any]]] = []
+
+    def capture_publish(session_id: str, event: dict[str, Any]) -> None:
+        """Capture session-stream events emitted by the route."""
+        published.append((session_id, event))
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        capture_publish,
+    )
+    agent = await create_test_agent(client)
+    sid = await _create_session(client, agent["id"])
+
+    async def post(status: str) -> None:
+        """Post one compaction edge and require the server to accept it."""
+        resp = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={"type": "external_compaction_status", "data": {"status": status}},
+        )
+        assert resp.status_code == 202, resp.text
+
+    def last_started_at() -> object:
+        """Return started_at from the newest published in_progress SSE."""
+        events = [e for _, e in published if e["type"] == "response.compaction.in_progress"]
+        assert events, f"no in_progress SSE published; got {published!r}."
+        return events[-1].get("started_at")
+
+    now = int(time.time())
+    await post("in_progress")
+    first_start = last_started_at()
+    assert isinstance(first_start, int) and now <= first_start <= now + 30, (
+        f"in_progress must carry a wall-clock started_at; got {first_start!r}."
+    )
+
+    # A repeated poll of the SAME compaction reuses the recorded anchor. Pin
+    # it to a sentinel so the reuse is observable without sleeping a second.
+    sessions_helpers._compaction_started_at[sid] = 123
+    await post("in_progress")
+    assert last_started_at() == 123, (
+        "a repeated in_progress must reuse the recorded compaction start, "
+        "not re-anchor to the current clock."
+    )
+
+    # completed clears the anchor: the next compaction starts a fresh clock.
+    await post("completed")
+    assert sid not in sessions_helpers._compaction_started_at
+    await post("in_progress")
+    fresh_start = last_started_at()
+    assert isinstance(fresh_start, int) and fresh_start >= now, (
+        f"after completed, in_progress must record a fresh start; got {fresh_start!r}."
+    )
+
+    # failed clears it too — a retried compaction must not inherit the
+    # failed attempt's clock.
+    await post("failed")
+    assert sid not in sessions_helpers._compaction_started_at
+
+
+async def test_external_compaction_status_rejects_unknown_status(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Unknown compaction-status values are rejected with a 400.
+
+    Without this guard a typo in the forwarder would publish a
+    non-conforming event the SDK's strict adapter drops downstream —
+    the fail-loud guard rule 15 exists to prevent.
+    """
+    agent = await create_test_agent(client)
+    sid = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={"type": "external_compaction_status", "data": {"status": "Done"}},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "external_compaction_status" in resp.text
+
+
+async def test_compaction_snapshot_persists_without_base64_payloads(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A compaction snapshot reaches storage with no inline base64 payload.
+
+    The strip is unit-tested at ``parse_item_data``; this walks the whole
+    user-visible path instead — the event a native forwarder POSTs, through
+    the store, back out of ``GET /items`` — because that round trip is what
+    the reported multi-MB rows were actually made of.
+    """
+    payload = "iVBORw0KGgoAAAANSUhEUgAAAAE" + "A" * 20_000
+    agent = await create_test_agent(client)
+    sid = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={
+            "type": "compaction",
+            "data": {
+                "summary": "[Claude Code compaction — context was compacted in the terminal]",
+                "last_item_id": "msg_boundary_abc123",
+                "model": "unknown",
+                "token_count": 0,
+                "window_id": "01a070e2-2665-7d62-9b74-973decf239b7",
+                "compacted_messages": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_screenshot_01",
+                                "content": [
+                                    {
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": "image/png",
+                                            "data": payload,
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "I can see the screenshot."}],
+                    },
+                ],
+            },
+        },
+    )
+    assert resp.status_code == 202, resp.text
+
+    items_resp = await client.get(f"/v1/sessions/{sid}/items")
+    assert items_resp.status_code == 200, items_resp.text
+    compaction_items = [i for i in items_resp.json()["data"] if i.get("type") == "compaction"]
+    assert len(compaction_items) == 1, (
+        f"Expected exactly one compaction item; got {len(compaction_items)}."
+    )
+
+    item = compaction_items[0]
+    assert item["window_id"] == "01a070e2-2665-7d62-9b74-973decf239b7"
+    # to_api_dict spreads CompactionData onto the top level, so serialising the
+    # whole item leaves nowhere for a stray copy of the payload to hide.
+    item_json = json.dumps(item)
+    assert payload[:200] not in item_json, (
+        "Compaction snapshot persisted the full base64 image payload verbatim."
+    )
+    assert len(item_json) < len(payload) // 2, (
+        f"Stored compaction item is {len(item_json):,} bytes — close to the "
+        f"{len(payload):,}-byte payload, so it was not stripped."
+    )
+
+    # Still a usable snapshot: summary intact, message shape preserved, and
+    # only the payload swapped for a marker that names what was dropped.
+    assert item["summary"].startswith("[Claude Code compaction")
+    messages = item["compacted_messages"]
+    assert [m["role"] for m in messages] == ["user", "assistant"]
+    source = messages[0]["content"][0]["content"][0]["source"]
+    assert source["media_type"] == "image/png"
+    assert source["data"] == "[image/png content omitted from the compaction snapshot]"
+    assert messages[1]["content"][0]["text"] == "I can see the screenshot."

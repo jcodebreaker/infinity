@@ -1,0 +1,1595 @@
+"""
+Mock LLM server with keyed response queues for tests.
+
+Implements the OpenAI Responses API streaming format. Supports
+pre-configured response sequences (text, tool calls, errors),
+per-request blocking gates, request capture, and **keyed queues**
+so concurrent tests / sessions get isolated response streams.
+
+Keyed queues:
+
+Each ``POST /mock/configure`` call specifies an optional ``key``
+(defaults to ``"default"`` for model routing; content routing gets a unique key).
+When ``POST /v1/responses`` arrives,
+the server extracts the ``model`` field from the request body and
+looks up a queue by that key. If no queue matches the model, the
+``"default"`` queue is used. This lets e2e tests register one
+queue per agent (keyed by model name) so parent and sub-agent
+sessions each get their own response sequence.
+
+Endpoints:
+
+- ``POST /v1/responses`` — consume the next queued response from
+  the queue matching the request's ``model`` field.
+- ``GET /v1/models`` — return an empty model list (satisfies SDK
+  preflight checks).
+- ``POST /mock/configure`` — load a keyed response sequence.
+- ``POST /mock/reset`` — clear all state.
+- ``GET /mock/requests`` — return captured request bodies.
+- ``GET /gate/pending`` — check if any request is blocked on a gate.
+- ``POST /gate/release`` — release the oldest pending gate.
+- ``GET /stats`` — return ``{"request_count": N}``.
+
+Usage::
+
+    python tests/server/integration/mock_llm_server.py 9999
+
+Configuration via ``POST /mock/configure``::
+
+    {
+        "key": "mock-model",
+        "responses": [
+            {"text": "Hello!"},
+            {"text": "World!", "block": true},
+            {
+                "tool_calls": [
+                    {"call_id": "c1", "name": "grep", "arguments": "{}"}
+                ]
+            },
+            {"error": "rate limit exceeded", "status_code": 429},
+            {"text": "later", "delay": 1.5},
+            {"text": "one two three", "stream": true, "truncate_after": 2}
+        ]
+    }
+
+``truncate_after`` opens a normal ``200`` SSE stream but emits only that many
+events before ending — dropping the terminal completion event — to simulate a
+stream that dies mid-flight (the mid-stream fault the ``error`` field, an
+open-time HTTP status, cannot express).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hashlib
+import json
+import os
+import sys
+import threading
+import time as _time_mod
+import uuid as _uuid_mod
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+app = FastAPI()
+_evidence_journals = {}
+_evidence_journals_lock = threading.Lock()
+
+
+def _evidence_directory() -> Path | None:
+    attempt = os.environ.get("OMNIGENT_REPRO_ATTEMPT_DIR")
+    if attempt:
+        return Path(attempt)
+    runtime = os.environ.get("OMNIGENT_REPRO_EVIDENCE_ROOT")
+    if runtime and (Path(runtime) / "execution-context.json").is_file():
+        return Path(runtime) / "execution/service"
+    return None
+
+
+def _record_evidence(kind: str, body=None, accepted_at_ns=None, *, directory=None) -> None:
+    try:
+        directory = directory if directory is not None else _evidence_directory()
+        if directory is None:
+            return
+        from dev.repro_env.execution import Journal
+
+        with _evidence_journals_lock:
+            if directory not in _evidence_journals:
+                _evidence_journals[directory] = Journal(directory)
+            journal = _evidence_journals[directory]
+        journal.emit(
+            "provider_mock",
+            action=kind,
+            accepted_at_ns=accepted_at_ns,
+            body=body,
+            boundary="model provider",
+            correlation="timestamp and request content",
+        )
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            print(f"provider evidence unavailable: {type(exc).__name__}", file=sys.stderr)
+
+
+async def _record_evidence_async(kind: str, body=None, accepted_at_ns=None) -> None:
+    try:
+        directory = _evidence_directory()
+        if directory is not None:
+            await asyncio.to_thread(
+                _record_evidence, kind, body, accepted_at_ns, directory=directory
+            )
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            print(f"provider evidence unavailable: {type(exc).__name__}", file=sys.stderr)
+
+
+# Default queue key when none is specified or no model matches.
+_DEFAULT_KEY = "default"
+
+
+# ── SSE event builders (following Codex pattern) ─────────
+
+
+def _response_id() -> str:
+    """Generate a unique response id."""
+    return f"resp_{_uuid_mod.uuid4().hex[:12]}"
+
+
+def _response_usage(output_tokens: int, overrides: dict | None = None) -> dict:
+    """Merge scripted token counts and derive the total when it is omitted."""
+    usage = {"input_tokens": 10, "output_tokens": output_tokens, **(overrides or {})}
+    usage.setdefault("total_tokens", usage["input_tokens"] + usage["output_tokens"])
+    return usage
+
+
+def sse_text_response(text: str, model: str = "mock-model", usage: dict | None = None) -> str:
+    """
+    Build a complete SSE stream for a simple text response.
+
+    Emits the full sequence of events the OpenAI Agents SDK expects:
+    ``response.created``, ``response.output_item.added``,
+    ``response.output_text.done``, ``response.output_item.done``,
+    ``response.completed``.
+
+    :param text: The assistant response text.
+    :param model: Model name to include in the response.
+    :param usage: Optional token-usage overrides.
+    :returns: SSE-formatted string.
+    """
+    resp_id = _response_id()
+    msg_id = f"msg_{resp_id}"
+    output_tokens = max(5, len(text.split()))
+    now = _time_mod.time()
+
+    message_item = {
+        "id": msg_id,
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": text}],
+    }
+    response_obj = {
+        "id": resp_id,
+        "object": "response",
+        "status": "completed",
+        "model": model,
+        "output": [message_item],
+        "parallel_tool_calls": True,
+        "tools": [],
+        "tool_choice": "auto",
+        "usage": _response_usage(output_tokens, usage),
+        "created_at": now,
+        "completed_at": now,
+    }
+    created_response = {
+        **response_obj,
+        "status": "in_progress",
+        "output": [],
+    }
+
+    seq = 0
+    events: list[str] = []
+
+    def _add(evt_type: str, **extra: object) -> None:
+        nonlocal seq
+        data = {"type": evt_type, "sequence_number": seq, **extra}
+        events.append(f"event: {evt_type}\ndata: {json.dumps(data)}\n\n")
+        seq += 1
+
+    _add("response.created", response=created_response)
+    _add(
+        "response.output_item.added",
+        output_index=0,
+        item=message_item,
+    )
+    _add(
+        "response.output_text.done",
+        output_index=0,
+        item_id=msg_id,
+        content_index=0,
+        text=text,
+    )
+    _add(
+        "response.output_item.done",
+        output_index=0,
+        item=message_item,
+    )
+    _add("response.completed", response=response_obj)
+    return "".join(events)
+
+
+def json_text_response(text: str, model: str = "mock-model", usage: dict | None = None) -> dict:
+    """
+    Build a non-streaming Responses API JSON body for a text response.
+
+    Used when the request does NOT include ``stream: true`` — for example,
+    the cost-advisor judge calls ``responses.create`` without streaming and
+    the OpenAI adapter calls ``_send_request`` which expects a plain JSON dict.
+
+    :param text: The assistant response text.
+    :param model: Model name to include in the response.
+    :param usage: Optional token-usage overrides.
+    :returns: Responses API response dict.
+    """
+    resp_id = _response_id()
+    msg_id = f"msg_{resp_id}"
+    output_tokens = max(5, len(text.split()))
+    now = _time_mod.time()
+    return {
+        "id": resp_id,
+        "object": "response",
+        "status": "completed",
+        "model": model,
+        "output": [
+            {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        ],
+        "parallel_tool_calls": True,
+        "tools": [],
+        "tool_choice": "auto",
+        "usage": _response_usage(output_tokens, usage),
+        "created_at": now,
+        "completed_at": now,
+    }
+
+
+def sse_tool_call_response(
+    tool_calls: list[dict[str, str]],
+    model: str = "mock-model",
+    usage: dict | None = None,
+) -> str:
+    """
+    Build a complete SSE stream for a function call response.
+
+    :param tool_calls: List of tool call dicts, each with
+        ``"call_id"``, ``"name"``, and ``"arguments"`` keys.
+    :param model: Model name to include in the response.
+    :param usage: Optional token-usage overrides.
+    :returns: SSE-formatted string.
+    """
+    resp_id = _response_id()
+    now = _time_mod.time()
+    output = []
+    for tc in tool_calls:
+        output.append(
+            {
+                "id": tc.get("call_id", "call-mock"),
+                "type": "function_call",
+                "call_id": tc.get("call_id", "call-mock"),
+                "name": tc["name"],
+                "arguments": tc.get("arguments", "{}"),
+                "status": "completed",
+            }
+        )
+    response_obj = {
+        "id": resp_id,
+        "object": "response",
+        "status": "completed",
+        "model": model,
+        "output": output,
+        "parallel_tool_calls": True,
+        "tools": [],
+        "tool_choice": "auto",
+        "usage": _response_usage(5, usage),
+        "created_at": now,
+        "completed_at": now,
+    }
+    created_response = {
+        **response_obj,
+        "status": "in_progress",
+        "output": [],
+    }
+
+    seq = 0
+    events: list[str] = []
+
+    def _add(evt_type: str, **extra: object) -> None:
+        nonlocal seq
+        data = {"type": evt_type, "sequence_number": seq, **extra}
+        events.append(f"event: {evt_type}\ndata: {json.dumps(data)}\n\n")
+        seq += 1
+
+    _add("response.created", response=created_response)
+    for idx, item in enumerate(output):
+        _add(
+            "response.output_item.added",
+            output_index=idx,
+            item=item,
+        )
+        _add(
+            "response.output_item.done",
+            output_index=idx,
+            item=item,
+        )
+    _add("response.completed", response=response_obj)
+    return "".join(events)
+
+
+def truncate_sse(body: str, keep_events: int) -> str:
+    """Return the first *keep_events* SSE events of *body*, dropping the rest.
+
+    Events are ``\\n\\n``-delimited. Keeping a prefix drops the terminal
+    completion event (``response.completed`` / ``message_stop``), so a client
+    reading the stream sees deltas start and then the connection end without a
+    completion — the "dropped events mid-stream" fault used to drive the SPA's
+    error/recovery UI. ``keep_events=0`` yields an empty body (immediate EOF).
+    """
+    events = [seg for seg in body.split("\n\n") if seg]
+    kept = events[: max(0, keep_events)]
+    return "".join(f"{seg}\n\n" for seg in kept)
+
+
+def sse_streaming_text(text: str, model: str = "mock-model", usage: dict | None = None) -> str:
+    """
+    Build SSE with text deltas followed by a completed event.
+
+    :param text: The assistant response text.
+    :param model: Model name.
+    :param usage: Optional token-usage overrides.
+    :returns: SSE-formatted string with delta events.
+    """
+    events = []
+    for word in text.split():
+        delta = {"delta": word + " "}
+        events.append(f"event: response.output_text.delta\ndata: {json.dumps(delta)}\n\n")
+    events.append(sse_text_response(text, model, usage))
+    return "".join(events)
+
+
+def sse_text_with_native_items(
+    text: str,
+    native_items: list[dict],
+    model: str = "mock-model",
+    usage: dict | None = None,
+) -> str:
+    """Build SSE with text + native tool output items (e.g. web_search_call).
+
+    Native items are emitted as ``response.output_item.done`` events
+    before the text message, matching the real API's ordering.
+    """
+    resp_id = _response_id()
+    msg_id = f"msg_{resp_id}"
+    output_tokens = max(5, len(text.split()))
+    now = _time_mod.time()
+
+    message_item = {
+        "id": msg_id,
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": text}],
+    }
+    all_output: list[dict] = [*native_items, message_item]
+    response_obj = {
+        "id": resp_id,
+        "object": "response",
+        "status": "completed",
+        "model": model,
+        "output": all_output,
+        "parallel_tool_calls": True,
+        "tools": [],
+        "tool_choice": "auto",
+        "usage": _response_usage(output_tokens, usage),
+        "created_at": now,
+        "completed_at": now,
+    }
+    created_response = {
+        **response_obj,
+        "status": "in_progress",
+        "output": [],
+    }
+
+    seq = 0
+    events: list[str] = []
+
+    def _add(evt_type: str, **extra: object) -> None:
+        nonlocal seq
+        data = {"type": evt_type, "sequence_number": seq, **extra}
+        events.append(f"event: {evt_type}\ndata: {json.dumps(data)}\n\n")
+        seq += 1
+
+    _add("response.created", response=created_response)
+    for idx, item in enumerate(all_output):
+        _add("response.output_item.added", output_index=idx, item=item)
+        if item.get("type") == "message":
+            _add(
+                "response.output_text.done",
+                output_index=idx,
+                item_id=msg_id,
+                content_index=0,
+                text=text,
+            )
+        _add("response.output_item.done", output_index=idx, item=item)
+    _add("response.completed", response=response_obj)
+    return "".join(events)
+
+
+# ── Anthropic Messages API SSE builders ─────────────────
+
+
+def anthropic_sse_text_response(
+    text: str,
+    model: str = "mock-model",
+    usage: dict | None = None,
+) -> str:
+    """Build Anthropic Messages API SSE stream for a text response.
+
+    Emits: ``message_start``, ``content_block_start``,
+    ``content_block_delta`` (text), ``content_block_stop``,
+    ``message_delta``, ``message_stop``.
+
+    :param usage: Optional prompt-usage overrides merged into the
+        ``message_start`` event's ``message.usage`` (e.g.
+        ``{"input_tokens": 50000}``), so tests can script the observed
+        context size. Defaults keep the historical fixed values.
+    """
+    msg_id = f"msg_{_uuid_mod.uuid4().hex[:12]}"
+    output_tokens = max(5, len(text.split()))
+
+    events: list[str] = []
+
+    def _evt(evt_type: str, data: dict) -> None:
+        events.append(f"event: {evt_type}\ndata: {json.dumps(data)}\n\n")
+
+    _evt(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 0, **(usage or {})},
+            },
+        },
+    )
+    _evt(
+        "content_block_start",
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        },
+    )
+    _evt(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text},
+        },
+    )
+    _evt(
+        "content_block_stop",
+        {
+            "type": "content_block_stop",
+            "index": 0,
+        },
+    )
+    _evt(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": output_tokens},
+        },
+    )
+    _evt("message_stop", {"type": "message_stop"})
+    return "".join(events)
+
+
+def anthropic_sse_thinking_text_response(
+    thinking: str,
+    text: str,
+    model: str = "mock-model",
+    usage: dict | None = None,
+) -> str:
+    """Build Anthropic Messages API SSE stream: a thinking block, then text.
+
+    Emits the extended-thinking wire shape — ``content_block_start`` of type
+    ``thinking``, word-chunked ``thinking_delta`` events, a ``signature_delta``,
+    ``content_block_stop`` — followed by the normal text block. Scripts a model
+    turn that visibly thinks before answering (e.g. Claude Code streaming
+    thinking into its TUI and transcript).
+
+    :param thinking: The thought text streamed in the thinking block.
+    :param text: The final assistant text streamed after the thought.
+    :param usage: Optional prompt-usage overrides merged into
+        ``message_start`` (see :func:`anthropic_sse_text_response`).
+    """
+    msg_id = f"msg_{_uuid_mod.uuid4().hex[:12]}"
+    output_tokens = max(5, len(text.split()) + len(thinking.split()))
+
+    events: list[str] = []
+
+    def _evt(evt_type: str, data: dict) -> None:
+        events.append(f"event: {evt_type}\ndata: {json.dumps(data)}\n\n")
+
+    _evt(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 0, **(usage or {})},
+            },
+        },
+    )
+    _evt(
+        "content_block_start",
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+        },
+    )
+    # Word-chunked deltas so a paced stream (``chunk_delay``) shows the
+    # thought arriving progressively, the way a real thinking turn does.
+    words = thinking.split(" ")
+    for at in range(0, len(words), 6):
+        _evt(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "thinking_delta",
+                    "thinking": " ".join(words[at : at + 6]) + " ",
+                },
+            },
+        )
+    _evt(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": "mock-signature"},
+        },
+    )
+    _evt("content_block_stop", {"type": "content_block_stop", "index": 0})
+    _evt(
+        "content_block_start",
+        {
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {"type": "text", "text": ""},
+        },
+    )
+    _evt(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "text_delta", "text": text},
+        },
+    )
+    _evt("content_block_stop", {"type": "content_block_stop", "index": 1})
+    _evt(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": output_tokens},
+        },
+    )
+    _evt("message_stop", {"type": "message_stop"})
+    return "".join(events)
+
+
+def anthropic_sse_tool_call_response(
+    tool_calls: list[dict[str, str]],
+    model: str = "mock-model",
+) -> str:
+    """Build Anthropic Messages API SSE stream for tool use blocks."""
+    msg_id = f"msg_{_uuid_mod.uuid4().hex[:12]}"
+    events: list[str] = []
+
+    def _evt(evt_type: str, data: dict) -> None:
+        events.append(f"event: {evt_type}\ndata: {json.dumps(data)}\n\n")
+
+    _evt(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 0},
+            },
+        },
+    )
+    for idx, tc in enumerate(tool_calls):
+        tool_id = tc.get("call_id", f"toolu_{_uuid_mod.uuid4().hex[:12]}")
+        _evt(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": tc["name"],
+                    "input": {},
+                },
+            },
+        )
+        _evt(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": tc.get("arguments", "{}"),
+                },
+            },
+        )
+        _evt(
+            "content_block_stop",
+            {
+                "type": "content_block_stop",
+                "index": idx,
+            },
+        )
+    _evt(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+            "usage": {"output_tokens": 5},
+        },
+    )
+    _evt("message_stop", {"type": "message_stop"})
+    return "".join(events)
+
+
+def anthropic_sse_refusal_response(
+    model: str = "mock-model",
+    category: str = "cyber",
+) -> str:
+    """Build an Anthropic Messages SSE stream that ends in a safeguard refusal.
+
+    Mirrors the wire shape Claude's safeguards produce on a flagged message:
+    ``stop_reason: "refusal"`` plus ``stop_details.{type,category}`` in the
+    ``message_delta``. Claude Code reacts by arming its refusal-fallback and
+    re-issuing the turn on the family's ``ANTHROPIC_DEFAULT_*_MODEL`` pin — so
+    this is what exercises the fallback path on the claude-sdk harness.
+    """
+    msg_id = f"msg_{_uuid_mod.uuid4().hex[:12]}"
+    events: list[str] = []
+
+    def _evt(evt_type: str, data: dict) -> None:
+        events.append(f"event: {evt_type}\ndata: {json.dumps(data)}\n\n")
+
+    _evt(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 0},
+            },
+        },
+    )
+    _evt(
+        "content_block_start",
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    )
+    _evt(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "I can't help with that."},
+        },
+    )
+    _evt("content_block_stop", {"type": "content_block_stop", "index": 0})
+    _evt(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": "refusal",
+                "stop_sequence": None,
+                "stop_details": {"type": "refusal", "category": category},
+            },
+            "usage": {"output_tokens": 5},
+        },
+    )
+    _evt("message_stop", {"type": "message_stop"})
+    return "".join(events)
+
+
+# ── Response queue state ─────────────────────────────────
+
+
+@dataclass
+class QueuedResponse:
+    """A single pre-configured response in the queue.
+
+    :param text: Response text (for text responses).
+    :param tool_calls: Tool call list (for function call responses).
+    :param native_items: Raw output items (e.g. ``web_search_call``)
+        included alongside text in the response.
+    :param block: If True, block until gate is released.
+    :param stream: If True, stream text deltas before completed.
+    :param error: If set, return an error response with this message.
+    :param status_code: HTTP status code for error responses.
+    :param delay: Seconds to sleep before returning this response.
+        Unlike ``block`` (which waits for an external gate release),
+        this is a fixed wall-clock pause the mock owns — use it to
+        give a server-side side effect (e.g. a cold interactive
+        subprocess booting/evaluating) real time to land before the
+        next scripted tool call fires, without depending on the CI
+        runner being fast enough for a back-to-back agent loop.
+    :param truncate_after: If set, open the SSE stream normally but emit only
+        this many events and then end the connection — dropping the terminal
+        completion event so the client sees a stream that starts and dies
+        mid-flight. Unlike ``error`` (an HTTP status at open time, before any
+        stream), this is a *mid-stream* fault: the response is a ``200`` SSE
+        body that stops early, which is what exercises the SPA's stream
+        error/recovery UI. ``0`` emits an empty body (immediate EOF after the
+        headers).
+    """
+
+    text: str = "Mock LLM response"
+    tool_calls: list[dict[str, str]] | None = None
+    native_items: list[dict] | None = None
+    block: bool = False
+    stream: bool = False
+    error: str | None = None
+    status_code: int = 500
+    delay: float = 0.0
+    truncate_after: int | None = None
+    # Usage overrides. On ``/v1/responses`` merged into the response usage.
+    # On ``/v1/messages`` merged into the Anthropic
+    # ``message_start`` event (e.g. {"input_tokens": 50000}) so a test can
+    # script the context size a claude harness observes mid-turn. On
+    # ``/v1/chat/completions`` returned verbatim as the OpenAI ``usage``
+    # object (JSON body and, when the client requests
+    # ``stream_options.include_usage``, the final stream chunk) so a test can
+    # script the token accounting an openai-wire harness records.
+    usage: dict | None = None
+    # When set, ``/v1/messages`` returns a safeguard-refusal SSE stream with
+    # this category (e.g. ``"cyber"``) instead of text — used to exercise
+    # Claude Code's refusal-fallback on the claude-sdk harness.
+    refusal_category: str | None = None
+    # When set, ``/v1/messages`` streams an extended-thinking block carrying
+    # this text before the ``text`` block — scripts a turn where the model
+    # visibly thinks before answering.
+    thinking: str | None = None
+    # Seconds to sleep between SSE events on ``/v1/messages``. ``0`` keeps the
+    # historical single-chunk body; a small value paces the stream so live
+    # surfaces (a native TUI) visibly render intermediate deltas.
+    chunk_delay: float = 0.0
+    _gate: asyncio.Event = field(default_factory=asyncio.Event)
+    _pending: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+class _ResponseQueue:
+    """Per-key FIFO queue of pre-configured responses.
+
+    An optional *fallback* response is returned when the queue is
+    exhausted.  Unlike regular entries, the fallback is NOT cleared by
+    :meth:`reset` — it persists for the lifetime of the queue instance
+    so session-level callers (e.g. a policy-classifier LLM configured
+    by ``live_server``) always receive a valid response even when
+    per-test ``reset_mock_llm`` calls clear the regular queue.
+    """
+
+    def __init__(self) -> None:
+        self.responses: list[QueuedResponse] = []
+        self.index: int = 0
+        self.fallback: QueuedResponse | None = None
+        # Optional content-routing token. When set, a request is served
+        # from this queue if the token appears in the request's
+        # role="user" input text — regardless of the request's ``model``.
+        # Lets each test claim its own queue by the (unique) message it
+        # sends, so a stray/late request from another test (which carries
+        # a different user message) can't draw from this test's queue —
+        # the #523 cross-test contamination, fixed without per-test
+        # servers. ``None`` preserves the default model/"default" routing.
+        self.match: str | None = None
+        self.required_tools: frozenset[str] | None = None
+
+    def accepts_tools(self, tool_names: set[str]) -> bool:
+        """Keep scripted tool calls out of requests without any tools.
+
+        Explicit guards cover the whole queue; an empty guard deliberately
+        permits calls even without tools. Otherwise only require a tool surface:
+        negative tests may deliberately call an unadvertised tool. Text, errors
+        and exhausted-queue fallbacks remain unrestricted.
+        """
+        if self.required_tools is not None:
+            return self.required_tools <= tool_names
+        if self.index < len(self.responses):
+            calls = self.responses[self.index].tool_calls or []
+            return not calls or bool(tool_names)
+        return True
+
+    def next(self) -> QueuedResponse:
+        """Consume the next response, or return the fallback / default."""
+        if self.index < len(self.responses):
+            resp = self.responses[self.index]
+            self.index += 1
+            return resp
+        if self.fallback is not None:
+            return self.fallback
+        return QueuedResponse()
+
+    def reset(self) -> None:
+        """Clear the regular queue + content-routing token; fallback is preserved."""
+        self.responses.clear()
+        self.index = 0
+        self.match = None
+        self.required_tools = None
+
+
+class MockState:
+    """Mutable server state with keyed response queues.
+
+    All mutations are guarded by ``_lock`` so concurrent coroutines
+    (e.g. two ``POST /v1/responses`` handlers) don't interleave on
+    shared structures.
+    """
+
+    def __init__(self) -> None:
+        self.queues: dict[str, _ResponseQueue] = {}
+        self.captured_requests: list[dict] = []
+        self.request_count: int = 0
+        self.pending_gates: list[QueuedResponse] = []
+        # Ids ``GET /v1/models`` reports; see ``POST /mock/served_models``.
+        self.served_models: list[str] = []
+        self._lock = asyncio.Lock()
+
+    def get_queue(self, key: str) -> _ResponseQueue:
+        """Get or create a queue for *key*."""
+        if key not in self.queues:
+            self.queues[key] = _ResponseQueue()
+        return self.queues[key]
+
+    def resolve_queue(self, model: str | None) -> _ResponseQueue:
+        """Find the queue for a request's model field.
+
+        Lookup order:
+        1. Exact match on *model* in ``self.queues``.
+        2. The ``"default"`` queue.
+        3. A lazily-stored ``"default"`` queue (so subsequent
+           requests for unknown models share the same queue).
+        """
+        if model and model in self.queues:
+            return self.queues[model]
+        if _DEFAULT_KEY in self.queues:
+            return self.queues[_DEFAULT_KEY]
+        # Lazily create and store the default queue so concurrent
+        # requests to unknown models share the same instance.
+        self.queues[_DEFAULT_KEY] = _ResponseQueue()
+        return self.queues[_DEFAULT_KEY]
+
+    @staticmethod
+    def _user_input_text(parsed: object) -> str:
+        """Concatenate the text of all ``role="user"`` items in the request.
+
+        Endpoint-agnostic: reads BOTH the Responses-API ``input`` array
+        (``/v1/responses``) AND the ``messages`` array used by the
+        Anthropic Messages (``/v1/messages``) and OpenAI Chat
+        (``/v1/chat/completions``) endpoints — so content routing behaves
+        identically no matter which endpoint ``resolve_queue_for_request``
+        is called from, rather than silently degrading to model routing
+        for ``messages``-shaped requests.
+
+        Scoped to user-role content deliberately — NOT the system prompt
+        (``instructions`` / ``system``) or tool outputs — so a
+        content-routing token only ever matches what the test itself
+        typed, never incidental words in a shared system prompt. Responses
+        input may itself be a string, while message content can be a string,
+        mapping, or nested list of text blocks.
+
+        :param parsed: The parsed request body.
+        :returns: Space-joined user message text (``""`` if none).
+        """
+        if not isinstance(parsed, dict):
+            return ""
+        parts: list[str] = []
+
+        def append_text(content: object) -> None:
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, dict):
+                if content.get("type") in {"tool_result", "function_call_output"}:
+                    return
+                text = content.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                nested = content.get("content")
+                if nested is not None:
+                    append_text(nested)
+            elif isinstance(content, list):
+                for block in content:
+                    append_text(block)
+
+        response_input = parsed.get("input")
+        if isinstance(response_input, str):
+            append_text(response_input)
+        elif isinstance(response_input, (dict, list)):
+            items = response_input if isinstance(response_input, list) else [response_input]
+            for item in items:
+                if isinstance(item, dict) and item.get("role") == "user":
+                    append_text(item.get("content"))
+
+        messages = parsed.get("messages")
+        if isinstance(messages, dict):
+            messages = [messages]
+        if isinstance(messages, list):
+            for item in messages:
+                if isinstance(item, dict) and item.get("role") == "user":
+                    append_text(item.get("content"))
+        return " ".join(parts)
+
+    @staticmethod
+    def tool_names(parsed: object) -> set[str]:
+        """Read advertised tool names across Messages, Responses and Chat APIs."""
+        if not isinstance(parsed, dict):
+            return set()
+        names = set()
+        for tool in parsed.get("tools") or []:
+            if isinstance(tool, dict):
+                schema = tool.get("function", tool)
+                name = schema.get("name") if isinstance(schema, dict) else None
+                if isinstance(name, str):
+                    names.add(name)
+        return names
+
+    def resolve_queue_for_request(self, parsed: object) -> _ResponseQueue:
+        """Pick the queue for a request: content-routed queues first, then model/default.
+
+        A queue with a ``match`` token wins if that token appears in the
+        request's user input — this is how a test claims its own queue by
+        the unique message it sends. Otherwise falls back to the existing
+        ``model`` / ``"default"`` routing, so tests that don't opt in are
+        unaffected.
+
+        When several match-queues are live at once (e.g. a sub-agent test
+        with distinct parent/worker queues), the longest matching token
+        wins. Equal-length matches use the rightmost token, which selects
+        the newest turn when a native client resends its full conversation.
+
+        :param parsed: The parsed request body.
+        :returns: The selected response queue.
+        """
+        user_text = self._user_input_text(parsed)
+        tool_names = self.tool_names(parsed)
+        if user_text:
+            best: _ResponseQueue | None = None
+            best_score = (-1, -1)
+            for queue in self.queues.values():
+                if not queue.match or not queue.accepts_tools(tool_names):
+                    continue
+                position = user_text.rfind(queue.match)
+                score = (len(queue.match), position)
+                if position >= 0 and score > best_score:
+                    best = queue
+                    best_score = score
+            if best is not None:
+                return best
+        model = parsed.get("model") if isinstance(parsed, dict) else None
+        queue = self.resolve_queue(model)
+        # Model/default lookup must respect both explicit and inferred guards.
+        if not queue.accepts_tools(tool_names):
+            return _ResponseQueue()
+        return queue
+
+    def reset(self, *, record_evidence: bool = True) -> None:
+        """Clear all state (queues, captured requests, gates).
+
+        Queues that have a fallback response set (via ``POST /mock/set_fallback``)
+        are not deleted — their regular responses are cleared but the fallback
+        is preserved so session-level callers (e.g. the policy-classifier LLM)
+        continue to receive a valid response after per-test resets.
+
+        Atomically swaps the pending-gates list before releasing
+        so a handler that appends between the loop and the clear
+        doesn't lose its gate.
+        """
+        old_gates = self.pending_gates
+        self.pending_gates = []
+        for qr in old_gates:
+            qr._gate.set()
+        # Preserve queues that have a non-resettable fallback; delete others.
+        for key in list(self.queues):
+            queue = self.queues[key]
+            if queue.fallback is not None:
+                queue.reset()  # clear responses/index, keep fallback
+            else:
+                del self.queues[key]
+        if record_evidence:
+            _record_evidence("reset", accepted_at_ns=_time_mod.time_ns())
+        self.captured_requests.clear()
+        self.request_count = 0
+        self.served_models = []
+
+
+_state = MockState()
+
+
+# ── Endpoints ────────────────────────────────────────────
+
+
+@app.post("/v1/responses", response_model=None)
+async def create_response(
+    request: Request,
+) -> StreamingResponse | JSONResponse:
+    """
+    Accept an LLM request, optionally block on gate, then return SSE.
+
+    Routes to the keyed queue matching the request's ``model`` field.
+    Falls back to the ``"default"`` queue when no key matches.
+    """
+    body = await request.body()
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        parsed = {"raw": body.decode(errors="replace")}
+
+    async with _state._lock:
+        accepted_at_ns = _time_mod.time_ns()
+        _state.request_count += 1
+        _state.captured_requests.append(parsed)
+        queue = _state.resolve_queue_for_request(parsed)
+        qr = queue.next()
+
+    await _record_evidence_async("request", parsed, accepted_at_ns)
+
+    # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
+    if qr.delay:
+        await asyncio.sleep(qr.delay)
+
+    # Error response
+    if qr.error is not None:
+        return JSONResponse(
+            status_code=qr.status_code,
+            content={"error": {"message": qr.error, "type": "mock_error"}},
+        )
+
+    # Block on gate if configured
+    if qr.block:
+        qr._pending.set()
+        _state.pending_gates.append(qr)
+        await qr._gate.wait()
+
+    # When the request does not include ``stream: true``, return a plain
+    # JSON body (non-streaming Responses API format).  This supports callers
+    # like the cost-advisor judge that call ``responses.create`` without
+    # streaming and use ``_send_request`` which calls ``resp.json()``.
+    # Tool-call responses and native-item responses are streaming-only; fall
+    # through to SSE for those.
+    is_streaming = isinstance(parsed, dict) and parsed.get("stream")
+    if not is_streaming and not qr.tool_calls and not qr.native_items:
+        model_name = (
+            parsed.get("model", "mock-model") if isinstance(parsed, dict) else "mock-model"
+        )
+        return JSONResponse(
+            content=json_text_response(qr.text or "", model=model_name, usage=qr.usage)
+        )
+
+    # Build SSE body
+    if qr.tool_calls:
+        sse_body = sse_tool_call_response(qr.tool_calls, usage=qr.usage)
+    elif qr.stream:
+        sse_body = sse_streaming_text(qr.text, usage=qr.usage)
+    elif qr.native_items:
+        sse_body = sse_text_with_native_items(qr.text, qr.native_items, usage=qr.usage)
+    else:
+        sse_body = sse_text_response(qr.text, usage=qr.usage)
+
+    # Mid-stream fault: emit only a prefix and end, dropping the completion.
+    if qr.truncate_after is not None:
+        sse_body = truncate_sse(sse_body, qr.truncate_after)
+
+    async def _generate() -> AsyncIterator[str]:
+        yield sse_body
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+    )
+
+
+@app.post("/v1/messages", response_model=None)
+async def create_message(
+    request: Request,
+) -> StreamingResponse | JSONResponse:
+    """Anthropic Messages API endpoint for claude-sdk harness.
+
+    Uses the same keyed queues as ``/v1/responses`` and honors ``stream``.
+    Native Claude's model validation requests a nonstream JSON message.
+    """
+    body = await request.body()
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        parsed = {"raw": body.decode(errors="replace")}
+
+    async with _state._lock:
+        accepted_at_ns = _time_mod.time_ns()
+        _state.request_count += 1
+        _state.captured_requests.append(parsed)
+        queue = _state.resolve_queue_for_request(parsed)
+        qr = queue.next()
+
+    await _record_evidence_async("request", parsed, accepted_at_ns)
+
+    # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
+    if qr.delay:
+        await asyncio.sleep(qr.delay)
+
+    if qr.error is not None:
+        return JSONResponse(
+            status_code=qr.status_code,
+            content={
+                "type": "error",
+                "error": {"type": "mock_error", "message": qr.error},
+            },
+        )
+
+    if qr.block:
+        qr._pending.set()
+        _state.pending_gates.append(qr)
+        await qr._gate.wait()
+
+    req_model = parsed.get("model") if isinstance(parsed, dict) else None
+    echo_model = req_model if isinstance(req_model, str) and req_model else "mock-model"
+    if isinstance(parsed, dict) and not parsed.get("stream", False):
+        content: list[dict] = []
+        stop_reason = "end_turn"
+        extra: dict = {}
+        output_tokens = max(5, len(qr.text.split()) + len((qr.thinking or "").split()))
+        if qr.refusal_category is not None:
+            content.append({"type": "text", "text": "I can't help with that."})
+            stop_reason = "refusal"
+            extra["stop_details"] = {"type": "refusal", "category": qr.refusal_category}
+            output_tokens = 5
+        elif qr.tool_calls:
+            content.extend(
+                {
+                    "type": "tool_use",
+                    "id": call.get("call_id", f"toolu_{_uuid_mod.uuid4().hex[:12]}"),
+                    "name": call["name"],
+                    "input": json.loads(call.get("arguments", "{}")),
+                }
+                for call in qr.tool_calls
+            )
+            stop_reason = "tool_use"
+            output_tokens = 5
+        else:
+            if qr.thinking:
+                content.append(
+                    {"type": "thinking", "thinking": qr.thinking, "signature": "mock-signature"}
+                )
+            content.append({"type": "text", "text": qr.text})
+        return JSONResponse(
+            {
+                "id": f"msg_{_uuid_mod.uuid4().hex[:12]}",
+                "type": "message",
+                "role": "assistant",
+                "content": content,
+                "model": echo_model,
+                "stop_reason": stop_reason,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, **(qr.usage or {}), "output_tokens": output_tokens},
+                **extra,
+            }
+        )
+    if qr.refusal_category is not None:
+        sse_body = anthropic_sse_refusal_response(model=echo_model, category=qr.refusal_category)
+    elif qr.tool_calls:
+        sse_body = anthropic_sse_tool_call_response(qr.tool_calls, model=echo_model)
+    elif qr.thinking:
+        sse_body = anthropic_sse_thinking_text_response(
+            qr.thinking, qr.text, model=echo_model, usage=qr.usage
+        )
+    else:
+        sse_body = anthropic_sse_text_response(qr.text, model=echo_model, usage=qr.usage)
+
+    # Mid-stream fault: emit only a prefix and end, dropping message_stop.
+    if qr.truncate_after is not None:
+        sse_body = truncate_sse(sse_body, qr.truncate_after)
+
+    chunk_delay = qr.chunk_delay
+
+    async def _generate() -> AsyncIterator[str]:
+        if chunk_delay > 0:
+            # Pace the stream one SSE event at a time so live surfaces
+            # render intermediate deltas instead of one instant repaint.
+            for event in sse_body.split("\n\n"):
+                if not event:
+                    continue
+                yield event + "\n\n"
+                await asyncio.sleep(chunk_delay)
+        else:
+            yield sse_body
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+    )
+
+
+@app.post("/v1/chat/completions", response_model=None)
+async def create_chat_completion(
+    request: Request,
+) -> StreamingResponse | JSONResponse:
+    """OpenAI Chat Completions API endpoint (for pi and legacy harnesses).
+
+    Returns a non-streaming JSON response in Chat Completions format,
+    routing through the same keyed queue as /v1/responses.
+    """
+    body = await request.body()
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        parsed = {"raw": body.decode(errors="replace")}
+
+    async with _state._lock:
+        accepted_at_ns = _time_mod.time_ns()
+        _state.request_count += 1
+        _state.captured_requests.append(parsed)
+        model = parsed.get("model") if isinstance(parsed, dict) else None
+        queue = _state.resolve_queue_for_request(parsed)
+        qr = queue.next()
+
+    await _record_evidence_async("request", parsed, accepted_at_ns)
+
+    # Fixed wall-clock pause the mock owns (see QueuedResponse.delay).
+    if qr.delay:
+        await asyncio.sleep(qr.delay)
+
+    if qr.error is not None:
+        return JSONResponse(
+            status_code=qr.status_code,
+            content={"error": {"message": qr.error, "type": "mock_error"}},
+        )
+
+    if qr.block:
+        qr._pending.set()
+        _state.pending_gates.append(qr)
+        await qr._gate.wait()
+
+    text = qr.text if not qr.tool_calls else ""
+    # Render queued tool_calls in Chat Completions format (harnesses on the
+    # openai-completions wire — e.g. pi's gateway models.json — POST here, not
+    # /v1/responses). Without this, a tool_call response collapsed to empty
+    # content and the tool round-trip silently produced nothing.
+    cc_tool_calls = (
+        [
+            {
+                "id": tc.get("call_id", "call-mock"),
+                "type": "function",
+                "function": {
+                    "name": tc.get("name", ""),
+                    "arguments": tc.get("arguments", "{}"),
+                },
+            }
+            for tc in qr.tool_calls
+        ]
+        if qr.tool_calls
+        else None
+    )
+    finish_reason = "tool_calls" if cc_tool_calls else "stop"
+    cc_message: dict[str, object] = {"role": "assistant", "content": text or None}
+    if cc_tool_calls:
+        cc_message["tool_calls"] = cc_tool_calls
+    resp_id = _response_id()
+    cc_usage: dict[str, object] = qr.usage or {
+        "prompt_tokens": 10,
+        "completion_tokens": max(5, len(text.split())),
+        "total_tokens": 15,
+    }
+    body_json = {
+        "id": f"chatcmpl-{resp_id}",
+        "object": "chat.completion",
+        "model": model or "mock-model",
+        "choices": [
+            {
+                "index": 0,
+                "message": cc_message,
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": cc_usage,
+    }
+    if parsed.get("stream"):
+        delta: dict[str, object] = {"role": "assistant", "content": text or None}
+        if cc_tool_calls:
+            delta["tool_calls"] = [{"index": i, **tc} for i, tc in enumerate(cc_tool_calls)]
+        chunk = {
+            "id": f"chatcmpl-{resp_id}",
+            "object": "chat.completion.chunk",
+            "model": model or "mock-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }
+            ],
+        }
+
+        events: list[dict[str, object]] = [chunk]
+        # OpenAI stream-usage semantics: when the client requests
+        # ``stream_options.include_usage``, a final chunk with empty
+        # ``choices`` carries the ``usage`` object right before ``[DONE]``.
+        # Harnesses on this wire read their per-turn token
+        # accounting from exactly this chunk.
+        stream_options = parsed.get("stream_options") if isinstance(parsed, dict) else None
+        if isinstance(stream_options, dict) and stream_options.get("include_usage"):
+            events.append(
+                {
+                    "id": f"chatcmpl-{resp_id}",
+                    "object": "chat.completion.chunk",
+                    "model": model or "mock-model",
+                    "choices": [],
+                    "usage": cc_usage,
+                }
+            )
+        stream_body = "".join(f"data: {json.dumps(e)}\n\n" for e in events) + "data: [DONE]\n\n"
+        # Mid-stream fault: drop the trailing ``[DONE]`` (and, at 0, the chunk
+        # too) so the client sees the stream end without a terminator.
+        if qr.truncate_after is not None:
+            stream_body = truncate_sse(stream_body, qr.truncate_after)
+
+        async def _stream() -> AsyncIterator[str]:
+            yield stream_body
+
+        return StreamingResponse(_stream(), media_type="text/event-stream")
+    return JSONResponse(content=body_json)
+
+
+@app.get("/v1/models")
+async def list_models() -> dict:
+    """List the models the mock gateway serves.
+
+    Empty unless a test sets them via ``POST /mock/served_models`` — the
+    claude-sdk executor reads this to pin Claude Code's family aliases to the
+    ids the gateway actually serves.
+    """
+    return {"object": "list", "data": [{"id": m, "object": "model"} for m in _state.served_models]}
+
+
+@app.post("/mock/served_models")
+async def set_served_models(request: Request) -> dict[str, object]:
+    """Set the model ids ``GET /v1/models`` reports (cleared by ``/mock/reset``).
+
+    Body::
+
+        {"models": ["gw-claude-fable-5", "gw-claude-opus-4-8"]}
+    """
+    body = await request.json()
+    models = body.get("models", [])
+    async with _state._lock:
+        _state.served_models = [m for m in models if isinstance(m, str) and m]
+    return {"configured": True, "count": len(_state.served_models)}
+
+
+@app.post("/mock/configure")
+async def configure(request: Request) -> dict[str, object]:
+    """
+    Load a keyed response sequence.
+
+    Body::
+
+        {
+            "key": "mock-model",          // optional, default "default"
+            "match": "mangosteen-tr",     // optional content-routing token
+            "responses": [{"text": "..."}, ...]
+        }
+
+    When ``match`` is set, a request is served from this queue if the
+    token appears in the request's ``role="user"`` input text, regardless
+    of the request's ``model`` — so a test can claim its own queue by the
+    unique message it sends (per-test isolation against cross-test
+    contamination). Omitting ``match`` keeps the default model/"default"
+    routing.
+
+    Without a key, distinct content selectors and their tool guards get
+    independent queues. Reconfiguring the same selector replaces its queue.
+    Without a content match, configuration still targets the default queue;
+    required_tools then guards consumption without changing model routing.
+    Explicit keys replace the named queue, including ``"default"``.
+    ``required_tools`` restricts consumption to requests advertising all listed
+    tool names, isolating turns from title-generation/background requests.
+    The guard covers the entire queue, including its configured fallback.
+    If the model/default queue fails the guard, return the generic
+    "Mock LLM response" without consuming that queue.
+
+    When ``required_tools`` is omitted, the next ``tool_calls`` response requires
+    a request with at least one advertised tool, so a no-tools title request
+    cannot consume it. Names need not match: negative tests can still call an
+    excluded tool. This does not guard text entries or the fallback. Set
+    ``required_tools: []`` to also permit calls on requests with no tools.
+    A nonempty explicit guard still takes precedence over inference.
+
+    Multiple calls with different keys accumulate queues; use
+    ``POST /mock/reset`` to clear all keys.
+    """
+    body = await request.json()
+    match = body.get("match")
+    required_tools = body.get("required_tools", [])
+    if not isinstance(required_tools, list) or any(
+        not isinstance(name, str) or not name for name in required_tools
+    ):
+        raise HTTPException(400, "required_tools must be a list of nonempty tool names")
+    if match is not None and (not isinstance(match, str) or not match):
+        raise HTTPException(400, "match must be a nonempty string")
+    # Only implicit content queues get independent identities. Explicit keys
+    # retain replacement semantics, including an explicit key="default".
+    guard = frozenset(required_tools) if "required_tools" in body else None
+    route = json.dumps([match, sorted(guard) if guard is not None else None]).encode()
+    implicit_key = f"content-{hashlib.sha256(route).hexdigest()[:24]}" if match else _DEFAULT_KEY
+    key = body.get("key", implicit_key)
+    async with _state._lock:
+        queue = _state.get_queue(key)
+        queue.reset()
+        queue.match = match
+        queue.required_tools = guard
+        for entry in body.get("responses", []):
+            queue.responses.append(
+                QueuedResponse(
+                    text=entry.get("text", "Mock LLM response"),
+                    tool_calls=entry.get("tool_calls"),
+                    native_items=entry.get("native_items"),
+                    block=entry.get("block", False),
+                    stream=entry.get("stream", False),
+                    error=entry.get("error"),
+                    status_code=entry.get("status_code", 500),
+                    delay=entry.get("delay", 0.0),
+                    truncate_after=entry.get("truncate_after"),
+                    usage=entry.get("usage"),
+                    refusal_category=entry.get("refusal_category"),
+                    thinking=entry.get("thinking"),
+                    chunk_delay=entry.get("chunk_delay", 0.0),
+                )
+            )
+        count = len(queue.responses)
+    return {"configured": True, "key": key, "count": count}
+
+
+@app.post("/mock/set_fallback")
+async def set_fallback(request: Request) -> dict[str, object]:
+    """Set a non-resettable fallback response for a queue key.
+
+    The fallback is returned when the regular queue for *key* is
+    exhausted.  Unlike regular entries (configured via
+    ``POST /mock/configure``), the fallback survives
+    ``POST /mock/reset`` — it persists for the lifetime of the server
+    process.  Use this for session-level queues that must return a
+    valid response even when per-test resets clear the regular queue
+    (e.g. the server-level policy-classifier LLM queue).
+
+    Body: ``{"key": "<key>", "text": "<response-text>", "stream": false}``
+
+    ``stream`` (optional, default false): when true the fallback emits
+    ``response.output_text.delta`` events (one per word) before the completed
+    event — so a caller that subscribes to a streaming response sees
+    incremental deltas from the fallback, not just a single completed body.
+    """
+    body = await request.json()
+    key = body.get("key", _DEFAULT_KEY)
+    text = body.get("text", "Mock LLM response")
+    stream = bool(body.get("stream", False))
+    async with _state._lock:
+        queue = _state.get_queue(key)
+        queue.fallback = QueuedResponse(text=text, stream=stream)
+    return {"fallback_set": True, "key": key}
+
+
+@app.post("/mock/reset")
+async def reset() -> dict[str, bool]:
+    """Clear all regular queues, captured requests, and gates.
+
+    Fallbacks set via ``POST /mock/set_fallback`` are preserved.
+    """
+    async with _state._lock:
+        accepted_at_ns = _time_mod.time_ns()
+        _state.reset(record_evidence=False)
+    await _record_evidence_async("reset", accepted_at_ns=accepted_at_ns)
+    return {"reset": True}
+
+
+@app.get("/mock/requests")
+async def get_requests(key: str | None = None) -> dict[str, list]:
+    """Return captured request bodies, optionally filtered by model.
+
+    :param key: When set, only return requests whose ``model`` field
+        matches this key.
+    """
+    if key is None:
+        return {"requests": _state.captured_requests}
+    filtered = [
+        r for r in _state.captured_requests if isinstance(r, dict) and r.get("model") == key
+    ]
+    return {"requests": filtered}
+
+
+@app.get("/gate/pending")
+async def gate_pending() -> dict[str, bool]:
+    """Check if any request is waiting on a gate."""
+    pending = any(qr._pending.is_set() and not qr._gate.is_set() for qr in _state.pending_gates)
+    return {"pending": pending}
+
+
+@app.post("/gate/release")
+async def gate_release() -> dict[str, bool]:
+    """Release the oldest pending gate."""
+    for qr in _state.pending_gates:
+        if qr._pending.is_set() and not qr._gate.is_set():
+            qr._gate.set()
+            return {"released": True}
+    return {"released": False}
+
+
+@app.get("/stats")
+async def stats() -> dict[str, int]:
+    """Return the total number of LLM requests received."""
+    return {"request_count": _state.request_count}
+
+
+if __name__ == "__main__":
+    port = int(sys.argv[1])
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=port,
+        log_level="warning",
+    )

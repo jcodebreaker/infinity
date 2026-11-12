@@ -1,0 +1,24 @@
+# Build context for deployment/host.Dockerfile (the repo root). Everything is excluded, then
+# only what the Dockerfile COPYs is let back in.
+*
+
+# venv stage
+!engine/pyproject.toml
+!engine/setup.py
+!engine/LICENSE
+!engine/NOTICE
+!engine/sdks/python-client/
+!engine/omnigent/
+
+# host stage
+!host/bin/
+!host/share/
+
+# Local build output and caches inside the folders above.
+**/node_modules
+**/__pycache__
+**/*.pyc
+**/.venv
+engine/omnigent/server/static/web-ui
+host/share/**/*.test.ts
+host/share/**/fixtures

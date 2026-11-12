@@ -1,0 +1,11 @@
+/* Design derived from nexu-io/open-design design-templates/html-ppt/assets/themes/editorial-serif.css@802708f (https://github.com/lewislulu/html-ppt-skill),
+   MIT, Copyright (c) 2026 lewis <sudolewis@gmail.com>; the license is kept in ../LICENSE. Changes: palette, type and motifs
+   kept; rewritten for Superchat's fixed 1920x1080 canvas (px units, no vw/vh or clamp()), expressed as
+   tokens (tokens.css) plus the three surface classes of the shared layouts (../../layouts.css);
+   web fonts replaced by static Latin-subset TTFs embedded at assembly (../../fonts, SIL OFL 1.1,
+   license texts alongside); gradients and shadows dropped (they cannot become PowerPoint shapes). */
+/* Editorial Serif: t-a = cream, t-b = espresso, t-c = warm beige. */
+.slide.t-a { background: #faf7f2; color: #1b1410; }
+.slide.t-b { background: #1b1410; color: #faf7f2; --fg: #faf7f2; --muted: #cdc1b2; --accent: #e8a27c; --surface: #2a201a; --line: #4a3b30; }
+.slide.t-c { background: #f1ebe0; color: #1b1410; --fg: #1b1410; --muted: #5c4a3e; --accent: #8a2a1c; --surface: #faf7f2; --line: #ddd2c4; }
+.l-cover .title, .l-section .title, .l-closing .title, .l-statement .statement, .l-quote .quote { font-style: italic; }

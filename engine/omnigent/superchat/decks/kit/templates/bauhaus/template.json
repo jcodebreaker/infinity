@@ -1,0 +1,35 @@
+{
+  "id": "bauhaus",
+  "name": "Bauhaus",
+  "tagline": "Primary and graphic",
+  "description": "Primary red, yellow and blue on warm paper with heavy black outlines.",
+  "best_for": "design talks, creative briefs, art-history and product-craft topics",
+  "category": "bold",
+  "mode": "light",
+  "upstream": "https://github.com/lewislulu/html-ppt-skill",
+  "source": "nexu-io/open-design design-templates/html-ppt/assets/themes/bauhaus.css@802708f",
+  "license": "MIT (see LICENSE); fonts SIL OFL 1.1 (see ../../fonts/OFL-*.txt)",
+  "fonts": [
+    {
+      "family": "Space Grotesk",
+      "weight": 500,
+      "style": "normal",
+      "file": "SpaceGrotesk-500.ttf",
+      "license": "OFL-spacegrotesk.txt"
+    },
+    {
+      "family": "Space Grotesk",
+      "weight": 700,
+      "style": "normal",
+      "file": "SpaceGrotesk-700.ttf",
+      "license": "OFL-spacegrotesk.txt"
+    },
+    {
+      "family": "Archivo Black",
+      "weight": 400,
+      "style": "normal",
+      "file": "ArchivoBlack-400.ttf",
+      "license": "OFL-archivoblack.txt"
+    }
+  ]
+}

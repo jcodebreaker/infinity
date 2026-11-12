@@ -1,0 +1,117 @@
+"""Tests for llms.routing — model string parsing and harness inference."""
+
+import pytest
+
+from omnigent.errors import OmnigentError
+from omnigent.llms.routing import RoutedModel, infer_harness_from_model, parse_model_string
+
+
+@pytest.mark.parametrize(
+    ("model_string", "expected"),
+    [
+        (
+            "anthropic/claude-sonnet-4-20250514",
+            RoutedModel(provider="anthropic", model="claude-sonnet-4-20250514"),
+        ),
+        (
+            "openai/gpt-5.4",
+            RoutedModel(provider="openai", model="gpt-5.4"),
+        ),
+        (
+            "groq/llama-3.1-70b",
+            RoutedModel(provider="groq", model="llama-3.1-70b"),
+        ),
+        (
+            "deepseek/deepseek-chat",
+            RoutedModel(provider="deepseek", model="deepseek-chat"),
+        ),
+        (
+            "xai/grok-2",
+            RoutedModel(provider="xai", model="grok-2"),
+        ),
+        (
+            "openrouter/meta-llama/llama-3.1-70b",
+            RoutedModel(
+                provider="openrouter",
+                model="meta-llama/llama-3.1-70b",
+            ),
+        ),
+        (
+            "ollama/llama3",
+            RoutedModel(provider="ollama", model="llama3"),
+        ),
+        (
+            "moonshot/kimi-k2-instruct",
+            RoutedModel(provider="moonshot", model="kimi-k2-instruct"),
+        ),
+    ],
+)
+def test_parse_with_provider_prefix(
+    model_string: str,
+    expected: RoutedModel,
+) -> None:
+    assert parse_model_string(model_string) == expected
+
+
+@pytest.mark.parametrize(
+    "bare_model",
+    [
+        "gpt-5.4",
+        # Non-gpt bare ids also default to "openai" — parse_model_string is
+        # the generic-client routing primitive (omnigent/llms/client.py); its
+        # bare→openai default preserves the OpenAI-compatible adapter path
+        # for specs that pin a plain model id against a custom base_url
+        # (LiteLLM / OpenRouter / local-gateway style).
+        "claude-opus-4-8",
+        "gemini-2.5-flash",
+        "grok-2",
+        "deepseek-chat",
+        "databricks-gpt-5-4",
+    ],
+)
+def test_parse_without_prefix_defaults_to_openai(bare_model: str) -> None:
+    """Bare model ids (no ``/``) always resolve to the openai provider."""
+    result = parse_model_string(bare_model)
+    assert result == RoutedModel(provider="openai", model=bare_model)
+
+
+def test_unknown_provider_raises() -> None:
+    with pytest.raises(OmnigentError, match="Unknown provider 'foobar'"):
+        parse_model_string("foobar/some-model")
+
+
+# ── infer_harness_from_model ─────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_harness"),
+    [
+        # Databricks-hosted Claude → claude-sdk harness; these are the
+        # models that triggered the original routing bug (Responses API
+        # passthrough 400s for Claude).
+        # Anthropic-prefixed models also need claude-sdk.
+        ("anthropic/claude-sonnet-4-20250514", "claude-sdk"),
+        # Every non-Claude model — no prefix match — returns empty string
+        # so the downstream validator can surface a "harness required" error.
+        ("databricks-gpt-5-4", ""),
+        ("openai/gpt-5.4", ""),
+        ("gpt-5.4", ""),
+        ("xai/grok-4", ""),
+        ("llama3-groq", ""),
+        ("unknown-model-xyz", ""),
+    ],
+)
+def test_infer_harness_from_model(model: str, expected_harness: str) -> None:
+    """
+    :func:`infer_harness_from_model` maps known model prefixes to their
+    harness names and returns ``""`` for unrecognised models.
+
+    A failure here means the prefix table has drifted — either a new
+    model family was added without updating the table, or an existing
+    prefix was renamed.
+    """
+    assert infer_harness_from_model(model) == expected_harness, (
+        f"Model {model!r}: expected harness {expected_harness!r}, "
+        f"got {infer_harness_from_model(model)!r}. "
+        "Check _HARNESS_FOR_MODEL_PREFIX in omnigent/llms/routing.py."
+    )

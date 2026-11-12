@@ -1,0 +1,99 @@
+/* Superchat deck layout vocabulary (original). One fixed 1920x1080 canvas; every size is in px.
+   Safe area: 128px left/right, 104px top, 168px bottom (the footer rail, pinned, lives in the
+   bottom band: nothing else may enter it). Layouts are flex/grid flow so content can never be
+   positioned off its box: that is what keeps the PowerPoint export exact. */
+.slide {
+  font-family: var(--font-body);
+  color: var(--fg);
+  background: var(--bg);
+  padding: 104px 128px 168px;
+  font-size: 32px;
+  line-height: 1.4;
+}
+.slide .foot {
+  position: absolute; left: 128px; right: 128px; bottom: 64px; height: 32px;
+  display: flex; align-items: center; justify-content: space-between;
+  font: 500 22px/1 var(--font-mono); letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--muted);
+}
+.kicker { font: 500 24px/1.2 var(--font-mono); letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); }
+.title {
+  font-family: var(--font-display); font-weight: var(--display-weight);
+  font-size: 88px; line-height: 1.06; letter-spacing: var(--display-tracking);
+  max-width: 1560px; margin-top: 28px;
+}
+.lead { font-size: 38px; line-height: 1.4; color: var(--muted); max-width: 1200px; margin-top: 36px; }
+.rule { height: 4px; width: 96px; background: var(--accent); margin-top: 40px; }
+
+/* cover: a headline, one line under it, a meta line */
+.l-cover { justify-content: center; }
+.l-cover .title { font-size: 148px; line-height: 1.02; max-width: 1580px; }
+.l-cover .lead { margin-top: 44px; }
+.l-cover .meta { margin-top: 64px; font: 500 24px/1.2 var(--font-mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+
+/* section: a big number and a section name */
+.l-section { justify-content: center; }
+.l-section .num { font-family: var(--font-display); font-weight: var(--display-weight); font-size: 320px; line-height: 0.9; color: var(--accent); }
+.l-section .title { font-size: 104px; margin-top: 24px; }
+
+/* statement: one sentence, set large */
+.l-statement { justify-content: center; }
+.l-statement .statement {
+  font-family: var(--font-display); font-weight: var(--display-weight);
+  font-size: 112px; line-height: 1.08; letter-spacing: var(--display-tracking); max-width: 1560px; margin-top: 32px;
+}
+
+/* points: a title and three cards */
+.l-points .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 48px; margin-top: 72px; }
+.point { background: var(--surface); border: 2px solid var(--line); border-radius: var(--radius); padding: 44px 40px 48px; }
+.point .num { font: 500 24px/1 var(--font-mono); letter-spacing: 0.1em; color: var(--accent); }
+.point h3 { font-family: var(--font-display); font-weight: var(--display-weight); font-size: 48px; line-height: 1.12; margin-top: 28px; }
+.point p { font-size: 30px; line-height: 1.45; color: var(--muted); margin-top: 20px; }
+
+/* split: a title, then two columns */
+.l-split .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 96px; margin-top: 72px; align-items: start; }
+.col h3 { font-family: var(--font-display); font-weight: var(--display-weight); font-size: 52px; line-height: 1.1; }
+.col p { font-size: 32px; line-height: 1.5; color: var(--muted); margin-top: 24px; }
+.col .panel { background: var(--surface); border: 2px solid var(--line); border-radius: var(--radius); padding: 44px 48px; }
+.col .panel p { margin-top: 0; color: var(--fg); }
+.col .panel p + p { margin-top: 20px; }
+
+/* stats: a title and up to three figures that come from the person's data */
+.l-stats .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 48px; margin-top: 80px; }
+/* the rule is a filled box, not border-top: PowerPoint gets a single-side border as a picture */
+.stat::before { content: ""; display: block; height: 4px; background: var(--accent); margin-bottom: 36px; }
+.stat .value { font-family: var(--font-display); font-weight: var(--display-weight); font-size: 176px; line-height: 0.95; letter-spacing: var(--display-tracking); }
+.stat .label { font-size: 32px; line-height: 1.35; color: var(--muted); margin-top: 24px; max-width: 460px; }
+
+/* quote: one quotation and who said it */
+.l-quote { justify-content: center; }
+.l-quote .quote {
+  font-family: var(--font-display); font-weight: var(--display-weight); font-size: 80px; line-height: 1.16;
+  letter-spacing: var(--display-tracking); max-width: 1500px; margin-top: 36px;
+}
+.l-quote .by { margin-top: 48px; font: 500 26px/1.3 var(--font-mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+
+/* closing: the ask or the next step */
+.l-closing { justify-content: center; }
+.l-closing .title { font-size: 128px; line-height: 1.04; }
+.l-closing .contact { margin-top: 56px; font: 500 28px/1.4 var(--font-mono); letter-spacing: 0.08em; color: var(--muted); }
+
+/* chart: a title, one Chart.js chart in a fixed-height box (an unsized box lets Chart.js grow without
+   end), and a caption naming the data source. --text-2 and --border are the names Open Design's chart
+   templates read; they follow the slide's own tokens. */
+.slide { --text-2: var(--muted); --border: var(--line); }
+.l-chart .chart { position: relative; height: 520px; margin-top: 48px; }
+.l-chart .chart canvas { display: block; }
+.l-chart .source { margin-top: 24px; font: 500 22px/1.3 var(--font-mono); color: var(--muted); }
+.l-chart .cols-chart { display: grid; grid-template-columns: 1.5fr 1fr; gap: 64px; margin-top: 48px; align-items: center; }
+.l-chart .cols-chart .chart { margin-top: 0; height: 480px; }
+.l-chart .panel { background: var(--surface); border: 2px solid var(--line); border-radius: var(--radius); padding: 44px 48px; }
+.l-chart .panel h3 { font-family: var(--font-display); font-weight: var(--display-weight); font-size: 44px; line-height: 1.1; }
+.l-chart .panel p { font-size: 30px; line-height: 1.45; color: var(--muted); margin-top: 20px; }
+
+/* table: a title and one small table (up to 6 rows, 5 columns). Every cell has the same full
+   border: a single-side border would reach PowerPoint as a picture. */
+.l-table table { width: 100%; margin-top: 64px; border-collapse: collapse; font-size: 32px; line-height: 1.3; }
+.l-table th, .l-table td { padding: 26px 32px; border: 2px solid var(--line); text-align: left; }
+.l-table th { background: var(--surface); font: 500 24px/1.2 var(--font-mono); letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+.l-table td:first-child { font-family: var(--font-display); font-weight: var(--display-weight); }

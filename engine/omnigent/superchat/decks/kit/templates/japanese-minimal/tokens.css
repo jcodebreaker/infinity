@@ -1,0 +1,18 @@
+      --bg: #fafaf5;
+      --fg: #1a1a18;
+      --muted: #5c564c;
+      --accent: #c62f20;
+      --surface: #ffffff;
+      --shell: #08090d;
+      --line: #ddd9cb;
+      --radius: 0px;
+      --font-display: "Newsreader", Georgia, "Times New Roman", serif;
+      --font-body: "Inter", "Helvetica Neue", Arial, sans-serif;
+      --font-mono: "Inter", "Helvetica Neue", Arial, sans-serif;
+      --display-weight: 600;
+      --display-tracking: 0.02em;
+      --accent-2: #1a1a18;
+      --accent-3: #a98a3d;
+      --good: #4a6b3e;
+      --warn: #8a6d20;
+      --font-serif: var(--font-display);

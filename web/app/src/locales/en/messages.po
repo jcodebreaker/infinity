@@ -1,0 +1,2482 @@
+msgid ""
+msgstr ""
+"POT-Creation-Date: 2026-08-26 00:00+0000\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"X-Generator: @lingui/cli\n"
+"Language: en\n"
+"Project-Id-Version: superchat-web\n"
+"Report-Msgid-Bugs-To: \n"
+"PO-Revision-Date: \n"
+"Last-Translator: \n"
+"Language-Team: \n"
+"Plural-Forms: \n"
+
+#. placeholder {0}: applied.length
+#. placeholder {0}: status.changes
+msgid "{0, plural, one {# change} other {# changes}}"
+msgstr "{0, plural, one {# change} other {# changes}}"
+
+#. placeholder {0}: tally.commands
+msgid "{0, plural, one {# command} other {# commands}}"
+msgstr "{0, plural, one {# command} other {# commands}}"
+
+#. placeholder {0}: messages.length
+msgid "{0, plural, one {# failed attempt} other {# failed attempts}}"
+msgstr "{0, plural, one {# failed attempt} other {# failed attempts}}"
+
+#. placeholder {0}: tally.files
+#. placeholder {0}: view.files.length
+msgid "{0, plural, one {# file} other {# files}}"
+msgstr "{0, plural, one {# file} other {# files}}"
+
+#. placeholder {0}: stats.opensTotal
+msgid "{0, plural, one {# open} other {# opens}}"
+msgstr "{0, plural, one {# open} other {# opens}}"
+
+#. placeholder {0}: data.covered.length
+#. placeholder {0}: tally.other
+msgid "{0, plural, one {# step} other {# steps}}"
+msgstr "{0, plural, one {# step} other {# steps}}"
+
+#. placeholder {0}: stats.uniqueViewers
+msgid "{0, plural, one {# viewer} other {# viewers}}"
+msgstr "{0, plural, one {# viewer} other {# viewers}}"
+
+#. placeholder {0}: tally.looked
+msgid "{0, plural, one {looked at # file} other {looked at # files}}"
+msgstr "{0, plural, one {looked at # file} other {looked at # files}}"
+
+#. placeholder {0}: file.name
+msgid "{0} (max {ATTACHMENT_MAX_COUNT} attachments)"
+msgstr "{0} (max {ATTACHMENT_MAX_COUNT} attachments)"
+
+#. placeholder {0}: file.name
+msgid "{0} (over 10 MiB)"
+msgstr "{0} (over 10 MiB)"
+
+#. placeholder {0}: targets.length
+msgid "{0} elements"
+msgstr "{0} elements"
+
+#. placeholder {0}: automation.name
+msgid "{0} is on"
+msgstr "{0} is on"
+
+#. placeholder {0}: format(size / 1024)
+msgid "{0} KB"
+msgstr "{0} KB"
+
+#. placeholder {0}: format(size / (1024 * 1024))
+msgid "{0} MB"
+msgstr "{0} MB"
+
+msgid "{date} · {time}"
+msgstr "{date} · {time}"
+
+msgid "{days}d ago"
+msgstr "{days}d ago"
+
+msgid "{files, plural, one {# file} other {# files}}"
+msgstr "{files, plural, one {# file} other {# files}}"
+
+msgid "{hours}h ago"
+msgstr "{hours}h ago"
+
+#. placeholder {0}: shown?.version ?? version
+msgid "{kindLabel} · version {0}"
+msgstr "{kindLabel} · version {0}"
+
+msgid "{minutes}m ago"
+msgstr "{minutes}m ago"
+
+msgid "{more, plural, one {+# more} other {+# more}}"
+msgstr "{more, plural, one {+# more} other {+# more}}"
+
+msgid "{n} cells"
+msgstr "{n} cells"
+
+msgid "{n} elements"
+msgstr "{n} elements"
+
+#. js-lingui-explicit-id
+msgid "{name} failed"
+msgstr "{name} failed"
+
+#. js-lingui-explicit-id
+msgid "{name} finished"
+msgstr "{name} finished"
+
+#. js-lingui-explicit-id
+msgid "{name} stopped"
+msgstr "{name} stopped"
+
+msgid "{providerLabel} API key"
+msgstr "{providerLabel} API key"
+
+msgid "{size} B"
+msgstr "{size} B"
+
+msgid "{slides, plural, one {# slide} other {# slides}}"
+msgstr "{slides, plural, one {# slide} other {# slides}}"
+
+#. placeholder {0}: formatUsd(budget.monthlyLimitUsd, locale)
+msgid "{spent} of {0}"
+msgstr "{spent} of {0}"
+
+msgid "{topicCount, plural, one {# topic} other {# topics}}"
+msgstr "{topicCount, plural, one {# topic} other {# topics}}"
+
+msgid "{versionCount, plural, one {# version} other {# versions}}"
+msgstr "{versionCount, plural, one {# version} other {# versions}}"
+
+msgid "••••{hint} · Checked {checked}"
+msgstr "••••{hint} · Checked {checked}"
+
+msgid "••••{hint} · Needs attention"
+msgstr "••••{hint} · Needs attention"
+
+msgid "1 cell"
+msgstr "1 cell"
+
+msgid "A draft is ready for you"
+msgstr "A draft is ready for you"
+
+msgid "A file below changes"
+msgstr "A file below changes"
+
+#. placeholder {0}: row.version ?? ""
+msgid "A live update saved v{0} while you were editing"
+msgstr "A live update saved v{0} while you were editing"
+
+msgid "About you"
+msgstr "About you"
+
+msgid "Accepted"
+msgstr "Accepted"
+
+msgid "Account"
+msgstr "Account"
+
+msgid "Activity"
+msgstr "Activity"
+
+msgid "Add a file"
+msgstr "Add a file"
+
+msgid "Add a key in Settings to choose a model."
+msgstr "Add a key in Settings to choose a model."
+
+msgid "Add a key to choose a model."
+msgstr "Add a key to choose a model."
+
+msgid "Add key"
+msgstr "Add key"
+
+msgid "Add your API key"
+msgstr "Add your API key"
+
+msgid "Added to your Library"
+msgstr "Added to your Library"
+
+msgid "Address"
+msgstr "Address"
+
+msgid "After every update"
+msgstr "After every update"
+
+msgid "Align center"
+msgstr "Align center"
+
+msgid "Align left"
+msgstr "Align left"
+
+msgid "Align right"
+msgstr "Align right"
+
+msgid "All"
+msgstr "All"
+
+msgid "Allow once"
+msgstr "Allow once"
+
+msgid "Allowed"
+msgstr "Allowed"
+
+msgid "Allowed once"
+msgstr "Allowed once"
+
+msgid "Also open"
+msgstr "Also open"
+
+msgid "Always allow this tool"
+msgstr "Always allow this tool"
+
+msgid "Always allowed"
+msgstr "Always allowed"
+
+msgid "And every"
+msgstr "And every"
+
+msgid "Answer"
+msgstr "Answer"
+
+msgid "Answered"
+msgstr "Answered"
+
+msgid "Answered while the work continues"
+msgstr "Answered while the work continues"
+
+#. placeholder {0}: selectedAskActionLabel(answer, actions)
+msgid "Answered: {0}"
+msgstr "Answered: {0}"
+
+msgid "Answered: {answer}"
+msgstr "Answered: {answer}"
+
+msgid "Anyone signed in to your organization"
+msgstr "Anyone signed in to your organization"
+
+msgid "Anyone with the link"
+msgstr "Anyone with the link"
+
+msgid "API key"
+msgstr "API key"
+
+msgid "API keys"
+msgstr "API keys"
+
+msgid "App"
+msgstr "App"
+
+msgid "Appearance"
+msgstr "Appearance"
+
+msgid "Approvals"
+msgstr "Approvals"
+
+msgid "Apps, decks and documents I made for you."
+msgstr "Apps, decks and documents I made for you."
+
+msgid "Apps, decks, documents and files your Muse makes will appear here."
+msgstr "Apps, decks, documents and files your Muse makes will appear here."
+
+msgid "Ask me"
+msgstr "Ask me"
+
+msgid "Ask me anything, or tell me what you're working toward."
+msgstr "Ask me anything, or tell me what you're working toward."
+
+msgid "Ask superchat"
+msgstr "Ask superchat"
+
+msgid "Ask superchat instead"
+msgstr "Ask superchat instead"
+
+msgid "Ask superchat to change this app…"
+msgstr "Ask superchat to change this app…"
+
+msgid "Ask superchat to change this document…"
+msgstr "Ask superchat to change this document…"
+
+msgid "Ask superchat to change this file…"
+msgstr "Ask superchat to change this file…"
+
+msgid "Ask superchat to change this page…"
+msgstr "Ask superchat to change this page…"
+
+msgid "Ask superchat to change this sheet…"
+msgstr "Ask superchat to change this sheet…"
+
+msgid "Ask superchat to change this slide…"
+msgstr "Ask superchat to change this slide…"
+
+msgid "Ask superchat to change this…"
+msgstr "Ask superchat to change this…"
+
+msgid "Asked"
+msgstr "Asked"
+
+msgid "At"
+msgstr "At"
+
+msgid "At the limit"
+msgstr "At the limit"
+
+msgid "Attach"
+msgstr "Attach"
+
+msgid "Attach {name}"
+msgstr "Attach {name}"
+
+msgid "Attach a folder"
+msgstr "Attach a folder"
+
+msgid "Attach a folder from your machine"
+msgstr "Attach a folder from your machine"
+
+msgid "Attach file"
+msgstr "Attach file"
+
+msgid "Attachment"
+msgstr "Attachment"
+
+msgid "Automatic"
+msgstr "Automatic"
+
+msgid "Automation"
+msgstr "Automation"
+
+msgid "Automations"
+msgstr "Automations"
+
+msgid "Average"
+msgstr "Average"
+
+msgid "Back to steps"
+msgstr "Back to steps"
+
+msgid "Back to Super Chat"
+msgstr "Back to Super Chat"
+
+msgid "Background"
+msgstr "Background"
+
+msgid "Block"
+msgstr "Block"
+
+msgid "Bold"
+msgstr "Bold"
+
+msgid "Bot"
+msgstr "Bot"
+
+#. js-lingui-explicit-id
+msgid "Bot"
+msgstr "Bot"
+
+msgid "Box"
+msgstr "Box"
+
+msgid "Brief"
+msgstr "Brief"
+
+msgid "Budget"
+msgstr "Budget"
+
+msgid "Builder"
+msgstr "Builder"
+
+msgid "Builder · {label}"
+msgstr "Builder · {label}"
+
+msgid "by superchat"
+msgstr "by superchat"
+
+msgid "by you"
+msgstr "by you"
+
+msgid "By you"
+msgstr "By you"
+
+msgid "Can't reach the server."
+msgstr "Can't reach the server."
+
+msgid "Cancel"
+msgstr "Cancel"
+
+msgid "Cancel reply"
+msgstr "Cancel reply"
+
+msgid "cancelled"
+msgstr "cancelled"
+
+msgid "Cancelled"
+msgstr "Cancelled"
+
+msgid "Canvas tools"
+msgstr "Canvas tools"
+
+msgid "Change look"
+msgstr "Change look"
+
+msgid "Changing {about}"
+msgstr "Changing {about}"
+
+msgid "Chat Settings"
+msgstr "Chat Settings"
+
+msgid "chats"
+msgstr "chats"
+
+msgid "Checked · nothing new"
+msgstr "Checked · nothing new"
+
+msgid "Checking…"
+msgstr "Checking…"
+
+msgid "Choose where this chat works"
+msgstr "Choose where this chat works"
+
+msgid "Claude"
+msgstr "Claude"
+
+msgid "Clear"
+msgstr "Clear"
+
+#. placeholder {0}: bot.name
+msgid "Clear {0}’s conversation?"
+msgstr "Clear {0}’s conversation?"
+
+msgid "Clear conversation"
+msgstr "Clear conversation"
+
+msgid "Clearing…"
+msgstr "Clearing…"
+
+msgid "Click an element to edit it."
+msgstr "Click an element to edit it."
+
+msgid "Close"
+msgstr "Close"
+
+msgid "Close (Esc)"
+msgstr "Close (Esc)"
+
+msgid "Close and go back to Super Chat"
+msgstr "Close and go back to Super Chat"
+
+msgid "Close image preview"
+msgstr "Close image preview"
+
+msgid "Close model settings"
+msgstr "Close model settings"
+
+msgid "Close panel"
+msgstr "Close panel"
+
+msgid "Close preview"
+msgstr "Close preview"
+
+msgid "Close topics"
+msgstr "Close topics"
+
+msgid "Close user settings"
+msgstr "Close user settings"
+
+msgid "Code"
+msgstr "Code"
+
+msgid "Color"
+msgstr "Color"
+
+msgid "Commitments"
+msgstr "Commitments"
+
+msgid "Connected"
+msgstr "Connected"
+
+msgid "Connecting…"
+msgstr "Connecting…"
+
+msgid "Continue the conversation"
+msgstr "Continue the conversation"
+
+msgid "Conversation"
+msgstr "Conversation"
+
+msgid "Copied"
+msgstr "Copied"
+
+msgid "Copy"
+msgstr "Copy"
+
+msgid "Copy link"
+msgstr "Copy link"
+
+msgid "Copy message"
+msgstr "Copy message"
+
+msgid "Corner radius"
+msgstr "Corner radius"
+
+msgid "Could not clear conversation"
+msgstr "Could not clear conversation"
+
+msgid "Could not delete"
+msgstr "Could not delete"
+
+msgid "Could not delete this."
+msgstr "Could not delete this."
+
+#. placeholder {0}: props.name
+msgid "Could not download {0}. Try again."
+msgstr "Could not download {0}. Try again."
+
+msgid "Could not download {name}. Try again."
+msgstr "Could not download {name}. Try again."
+
+msgid "Could not download this."
+msgstr "Could not download this."
+
+msgid "Could not load Activity"
+msgstr "Could not load Activity"
+
+msgid "Could not load Memory"
+msgstr "Could not load Memory"
+
+msgid "Could not load models."
+msgstr "Could not load models."
+
+msgid "Could not load the runs."
+msgstr "Could not load the runs."
+
+msgid "Could not load this file."
+msgstr "Could not load this file."
+
+msgid "Could not load this."
+msgstr "Could not load this."
+
+msgid "Could not load your Library."
+msgstr "Could not load your Library."
+
+msgid "Could not publish this."
+msgstr "Could not publish this."
+
+msgid "Could not remove this key."
+msgstr "Could not remove this key."
+
+msgid "Could not revoke"
+msgstr "Could not revoke"
+
+msgid "Could not save"
+msgstr "Could not save"
+
+msgid "Could not save the budget."
+msgstr "Could not save the budget."
+
+msgid "Could not save this automation."
+msgstr "Could not save this automation."
+
+msgid "Could not save this day"
+msgstr "Could not save this day"
+
+msgid "Could not save this key."
+msgstr "Could not save this key."
+
+msgid "Could not save this."
+msgstr "Could not save this."
+
+msgid "Could not save."
+msgstr "Could not save."
+
+msgid "Could not save. Try again."
+msgstr "Could not save. Try again."
+
+msgid "Could not start it."
+msgstr "Could not start it."
+
+msgid "Could not submit this answer"
+msgstr "Could not submit this answer"
+
+msgid "Could not switch model."
+msgstr "Could not switch model."
+
+msgid "Could not upload this."
+msgstr "Could not upload this."
+
+msgid "Couldn't change"
+msgstr "Couldn't change"
+
+msgid "Couldn't index"
+msgstr "Couldn't index"
+
+msgid "Couldn't load"
+msgstr "Couldn't load"
+
+msgid "Couldn't load the themes. Try again in a moment."
+msgstr "Couldn't load the themes. Try again in a moment."
+
+msgid "Couldn't load this look. Try again in a moment."
+msgstr "Couldn't load this look. Try again in a moment."
+
+msgid "Couldn’t move this chat. Try again."
+msgstr "Couldn’t move this chat. Try again."
+
+msgid "Couldn't prepare PDF"
+msgstr "Couldn't prepare PDF"
+
+msgid "Couldn't prepare PowerPoint"
+msgstr "Couldn't prepare PowerPoint"
+
+#. placeholder {0}: attachment.file.name
+msgid "Couldn't read {0}"
+msgstr "Couldn't read {0}"
+
+msgid "Couldn’t read the workspace."
+msgstr "Couldn’t read the workspace."
+
+msgid "Couldn't restore. Try again"
+msgstr "Couldn't restore. Try again"
+
+msgid "Couldn't run"
+msgstr "Couldn't run"
+
+msgid "Couldn't save that change."
+msgstr "Couldn't save that change."
+
+msgid "Couldn't send that."
+msgstr "Couldn't send that."
+
+msgid "Couldn't stop"
+msgstr "Couldn't stop"
+
+msgid "Couldn't switch the theme."
+msgstr "Couldn't switch the theme."
+
+msgid "Count"
+msgstr "Count"
+
+msgid "Create automation"
+msgstr "Create automation"
+
+msgid "Create one and I'll run it on its own, every day, week or month."
+msgstr "Create one and I'll run it on its own, every day, week or month."
+
+msgid "Create space"
+msgstr "Create space"
+
+msgid "Created"
+msgstr "Created"
+
+msgid "Current look"
+msgstr "Current look"
+
+msgid "Custom"
+msgstr "Custom"
+
+msgid "Custom color"
+msgstr "Custom color"
+
+msgid "Daily"
+msgstr "Daily"
+
+msgid "Daily spending limit"
+msgstr "Daily spending limit"
+
+msgid "Dark"
+msgstr "Dark"
+
+msgid "Dashboard"
+msgstr "Dashboard"
+
+msgid "Dashboard unavailable"
+msgstr "Dashboard unavailable"
+
+msgid "Day"
+msgstr "Day"
+
+msgid "Day of the month"
+msgstr "Day of the month"
+
+msgid "Day of the week"
+msgstr "Day of the week"
+
+msgid "Days"
+msgstr "Days"
+
+msgid "Days touched this week"
+msgstr "Days touched this week"
+
+msgid "Decided"
+msgstr "Decided"
+
+msgid "Decisions"
+msgstr "Decisions"
+
+msgid "Deck"
+msgstr "Deck"
+
+msgid "Decks"
+msgstr "Decks"
+
+msgid "Default"
+msgstr "Default"
+
+#. placeholder {0}: model.defaultModel
+msgid "Default · {0}"
+msgstr "Default · {0}"
+
+msgid "Default · {defaultLabel}"
+msgstr "Default · {defaultLabel}"
+
+msgid "Delete"
+msgstr "Delete"
+
+#. placeholder {0}: pendingDelete.name
+msgid "Delete \"{0}\"?"
+msgstr "Delete \"{0}\"?"
+
+msgid "Deleting…"
+msgstr "Deleting…"
+
+msgid "Denied"
+msgstr "Denied"
+
+msgid "Deny"
+msgstr "Deny"
+
+msgid "Description"
+msgstr "Description"
+
+msgid "Details"
+msgstr "Details"
+
+msgid "Didn't finish"
+msgstr "Didn't finish"
+
+msgid "Dismiss"
+msgstr "Dismiss"
+
+msgid "Dismiss error"
+msgstr "Dismiss error"
+
+msgid "Dismissed"
+msgstr "Dismissed"
+
+msgid "Divider"
+msgstr "Divider"
+
+msgid "Document"
+msgstr "Document"
+
+msgid "Documents"
+msgstr "Documents"
+
+msgid "Does what it can, drafts what needs your yes, and asks you the decisions at the end."
+msgstr "Does what it can, drafts what needs your yes, and asks you the decisions at the end."
+
+msgid "Done"
+msgstr "Done"
+
+msgid "Done. Nothing open"
+msgstr "Done. Nothing open"
+
+msgid "Double-click or press Enter to edit its text."
+msgstr "Double-click or press Enter to edit its text."
+
+msgid "Download"
+msgstr "Download"
+
+#. placeholder {0}: props.name
+msgid "Download {0}"
+msgstr "Download {0}"
+
+msgid "Download {name}"
+msgstr "Download {name}"
+
+msgid "Download {title}"
+msgstr "Download {title}"
+
+msgid "due {dayMonth}"
+msgstr "due {dayMonth}"
+
+msgid "Due {iso}"
+msgstr "Due {iso}"
+
+msgid "Due {label}"
+msgstr "Due {label}"
+
+msgid "due {weekday}"
+msgstr "due {weekday}"
+
+msgid "due today"
+msgstr "due today"
+
+msgid "Due today"
+msgstr "Due today"
+
+msgid "due tomorrow"
+msgstr "due tomorrow"
+
+msgid "Due tomorrow"
+msgstr "Due tomorrow"
+
+msgid "Duplicate"
+msgstr "Duplicate"
+
+msgid "e.g. only the prices; leave the title as it is"
+msgstr "e.g. only the prices; leave the title as it is"
+
+msgid "Edit"
+msgstr "Edit"
+
+msgid "Edit first"
+msgstr "Edit first"
+
+msgid "Edit memory"
+msgstr "Edit memory"
+
+msgid "Edit style"
+msgstr "Edit style"
+
+msgid "Edited by you"
+msgstr "Edited by you"
+
+msgid "Editorial"
+msgstr "Editorial"
+
+msgid "Email"
+msgstr "Email"
+
+msgid "emails"
+msgstr "emails"
+
+msgid "Enter to save · Esc to cancel"
+msgstr "Enter to save · Esc to cancel"
+
+msgid "Enter to send · Shift+Enter for a new line"
+msgstr "Enter to send · Shift+Enter for a new line"
+
+msgid "Enter to send · Shift+Enter for a new line · superchat changes only what you selected"
+msgstr "Enter to send · Shift+Enter for a new line · superchat changes only what you selected"
+
+msgid "Exit full screen"
+msgstr "Exit full screen"
+
+msgid "Exit present mode"
+msgstr "Exit present mode"
+
+#. placeholder {0}: data.name
+msgid "Expand {0}"
+msgstr "Expand {0}"
+
+msgid "Expired"
+msgstr "Expired"
+
+msgid "Explore"
+msgstr "Explore"
+
+msgid "Exported by you"
+msgstr "Exported by you"
+
+msgid "failed"
+msgstr "failed"
+
+msgid "Failed"
+msgstr "Failed"
+
+#. placeholder {0}: newestReason ?? plainCode(run.errorCode) ?? t`it did not finish`
+#. placeholder {0}: status.reason
+msgid "Failed · {0}"
+msgstr "Failed · {0}"
+
+msgid "Failed to send message"
+msgstr "Failed to send message"
+
+msgid "Failed to start"
+msgstr "Failed to start"
+
+msgid "Failed to stop"
+msgstr "Failed to stop"
+
+#. js-lingui-explicit-id
+msgid "Failed."
+msgstr "Failed."
+
+msgid "File"
+msgstr "File"
+
+msgid "File on your machine"
+msgstr "File on your machine"
+
+msgid "files"
+msgstr "files"
+
+msgid "Files"
+msgstr "Files"
+
+msgid "Files it reads"
+msgstr "Files it reads"
+
+msgid "Fill"
+msgstr "Fill"
+
+msgid "Fill color"
+msgstr "Fill color"
+
+msgid "Filter files"
+msgstr "Filter files"
+
+msgid "Find a memory"
+msgstr "Find a memory"
+
+msgid "finished"
+msgstr "finished"
+
+#. js-lingui-explicit-id
+msgid "Finished."
+msgstr "Finished."
+
+msgid "Finishing another file first"
+msgstr "Finishing another file first"
+
+msgid "Folders"
+msgstr "Folders"
+
+msgid "Font"
+msgstr "Font"
+
+msgid "Font size"
+msgstr "Font size"
+
+msgid "Forget"
+msgstr "Forget"
+
+msgid "Found"
+msgstr "Found"
+
+msgid "Foundation"
+msgstr "Foundation"
+
+msgid "Foundation · {label}"
+msgstr "Foundation · {label}"
+
+#. placeholder {0}: formatRelativeTime(ask.createdAt)
+msgid "From {sourceLabel} · {0}"
+msgstr "From {sourceLabel} · {0}"
+
+msgid "From Super Chat"
+msgstr "From Super Chat"
+
+msgid "From this chat"
+msgstr "From this chat"
+
+msgid "from your message"
+msgstr "from your message"
+
+msgid "Full screen"
+msgstr "Full screen"
+
+msgid "General"
+msgstr "General"
+
+msgid "Getting started"
+msgstr "Getting started"
+
+msgid "Goes to your vault, not the chat."
+msgstr "Goes to your vault, not the chat."
+
+msgid "Got it"
+msgstr "Got it"
+
+msgid "Harness"
+msgstr "Harness"
+
+msgid "Heading"
+msgstr "Heading"
+
+msgid "Heading 1"
+msgstr "Heading 1"
+
+msgid "Heading 2"
+msgstr "Heading 2"
+
+msgid "Heading 3"
+msgstr "Heading 3"
+
+msgid "Height"
+msgstr "Height"
+
+msgid "Hi {name}, what can superchat <0>build with you?</0>"
+msgstr "Hi {name}, what can superchat <0>build with you?</0>"
+
+msgid "Hide"
+msgstr "Hide"
+
+msgid "Hide activity"
+msgstr "Hide activity"
+
+msgid "Hide hidden files"
+msgstr "Hide hidden files"
+
+msgid "Hide layers"
+msgstr "Hide layers"
+
+msgid "Hide outline"
+msgstr "Hide outline"
+
+msgid "Hide sheets"
+msgstr "Hide sheets"
+
+msgid "Hide slides"
+msgstr "Hide slides"
+
+msgid "Hide the runs"
+msgstr "Hide the runs"
+
+msgid "History"
+msgstr "History"
+
+msgid "Home"
+msgstr "Home"
+
+msgid "Home · {topics}"
+msgstr "Home · {topics}"
+
+msgid "How often"
+msgstr "How often"
+
+msgid "How superchat works with you"
+msgstr "How superchat works with you"
+
+msgid "HTML (source)"
+msgstr "HTML (source)"
+
+msgid "I ask before doing anything I can't undo."
+msgstr "I ask before doing anything I can't undo."
+
+msgid "I couldn't reach the model provider. Try again."
+msgstr "I couldn't reach the model provider. Try again."
+
+msgid "I couldn't save that reply, so it won't be here when you come back."
+msgstr "I couldn't save that reply, so it won't be here when you come back."
+
+msgid "I lost the connection. Try again."
+msgstr "I lost the connection. Try again."
+
+msgid "I need your API key to think."
+msgstr "I need your API key to think."
+
+msgid "Image"
+msgstr "Image"
+
+msgid "Image description"
+msgstr "Image description"
+
+msgid "Images"
+msgstr "Images"
+
+msgid "In progress"
+msgstr "In progress"
+
+msgid "In Super Chat"
+msgstr "In Super Chat"
+
+msgid "In Super Chat · {when}"
+msgstr "In Super Chat · {when}"
+
+msgid "Inbox"
+msgstr "Inbox"
+
+msgid "Inbox filter"
+msgstr "Inbox filter"
+
+msgid "Indexing…"
+msgstr "Indexing…"
+
+msgid "Isolated preview"
+msgstr "Isolated preview"
+
+msgid "Isolated preview — no access to your account"
+msgstr "Isolated preview — no access to your account"
+
+msgid "it did not finish"
+msgstr "it did not finish"
+
+msgid "It gets its own web address. It runs on its own, separate from superchat, and can't see your conversations or files."
+msgstr "It gets its own web address. It runs on its own, separate from superchat, and can't see your conversations or files."
+
+msgid "It includes edits of yours that are not published."
+msgstr "It includes edits of yours that are not published."
+
+msgid "It was due {dayMonth}."
+msgstr "It was due {dayMonth}."
+
+msgid "It was due {weekday}."
+msgstr "It was due {weekday}."
+
+msgid "It was due yesterday."
+msgstr "It was due yesterday."
+
+msgid "It's due {dayMonth}."
+msgstr "It's due {dayMonth}."
+
+msgid "It's due today."
+msgstr "It's due today."
+
+msgid "It's due tomorrow."
+msgstr "It's due tomorrow."
+
+msgid "Italic"
+msgstr "Italic"
+
+msgid "Its address stops working right away. You can publish it again later."
+msgstr "Its address stops working right away. You can publish it again later."
+
+msgid "Jump to latest"
+msgstr "Jump to latest"
+
+msgid "just now"
+msgstr "just now"
+
+msgid "Just you, signed in"
+msgstr "Just you, signed in"
+
+msgid "Keep updated"
+msgstr "Keep updated"
+
+msgid "Keeps {title} updated"
+msgstr "Keeps {title} updated"
+
+msgid "Kind"
+msgstr "Kind"
+
+msgid "Last 48 hours"
+msgstr "Last 48 hours"
+
+#. placeholder {0}: whenText(live.checkedAt)
+msgid "Last checked {0} · nothing new"
+msgstr "Last checked {0} · nothing new"
+
+msgid "Last: {line}"
+msgstr "Last: {line}"
+
+msgid "Last: {line} · {when}"
+msgstr "Last: {line} · {when}"
+
+msgid "Layers"
+msgstr "Layers"
+
+msgid "Less"
+msgstr "Less"
+
+msgid "Letter spacing"
+msgstr "Letter spacing"
+
+msgid "Library"
+msgstr "Library"
+
+msgid "Light"
+msgstr "Light"
+
+#. placeholder {0}: choices.defaultLabel
+msgid "Light · {0}"
+msgstr "Light · {0}"
+
+msgid "Light · {label}"
+msgstr "Light · {label}"
+
+msgid "Light model"
+msgstr "Light model"
+
+msgid "Line height"
+msgstr "Line height"
+
+msgid "Link"
+msgstr "Link"
+
+msgid "Link address"
+msgstr "Link address"
+
+msgid "List"
+msgstr "List"
+
+msgid "Live"
+msgstr "Live"
+
+msgid "Live · paused"
+msgstr "Live · paused"
+
+msgid "Live · update failed"
+msgstr "Live · update failed"
+
+msgid "Live page"
+msgstr "Live page"
+
+msgid "Live sheet"
+msgstr "Live sheet"
+
+msgid "Load earlier"
+msgstr "Load earlier"
+
+msgid "Load earlier messages"
+msgstr "Load earlier messages"
+
+msgid "Loading preview…"
+msgstr "Loading preview…"
+
+msgid "Loading…"
+msgstr "Loading…"
+
+msgid "Lower the conversation"
+msgstr "Lower the conversation"
+
+msgid "Machine"
+msgstr "Machine"
+
+msgid "Made"
+msgstr "Made"
+
+msgid "Main"
+msgstr "Main"
+
+msgid "Making a new one…"
+msgstr "Making a new one…"
+
+msgid "Mark done: {title}"
+msgstr "Mark done: {title}"
+
+msgid "Memory"
+msgstr "Memory"
+
+msgid "Message"
+msgstr "Message"
+
+#. js-lingui-explicit-id
+msgid "Message"
+msgstr "Message"
+
+msgid "Message composer"
+msgstr "Message composer"
+
+msgid "Message superchat"
+msgstr "Message superchat"
+
+msgid "Message…"
+msgstr "Message…"
+
+msgid "Model"
+msgstr "Model"
+
+msgid "Model for this chat"
+msgstr "Model for this chat"
+
+msgid "Models"
+msgstr "Models"
+
+msgid "Month"
+msgstr "Month"
+
+msgid "Monthly"
+msgstr "Monthly"
+
+msgid "Monthly limit"
+msgstr "Monthly limit"
+
+msgid "More"
+msgstr "More"
+
+msgid "More actions"
+msgstr "More actions"
+
+#. placeholder {0}: automation.name
+#. placeholder {0}: data.name
+msgid "More actions for {0}"
+msgstr "More actions for {0}"
+
+msgid "More actions for {title}"
+msgstr "More actions for {title}"
+
+msgid "Morning brief"
+msgstr "Morning brief"
+
+msgid "My machine restarted. Try again."
+msgstr "My machine restarted. Try again."
+
+msgid "My machine was replaced, so files I hadn't saved elsewhere are gone."
+msgstr "My machine was replaced, so files I hadn't saved elsewhere are gone."
+
+msgid "My organization"
+msgstr "My organization"
+
+msgid "Name"
+msgstr "Name"
+
+msgid "Never"
+msgstr "Never"
+
+msgid "New"
+msgstr "New"
+
+msgid "New app"
+msgstr "New app"
+
+msgid "New automation"
+msgstr "New automation"
+
+msgid "New messages"
+msgstr "New messages"
+
+msgid "Newer version available, show it"
+msgstr "Newer version available, show it"
+
+msgid "Next"
+msgstr "Next"
+
+msgid "Next look"
+msgstr "Next look"
+
+msgid "Next slide"
+msgstr "Next slide"
+
+msgid "No automations yet"
+msgstr "No automations yet"
+
+msgid "No change was made."
+msgstr "No change was made."
+
+msgid "No files yet."
+msgstr "No files yet."
+
+msgid "No fill"
+msgstr "No fill"
+
+msgid "No limit"
+msgstr "No limit"
+
+msgid "No longer active"
+msgstr "No longer active"
+
+msgid "No matches"
+msgstr "No matches"
+
+msgid "No matches."
+msgstr "No matches."
+
+msgid "No runs yet."
+msgstr "No runs yet."
+
+msgid "No sign-in needed"
+msgstr "No sign-in needed"
+
+msgid "No steps recorded"
+msgstr "No steps recorded"
+
+msgid "None"
+msgstr "None"
+
+msgid "Not connected"
+msgstr "Not connected"
+
+msgid "Not now"
+msgstr "Not now"
+
+msgid "Not run yet"
+msgstr "Not run yet"
+
+msgid "Not started"
+msgstr "Not started"
+
+msgid "Not useful"
+msgstr "Not useful"
+
+msgid "Noted. You'll see less like this."
+msgstr "Noted. You'll see less like this."
+
+msgid "Nothing decided yet"
+msgstr "Nothing decided yet"
+
+msgid "Nothing here yet."
+msgstr "Nothing here yet."
+
+msgid "Nothing in the last 48 hours."
+msgstr "Nothing in the last 48 hours."
+
+msgid "Nothing matches your search."
+msgstr "Nothing matches your search."
+
+msgid "Nothing noted yet."
+msgstr "Nothing noted yet."
+
+msgid "Nothing remembered yet."
+msgstr "Nothing remembered yet."
+
+msgid "Nothing this week."
+msgstr "Nothing this week."
+
+msgid "Nothing yet"
+msgstr "Nothing yet"
+
+msgid "Nothing yet — once I do something, it shows up here."
+msgstr "Nothing yet — once I do something, it shows up here."
+
+msgid "Nothing yet. Topics appear here a little while after you work on something."
+msgstr "Nothing yet. Topics appear here a little while after you work on something."
+
+msgid "Noticed, {when}"
+msgstr "Noticed, {when}"
+
+msgid "Now"
+msgstr "Now"
+
+msgid "Offset"
+msgstr "Offset"
+
+msgid "Offset X"
+msgstr "Offset X"
+
+msgid "Offset Y"
+msgstr "Offset Y"
+
+msgid "On"
+msgstr "On"
+
+msgid "On day"
+msgstr "On day"
+
+msgid "One yes before I send this"
+msgstr "One yes before I send this"
+
+msgid "Only me"
+msgstr "Only me"
+
+msgid "Opacity"
+msgstr "Opacity"
+
+msgid "Open"
+msgstr "Open"
+
+#. placeholder {0}: data.name
+#. placeholder {0}: props.name
+msgid "Open {0}"
+msgstr "Open {0}"
+
+#. placeholder {0}: item.name
+#. placeholder {1}: item.page
+msgid "Open {0}, page {1}"
+msgstr "Open {0}, page {1}"
+
+msgid "Open {name} in new tab"
+msgstr "Open {name} in new tab"
+
+msgid "Open {title}"
+msgstr "Open {title}"
+
+msgid "Open in new tab"
+msgstr "Open in new tab"
+
+msgid "Open loops"
+msgstr "Open loops"
+
+msgid "Open questions"
+msgstr "Open questions"
+
+msgid "Open run"
+msgstr "Open run"
+
+msgid "Open topic"
+msgstr "Open topic"
+
+msgid "Open your brief"
+msgstr "Open your brief"
+
+msgid "Opening superchat…"
+msgstr "Opening superchat…"
+
+msgid "Organization limit"
+msgstr "Organization limit"
+
+msgid "Outcome"
+msgstr "Outcome"
+
+msgid "Outline"
+msgstr "Outline"
+
+#. placeholder {0}: item.page
+msgid "p. {0}"
+msgstr "p. {0}"
+
+msgid "Padding"
+msgstr "Padding"
+
+msgid "Page"
+msgstr "Page"
+
+msgid "Pages"
+msgstr "Pages"
+
+msgid "Palette"
+msgstr "Palette"
+
+msgid "Panel sections"
+msgstr "Panel sections"
+
+msgid "Paragraph"
+msgstr "Paragraph"
+
+msgid "Password"
+msgstr "Password"
+
+msgid "Pause"
+msgstr "Pause"
+
+msgid "Paused"
+msgstr "Paused"
+
+#. placeholder {0}: status.failures
+msgid "Paused after {0} failed runs"
+msgstr "Paused after {0} failed runs"
+
+msgid "PDF"
+msgstr "PDF"
+
+msgid "People"
+msgstr "People"
+
+msgid "Pi"
+msgstr "Pi"
+
+msgid "Pick a folder"
+msgstr "Pick a folder"
+
+msgid "Pick a time and I'll do this for you."
+msgstr "Pick a time and I'll do this for you."
+
+msgid "Pick up"
+msgstr "Pick up"
+
+#. placeholder {0}: topic.title
+msgid "Pick up {0}"
+msgstr "Pick up {0}"
+
+msgid "Pick up in chat"
+msgstr "Pick up in chat"
+
+msgid "Pick up where you left off"
+msgstr "Pick up where you left off"
+
+msgid "pinned"
+msgstr "pinned"
+
+msgid "Plan my week"
+msgstr "Plan my week"
+
+msgid "Plan week"
+msgstr "Plan week"
+
+msgid "Plans"
+msgstr "Plans"
+
+msgid "Position and size"
+msgstr "Position and size"
+
+msgid "PowerPoint (.pptx)"
+msgstr "PowerPoint (.pptx)"
+
+msgid "Preparing PDF…"
+msgstr "Preparing PDF…"
+
+msgid "Preparing PowerPoint…"
+msgstr "Preparing PowerPoint…"
+
+msgid "Present"
+msgstr "Present"
+
+msgid "Preview"
+msgstr "Preview"
+
+#. placeholder {0}: theme.name
+msgid "Preview {0}"
+msgstr "Preview {0}"
+
+msgid "Preview isn't available for this file type — download it to view it."
+msgstr "Preview isn't available for this file type — download it to view it."
+
+msgid "Preview isn't available for this file type."
+msgstr "Preview isn't available for this file type."
+
+msgid "Previous look"
+msgstr "Previous look"
+
+msgid "Previous slide"
+msgstr "Previous slide"
+
+msgid "Private"
+msgstr "Private"
+
+msgid "Professional"
+msgstr "Professional"
+
+msgid "Projects"
+msgstr "Projects"
+
+msgid "Projects & focus"
+msgstr "Projects & focus"
+
+msgid "Promised"
+msgstr "Promised"
+
+msgid "Provided by your organization"
+msgstr "Provided by your organization"
+
+msgid "Publish"
+msgstr "Publish"
+
+msgid "Publish {name}?"
+msgstr "Publish {name}?"
+
+msgid "Publish settings"
+msgstr "Publish settings"
+
+msgid "Publish this version"
+msgstr "Publish this version"
+
+msgid "Publish…"
+msgstr "Publish…"
+
+msgid "Published"
+msgstr "Published"
+
+msgid "Published copy follows updates"
+msgstr "Published copy follows updates"
+
+msgid "Published copy not updated."
+msgstr "Published copy not updated."
+
+msgid "Pull request"
+msgstr "Pull request"
+
+msgid "Questions"
+msgstr "Questions"
+
+msgid "Quote"
+msgstr "Quote"
+
+msgid "Radius"
+msgstr "Radius"
+
+msgid "Raise budget"
+msgstr "Raise budget"
+
+msgid "Raise the conversation"
+msgstr "Raise the conversation"
+
+msgid "Ran"
+msgstr "Ran"
+
+msgid "Range"
+msgstr "Range"
+
+#. placeholder {0}: attachment.file.name
+msgid "Reading {0} is taking too long. Try again in a moment."
+msgstr "Reading {0} is taking too long. Try again in a moment."
+
+#. placeholder {0}: attachment.file.name
+msgid "Reading {0}…"
+msgstr "Reading {0}…"
+
+msgid "Reconnecting"
+msgstr "Reconnecting"
+
+msgid "Redo"
+msgstr "Redo"
+
+msgid "Redo (⇧⌘Z)"
+msgstr "Redo (⇧⌘Z)"
+
+msgid "Reflection"
+msgstr "Reflection"
+
+msgid "Refresh files"
+msgstr "Refresh files"
+
+msgid "Refresh now"
+msgstr "Refresh now"
+
+msgid "Reload"
+msgstr "Reload"
+
+msgid "Remove"
+msgstr "Remove"
+
+#. placeholder {0}: attachment.file.name
+#. placeholder {0}: chip.label
+msgid "Remove {0}"
+msgstr "Remove {0}"
+
+msgid "Remove file"
+msgstr "Remove file"
+
+#. placeholder {0}: folder || t`Whole workspace`
+msgid "Remove folder {0}"
+msgstr "Remove folder {0}"
+
+msgid "Remove selection"
+msgstr "Remove selection"
+
+msgid "Repeat"
+msgstr "Repeat"
+
+msgid "Replace"
+msgstr "Replace"
+
+msgid "Replay the intro"
+msgstr "Replay the intro"
+
+msgid "Reply"
+msgstr "Reply"
+
+msgid "Reply cancelled"
+msgstr "Reply cancelled"
+
+#. placeholder {0}: replyNameRef.current
+msgid "Replying to {0}"
+msgstr "Replying to {0}"
+
+msgid "Replying to {replyName}"
+msgstr "Replying to {replyName}"
+
+msgid "Replying to {replyName}: “{replyQuote}”"
+msgstr "Replying to {replyName}: “{replyQuote}”"
+
+msgid "Report"
+msgstr "Report"
+
+msgid "Research"
+msgstr "Research"
+
+msgid "Research something for me"
+msgstr "Research something for me"
+
+msgid "Restore this version"
+msgstr "Restore this version"
+
+msgid "restored"
+msgstr "restored"
+
+msgid "Restored"
+msgstr "Restored"
+
+msgid "Restyles every slide; your content stays as it is."
+msgstr "Restyles every slide; your content stays as it is."
+
+msgid "Resume"
+msgstr "Resume"
+
+msgid "Retry"
+msgstr "Retry"
+
+msgid "Retry now"
+msgstr "Retry now"
+
+msgid "Review the draft"
+msgstr "Review the draft"
+
+msgid "Revoke"
+msgstr "Revoke"
+
+msgid "Run"
+msgstr "Run"
+
+msgid "Run again"
+msgstr "Run again"
+
+msgid "Run now"
+msgstr "Run now"
+
+msgid "running"
+msgstr "running"
+
+msgid "Running"
+msgstr "Running"
+
+msgid "Running…"
+msgstr "Running…"
+
+msgid "Runs on"
+msgstr "Runs on"
+
+msgid "Save"
+msgstr "Save"
+
+msgid "Save to Library"
+msgstr "Save to Library"
+
+msgid "Saved"
+msgstr "Saved"
+
+#. placeholder {0}: day(entry.createdAt)
+msgid "Saved {0} · not used yet"
+msgstr "Saved {0} · not used yet"
+
+#. placeholder {0}: day(entry.createdAt)
+#. placeholder {1}: day(entry.lastUsedAt)
+msgid "Saved {0} · used {1}"
+msgstr "Saved {0} · used {1}"
+
+msgid "Saved to Library"
+msgstr "Saved to Library"
+
+msgid "Saving…"
+msgstr "Saving…"
+
+msgid "Search activity"
+msgstr "Search activity"
+
+msgid "Search folders"
+msgstr "Search folders"
+
+msgid "Search your Library"
+msgstr "Search your Library"
+
+msgid "Search your Library…"
+msgstr "Search your Library…"
+
+msgid "Searchable"
+msgstr "Searchable"
+
+msgid "Select"
+msgstr "Select"
+
+msgid "Select a block to change it."
+msgstr "Select a block to change it."
+
+msgid "Select cells to see their sum, count and average."
+msgstr "Select cells to see their sum, count and average."
+
+msgid "Selection"
+msgstr "Selection"
+
+#. placeholder {0}: words[pickedBlock.type]
+msgid "Selection · {0}"
+msgstr "Selection · {0}"
+
+msgid "Selection · {cells}"
+msgstr "Selection · {cells}"
+
+msgid "Send"
+msgstr "Send"
+
+msgid "Send answer"
+msgstr "Send answer"
+
+msgid "Send it"
+msgstr "Send it"
+
+msgid "Sending…"
+msgstr "Sending…"
+
+msgid "Settings"
+msgstr "Settings"
+
+msgid "Settings: General"
+msgstr "Settings: General"
+
+msgid "Sheet"
+msgstr "Sheet"
+
+msgid "Sheets"
+msgstr "Sheets"
+
+msgid "Show"
+msgstr "Show"
+
+msgid "Show all ({count} characters)"
+msgstr "Show all ({count} characters)"
+
+msgid "Show changes"
+msgstr "Show changes"
+
+msgid "Show details"
+msgstr "Show details"
+
+msgid "Show earlier messages"
+msgstr "Show earlier messages"
+
+msgid "Show hidden files"
+msgstr "Show hidden files"
+
+msgid "Show in Files"
+msgstr "Show in Files"
+
+msgid "Show in Super Chat ↗"
+msgstr "Show in Super Chat ↗"
+
+msgid "Show layers"
+msgstr "Show layers"
+
+msgid "Show less"
+msgstr "Show less"
+
+msgid "Show outline"
+msgstr "Show outline"
+
+msgid "Show sheets"
+msgstr "Show sheets"
+
+msgid "Show slides"
+msgstr "Show slides"
+
+msgid "Show the runs"
+msgstr "Show the runs"
+
+#. placeholder {0}: sheet.rows.length
+msgid "Showing the first {0} rows"
+msgstr "Showing the first {0} rows"
+
+msgid "Sign-in for {host}"
+msgstr "Sign-in for {host}"
+
+msgid "Size"
+msgstr "Size"
+
+msgid "Skipped"
+msgstr "Skipped"
+
+#. placeholder {0}: skipped.join(", ")
+msgid "Skipped {0}"
+msgstr "Skipped {0}"
+
+msgid "Slide"
+msgstr "Slide"
+
+msgid "Slide rail"
+msgstr "Slide rail"
+
+msgid "Slides"
+msgstr "Slides"
+
+msgid "Some changes could not be placed."
+msgstr "Some changes could not be placed."
+
+msgid "Some parts you changed differ from the source."
+msgstr "Some parts you changed differ from the source."
+
+msgid "Something went wrong before it could start."
+msgstr "Something went wrong before it could start."
+
+msgid "Something went wrong on my side. Try again."
+msgstr "Something went wrong on my side. Try again."
+
+msgid "Source"
+msgstr "Source"
+
+#. placeholder {0}: suggestion.sourceValue
+#. placeholder {1}: suggestion.yours
+msgid "Source says {0}, you wrote {1}"
+msgstr "Source says {0}, you wrote {1}"
+
+msgid "Sources"
+msgstr "Sources"
+
+msgid "Spacing"
+msgstr "Spacing"
+
+msgid "Spent this month"
+msgstr "Spent this month"
+
+msgid "Start"
+msgstr "Start"
+
+msgid "Start fresh"
+msgstr "Start fresh"
+
+#. placeholder {0}: botDisplayName ?? "superchat"
+msgid "Start it, and {0} works on it in the background."
+msgstr "Start it, and {0} works on it in the background."
+
+msgid "Start with"
+msgstr "Start with"
+
+msgid "Starting"
+msgstr "Starting"
+
+msgid "Starting your machine…"
+msgstr "Starting your machine…"
+
+msgid "Starts fresh at the next update"
+msgstr "Starts fresh at the next update"
+
+msgid "Status"
+msgstr "Status"
+
+msgid "Steps"
+msgstr "Steps"
+
+msgid "Still working on this."
+msgstr "Still working on this."
+
+msgid "Stop"
+msgstr "Stop"
+
+msgid "Stop updating"
+msgstr "Stop updating"
+
+msgid "Stopped"
+msgstr "Stopped"
+
+#. js-lingui-explicit-id
+msgid "Stopped."
+msgstr "Stopped."
+
+msgid "Style"
+msgstr "Style"
+
+msgid "subagent"
+msgstr "subagent"
+
+msgid "Suggested follow-ups"
+msgstr "Suggested follow-ups"
+
+msgid "Sum"
+msgstr "Sum"
+
+msgid "Summarize what changed in my files this week and tell me what needs attention."
+msgstr "Summarize what changed in my files this week and tell me what needs attention."
+
+msgid "Super Chat"
+msgstr "Super Chat"
+
+#. placeholder {0}: row.version ?? ""
+msgid "Super Chat saved v{0} while you were editing"
+msgstr "Super Chat saved v{0} while you were editing"
+
+msgid "superchat"
+msgstr "superchat"
+
+msgid "superchat is editing…"
+msgstr "superchat is editing…"
+
+msgid "superchat reads it where it is; nothing is copied."
+msgstr "superchat reads it where it is; nothing is copied."
+
+msgid "superchat starts fresh. You can still show earlier messages."
+msgstr "superchat starts fresh. You can still show earlier messages."
+
+msgid "superchat will see this after the current step"
+msgstr "superchat will see this after the current step"
+
+#. placeholder {0}: undo?.name ?? ""
+msgid "Switched to {0}"
+msgstr "Switched to {0}"
+
+msgid "System"
+msgstr "System"
+
+msgid "Table"
+msgstr "Table"
+
+msgid "Tell me in chat"
+msgstr "Tell me in chat"
+
+msgid "Text"
+msgstr "Text"
+
+msgid "Text color"
+msgstr "Text color"
+
+msgid "That change can't be made exactly by hand."
+msgstr "That change can't be made exactly by hand."
+
+msgid "That did not work."
+msgstr "That did not work."
+
+msgid "That didn't go through."
+msgstr "That didn't go through."
+
+msgid "That took too long. Try again."
+msgstr "That took too long. Try again."
+
+msgid "The deck changed since you opened it. Try again."
+msgstr "The deck changed since you opened it. Try again."
+
+msgid "The machine your Conversation runs on. It starts when it is needed."
+msgstr "The machine your Conversation runs on. It starts when it is needed."
+
+msgid "The model account is out of credit."
+msgstr "The model account is out of credit."
+
+msgid "The model is busy. Try again in a moment."
+msgstr "The model is busy. Try again in a moment."
+
+msgid "The model refused my key."
+msgstr "The model refused my key."
+
+msgid "Theme"
+msgstr "Theme"
+
+msgid "Things I do for you on a schedule."
+msgstr "Things I do for you on a schedule."
+
+msgid "This can't be undone."
+msgstr "This can't be undone."
+
+msgid "This chart was made with an older version"
+msgstr "This chart was made with an older version"
+
+msgid "This conversation is too long for the model."
+msgstr "This conversation is too long for the model."
+
+msgid "This deck can't be restyled by hand. Ask superchat to restyle it."
+msgstr "This deck can't be restyled by hand. Ask superchat to restyle it."
+
+msgid "This deck isn't on a theme. Ask superchat to restyle it."
+msgstr "This deck isn't on a theme. Ask superchat to restyle it."
+
+#. placeholder {0}: pendingDelete.versionCount
+msgid "This deletes all {0} versions of this. This can't be undone."
+msgstr "This deletes all {0} versions of this. This can't be undone."
+
+msgid "This file is not valid UTF-8 text."
+msgstr "This file is not valid UTF-8 text."
+
+msgid "This file's conversation"
+msgstr "This file's conversation"
+
+msgid "This isn't the latest version. Open the latest to edit it."
+msgstr "This isn't the latest version. Open the latest to edit it."
+
+msgid "This model isn't available — pick another."
+msgstr "This model isn't available — pick another."
+
+msgid "This morning · {time}"
+msgstr "This morning · {time}"
+
+msgid "This part of the page has no stable name in the file, so it can't be changed by hand."
+msgstr "This part of the page has no stable name in the file, so it can't be changed by hand."
+
+msgid "This week"
+msgstr "This week"
+
+msgid "Time"
+msgstr "Time"
+
+msgid "Today"
+msgstr "Today"
+
+msgid "Today · {time}"
+msgstr "Today · {time}"
+
+msgid "Too large to preview."
+msgstr "Too large to preview."
+
+msgid "Topic update"
+msgstr "Topic update"
+
+msgid "Topics"
+msgstr "Topics"
+
+msgid "Topics, something new"
+msgstr "Topics, something new"
+
+msgid "Try again"
+msgstr "Try again"
+
+msgid "Type your answer"
+msgstr "Type your answer"
+
+msgid "Unavailable"
+msgstr "Unavailable"
+
+msgid "Undo"
+msgstr "Undo"
+
+msgid "Undo (⌘Z)"
+msgstr "Undo (⌘Z)"
+
+msgid "Undo this update"
+msgstr "Undo this update"
+
+msgid "Unpublish"
+msgstr "Unpublish"
+
+msgid "Unpublish this app?"
+msgstr "Unpublish this app?"
+
+#. placeholder {0}: pending.file.name
+msgid "Unsupported file type: {0}"
+msgstr "Unsupported file type: {0}"
+
+msgid "Update now"
+msgstr "Update now"
+
+msgid "Update when"
+msgstr "Update when"
+
+msgid "updated"
+msgstr "updated"
+
+msgid "Updated"
+msgstr "Updated"
+
+#. placeholder {0}: superseded.version
+msgid "Updated — v{0}"
+msgstr "Updated — v{0}"
+
+#. placeholder {0}: status.version
+msgid "Updated · version {0}"
+msgstr "Updated · version {0}"
+
+#. placeholder {0}: whenText(update.at)
+#. placeholder {0}: whenText(updatedAt)
+msgid "Updated {0}"
+msgstr "Updated {0}"
+
+#. placeholder {0}: content.arrived.version
+msgid "Updated by superchat · v{0}"
+msgstr "Updated by superchat · v{0}"
+
+#. placeholder {0}: content.arrived.version
+msgid "Updated by you · v{0}"
+msgstr "Updated by you · v{0}"
+
+msgid "Updated from source"
+msgstr "Updated from source"
+
+msgid "Updates daily"
+msgstr "Updates daily"
+
+msgid "Updates monthly"
+msgstr "Updates monthly"
+
+msgid "Updates on a schedule"
+msgstr "Updates on a schedule"
+
+msgid "Updates weekly"
+msgstr "Updates weekly"
+
+msgid "Updates when file changes"
+msgstr "Updates when file changes"
+
+msgid "Updating"
+msgstr "Updating"
+
+msgid "Upload"
+msgstr "Upload"
+
+msgid "Upload from this device"
+msgstr "Upload from this device"
+
+#. placeholder {0}: uploaded + 1
+#. placeholder {1}: attachments.length
+msgid "Uploading {0} of {1}"
+msgstr "Uploading {0} of {1}"
+
+#. placeholder {0}: attachment.file.name
+msgid "Uploading {0}…"
+msgstr "Uploading {0}…"
+
+msgid "Uploading…"
+msgstr "Uploading…"
+
+msgid "Use source value"
+msgstr "Use source value"
+
+msgid "Use this look"
+msgstr "Use this look"
+
+msgid "Username"
+msgstr "Username"
+
+msgid "Username (optional)"
+msgstr "Username (optional)"
+
+msgid "Vault"
+msgstr "Vault"
+
+#. placeholder {0}: entry.version
+#. placeholder {0}: version.version
+msgid "Version {0}"
+msgstr "Version {0}"
+
+#. placeholder {0}: entry.version
+msgid "Version {0} · latest"
+msgstr "Version {0} · latest"
+
+msgid "Versions"
+msgstr "Versions"
+
+msgid "View all"
+msgstr "View all"
+
+msgid "View details"
+msgstr "View details"
+
+msgid "Wait for superchat to finish, then clear."
+msgstr "Wait for superchat to finish, then clear."
+
+msgid "Waiting on you"
+msgstr "Waiting on you"
+
+msgid "Waiting to start"
+msgstr "Waiting to start"
+
+msgid "was due {dayMonth}"
+msgstr "was due {dayMonth}"
+
+msgid "was due {weekday}"
+msgstr "was due {weekday}"
+
+msgid "was due yesterday"
+msgstr "was due yesterday"
+
+msgid "Week"
+msgstr "Week"
+
+msgid "Weekdays"
+msgstr "Weekdays"
+
+msgid "Weekly"
+msgstr "Weekly"
+
+msgid "Weekly summary"
+msgstr "Weekly summary"
+
+msgid "Weight"
+msgstr "Weight"
+
+msgid "What can I help you with?"
+msgstr "What can I help you with?"
+
+msgid "What can superchat <0>build with you?</0>"
+msgstr "What can superchat <0>build with you?</0>"
+
+msgid "What can you do?"
+msgstr "What can you do?"
+
+msgid "What I do on my own, in the background."
+msgstr "What I do on my own, in the background."
+
+msgid "What should superchat do?"
+msgstr "What should superchat do?"
+
+msgid "What to update"
+msgstr "What to update"
+
+msgid "What we covered"
+msgstr "What we covered"
+
+msgid "What we talked about"
+msgstr "What we talked about"
+
+msgid "What you decide shows up here for 30 days."
+msgstr "What you decide shows up here for 30 days."
+
+msgid "What you worked on, newest first. Open one to see where you left off, then pick it up in the chat."
+msgstr "What you worked on, newest first. Open one to see where you left off, then pick it up in the chat."
+
+msgid "When {files} changes"
+msgstr "When {files} changes"
+
+msgid "When I need a decision or an answer, it'll show up here."
+msgstr "When I need a decision or an answer, it'll show up here."
+
+msgid "When something important changes"
+msgstr "When something important changes"
+
+msgid "Where we left off"
+msgstr "Where we left off"
+
+#. placeholder {0}: data.title
+msgid "Where we left off on {0}"
+msgstr "Where we left off on {0}"
+
+msgid "While you were away"
+msgstr "While you were away"
+
+msgid "Who can open it"
+msgstr "Who can open it"
+
+msgid "Whole document"
+msgstr "Whole document"
+
+msgid "Whole file"
+msgstr "Whole file"
+
+msgid "Whole page"
+msgstr "Whole page"
+
+msgid "Whole sheet"
+msgstr "Whole sheet"
+
+msgid "Whole workspace"
+msgstr "Whole workspace"
+
+msgid "Width"
+msgstr "Width"
+
+#. placeholder {0}: lastSegment(dir)
+msgid "Work in {0}"
+msgstr "Work in {0}"
+
+msgid "Work in…"
+msgstr "Work in…"
+
+#. placeholder {0}: rows.length
+msgid "Work through all {0}"
+msgstr "Work through all {0}"
+
+#. placeholder {0}: data.title
+msgid "Work through everything still open on {0}"
+msgstr "Work through everything still open on {0}"
+
+msgid "Working"
+msgstr "Working"
+
+msgid "Working in {name}"
+msgstr "Working in {name}"
+
+msgid "Working now"
+msgstr "Working now"
+
+#. placeholder {0}: rows.length
+msgid "Working through {0}"
+msgstr "Working through {0}"
+
+msgid "Workspace"
+msgstr "Workspace"
+
+msgid "Yesterday"
+msgstr "Yesterday"
+
+msgid "Yesterday · {time}"
+msgstr "Yesterday · {time}"
+
+msgid "You"
+msgstr "You"
+
+msgid "You · {when}"
+msgstr "You · {when}"
+
+#. placeholder {0}: status.asked
+msgid "You asked: {0}"
+msgstr "You asked: {0}"
+
+#. placeholder {0}: row.element
+#. placeholder {1}: row.count
+#. placeholder {2}: row.from
+#. placeholder {3}: row.to
+msgid "You changed {0} · {1} edits · v{2} → v{3}"
+msgstr "You changed {0} · {1} edits · v{2} → v{3}"
+
+msgid "You changed {changedCount} cells on {sheetName}. superchat sees this before its next reply."
+msgstr "You changed {changedCount} cells on {sheetName}. superchat sees this before its next reply."
+
+msgid "You changed 1 cell on {sheetName}. superchat sees this before its next reply."
+msgstr "You changed 1 cell on {sheetName}. superchat sees this before its next reply."
+
+msgid "You said, {when}"
+msgstr "You said, {when}"
+
+msgid "You're all caught up"
+msgstr "You're all caught up"
+
+msgid "You're not signed in. Open superchat through your organisation's sign-in."
+msgstr "You're not signed in. Open superchat through your organisation's sign-in."
+
+msgid "You've reached your monthly model budget."
+msgstr "You've reached your monthly model budget."
+
+msgid "Your account is paused. Contact your admin."
+msgstr "Your account is paused. Contact your admin."
+
+msgid "Your brief"
+msgstr "Your brief"
+
+msgid "Your machine is starting. Try again in a moment."
+msgstr "Your machine is starting. Try again in a moment."
+
+msgid "Your workspace."
+msgstr "Your workspace."

@@ -1,0 +1,1087 @@
+#!/usr/bin/env python3
+"""Build a Superchat dashboard: one self-contained HTML page of KPIs and Chart.js charts.
+
+Usage: superchat-dashboard build SPEC.json -o NAME.dashboard.html
+       superchat-dashboard build - -o NAME.dashboard.html <<'EOF'   (the spec on stdin; paths are
+       {...}                                                    relative to the current folder)
+       EOF
+       superchat-dashboard data SPEC.json            (the computed numbers as JSON, e.g. for a deck chart)
+       superchat-dashboard pdf NAME.dashboard.html -o NAME.pdf
+
+The numbers always come from files. The spec names a source file (CSV, TSV, XLSX, JSON or JSON
+Lines) and, for every KPI and chart, the columns and the aggregation (sum, mean, median, min, max,
+count, with optional month/quarter/... date buckets); this computes them with pandas and embeds the
+result. A spec that types numbers itself is refused unless that block says how they were derived.
+The page inlines Chart.js, so it opens offline, in a browser, in Superchat's chat or as a published app.
+
+Prints one JSON object as the last stdout line: ``{"ok": true, ...}`` or ``{"ok": false,
+"error"}`` (exit code 1).
+
+Spec (JSON):
+    {
+      "title": "Sales", "subtitle": "...", "eyebrow": "Q3 2026",
+      "source": "orders.csv",                       # default file; paths are relative to the spec
+      "where": {"region": ["East", "West"]},        # optional row filter (column: value or values)
+      "kpis": [{"label": "Revenue", "value": "revenue", "agg": "sum",
+                "date": "order_date", "bucket": "month", "format": {"prefix": "$", "compact": true}}],
+      "charts": [{"title": "Revenue by month", "type": "line", "x": "order_date", "bucket": "month",
+                  "y": "revenue", "agg": "sum", "wide": true}]
+    }
+
+Chart types: bar (``horizontal``, ``stacked``), line, area (``stacked``), pie, doughnut, scatter,
+radar, combo (bars for ``y``, a line on a right axis for ``y2``; ``agg2`` is the line's own
+aggregation). ``split`` turns a column's values into series. ``sort`` is value, label or none;
+``limit`` keeps the top N categories (the rest are summed into "Other" when the aggregation allows
+it). ``format``: prefix, suffix, decimals, compact, percent (the value is a ratio: 0.25 shows as
+25%).
+
+``"agg": "mean"`` with ``"weight": "<column>"`` is a weighted average (a monthly margin % weighted
+by revenue), on a chart or a KPI: chart the person's file directly, no pre-aggregated copy.
+Series are labelled with the column name made readable ("margin_pct" shows as "Margin %"); set
+your own with ``"names": {"margin_pct": "Gross margin"}``. Date buckets read as "Jan", "Q1"
+("Jan 2026" when the range spans years); an x column already holding months or quarters
+("2026-01", "2026-Q1") is bucketed by itself.
+
+Source files must be in the person's workspace (``~/workspace``); the page cites them by their
+path inside it (``your_files/sales.csv``), never an absolute or scratch path.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import html
+import json
+import math
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+HERE = Path(__file__).resolve().parent
+SHARE = Path("/usr/local/share/superchat/dashboard")
+CHARTJS_IN_REPO = (
+    HERE.parent.parent
+    / "engine/omnigent/superchat/decks/kit/vendor/chart.js/chart.umd.js"
+)
+
+SUFFIX = ".dashboard.html"
+#: The spec argument that means "read the spec from stdin".
+STDIN = Path("-")
+CHART_TYPES = ("bar", "line", "area", "pie", "doughnut", "scatter", "radar", "combo")
+AGGS = {
+    "sum": "summed",
+    "mean": "averaged",
+    "median": "median",
+    "min": "minimum",
+    "max": "maximum",
+    "count": "counted",
+}
+ADDITIVE = ("sum", "count")
+BUCKETS = {"day": "D", "week": "W-MON", "month": "M", "quarter": "Q", "year": "Y"}
+MAX_SERIES = 8
+MAX_SCATTER_POINTS = 5000
+MAX_CATEGORIES = 500
+TABLE_ROWS = 200
+
+
+class SpecError(Exception):
+    """A sentence for the Muse: what to fix in the spec or the data."""
+
+
+# ---------------------------------------------------------------------------------------------
+# Assets
+# ---------------------------------------------------------------------------------------------
+
+
+def asset(name: str) -> Path:
+    """The template or Chart.js: the image's copy, else this repository's."""
+    root = os.environ.get("SUPERCHAT_DASHBOARD_ASSETS")
+    candidates = [Path(root) / name] if root else []
+    candidates.append(SHARE / name)
+    candidates.append(
+        HERE.parent / "share" / "dashboard" / name if name != "chart.umd.js" else CHARTJS_IN_REPO
+    )
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise SpecError(f"superchat-dashboard is missing its {name}")
+
+
+# ---------------------------------------------------------------------------------------------
+# Reading the spec and the files
+# ---------------------------------------------------------------------------------------------
+
+
+def refuse_typed_numbers(node: Any, where: str = "spec") -> None:
+    """Numbers come from files: a list of numbers (or a numeric KPI value) needs ``derived``."""
+    if isinstance(node, dict):
+        if isinstance(node.get("derived"), str) and node["derived"].strip():
+            return
+        for key, value in node.items():
+            if key in ("format", "format2", "format_x", "where"):
+                continue
+            if (
+                key == "value"
+                and isinstance(value, (int, float))
+                and not isinstance(value, bool)
+            ):
+                raise SpecError(
+                    f"{where}.value is a typed number. Point it at a column of a source file, or "
+                    'add "derived": "<how it was computed>" to that block.'
+                )
+            refuse_typed_numbers(value, f"{where}.{key}")
+    elif isinstance(node, list):
+        if any(isinstance(v, (int, float)) and not isinstance(v, bool) for v in node):
+            raise SpecError(
+                f"{where} has typed numbers. Charts read their numbers from files: name a source "
+                'file and columns, or add "derived": "<how it was computed>" to that block.'
+            )
+        for index, value in enumerate(node):
+            refuse_typed_numbers(value, f"{where}[{index}]")
+
+
+def workspace_roots() -> list[Path]:
+    """The person's workspace: ``OMNIGENT_RUNNER_WORKSPACE``, else ``~/workspace`` (if it exists).
+
+    Sources must lie inside it, so every source line cites the person's own file. With no
+    workspace at all (a developer machine) nothing is restricted.
+    """
+    raw = os.environ.get("OMNIGENT_RUNNER_WORKSPACE")
+    candidates = [Path(raw)] if raw else [Path.home() / "workspace"]
+    return [c.resolve() for c in candidates if c.is_dir()]
+
+
+def display_name(path: Path, roots: list[Path], base: Path) -> str:
+    """How a file is cited on the page: relative to the workspace (or the spec), never absolute."""
+    for root in [*roots, base.resolve()]:
+        if path.is_relative_to(root):
+            return path.relative_to(root).as_posix()
+    return path.name
+
+
+class Sources:
+    """Source files, read once each, relative to the spec's folder."""
+
+    def __init__(self, base: Path) -> None:
+        self.base = base
+        self.roots = workspace_roots()
+        self.frames: dict[tuple[str, str | None], Any] = {}
+        self.files: dict[str, dict[str, Any]] = {}
+
+    def locate(self, name: str) -> tuple[Path, str]:
+        """The real file and its cited name; refuses files outside the person's workspace."""
+        path = (self.base / name).expanduser().resolve()
+        if self.roots and not any(path.is_relative_to(root) for root in self.roots):
+            raise SpecError(
+                f"{name} is outside the workspace. Chart the person's own file (under "
+                "your_files/): the page cites it as the source. A weighted average is "
+                '"agg": "mean" with "weight"; a second measure on a combo has its own "agg2".'
+            )
+        if not path.is_file():
+            raise SpecError(f"source file not found: {name}")
+        return path, display_name(path, self.roots, self.base)
+
+    def frame(self, block: dict[str, Any], spec: dict[str, Any]) -> tuple[Any, str]:
+        import pandas as pd
+
+        name = block.get("source") or spec.get("source")
+        if not isinstance(name, str) or not name.strip():
+            raise SpecError(
+                f'"{block_name(block)}" has no "source" file (and the spec has none)'
+            )
+        sheet = block.get("sheet", spec.get("sheet"))
+        path, shown = self.locate(name)
+        key = (shown, sheet)
+        if key not in self.frames:
+            suffix = path.suffix.lower()
+            try:
+                if suffix in (".csv", ".txt"):
+                    df = pd.read_csv(
+                        path, sep=None, engine="python", encoding="utf-8-sig"
+                    )
+                elif suffix == ".tsv":
+                    df = pd.read_csv(path, sep="\t", encoding="utf-8-sig")
+                elif suffix in (".xlsx", ".xlsm", ".xls"):
+                    df = pd.read_excel(
+                        path, sheet_name=sheet if sheet is not None else 0
+                    )
+                elif suffix in (".jsonl", ".ndjson"):
+                    df = pd.read_json(path, lines=True)
+                elif suffix == ".json":
+                    raw = json.loads(path.read_text("utf-8"))
+                    if isinstance(raw, dict):
+                        lists = [v for v in raw.values() if isinstance(v, list)]
+                        raw = lists[0] if len(lists) == 1 else raw
+                    df = pd.DataFrame(raw)
+                else:
+                    raise SpecError(
+                        f"{name}: read CSV, TSV, XLSX, JSON or JSON Lines files"
+                    )
+            except SpecError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise SpecError(f"could not read {name}: {exc}") from exc
+            df.columns = [str(c).strip() for c in df.columns]
+            self.frames[key] = df
+            stat = path.stat()
+            self.files[shown] = {
+                "name": shown,
+                "rows": len(df),
+                "modified": dt.datetime.fromtimestamp(stat.st_mtime).astimezone(),
+            }
+        df = self.frames[key]
+        return filtered(df, spec.get("where"), block.get("where"), shown), shown
+
+
+def block_name(block: dict[str, Any]) -> str:
+    return str(block.get("title") or block.get("label") or "a block")
+
+
+def column(df: Any, name: Any, file: str, role: str) -> str:
+    if not isinstance(name, str) or not name:
+        raise SpecError(f'"{role}" must be a column name from {file}')
+    if name in df.columns:
+        return name
+    folded = {c.lower(): c for c in df.columns}
+    if name.lower() in folded:
+        return folded[name.lower()]
+    raise SpecError(
+        f'{file} has no column "{name}" ({role}). Columns: {", ".join(df.columns)}'
+    )
+
+
+def filtered(df: Any, *filters_and_file: Any) -> Any:
+    *filters, file = filters_and_file
+    for where in filters:
+        if not where:
+            continue
+        if not isinstance(where, dict):
+            raise SpecError('"where" maps column names to a value or a list of values')
+        for name, wanted in where.items():
+            col = column(df, name, file, "where")
+            values = wanted if isinstance(wanted, list) else [wanted]
+            series = df[col]
+            mask = series.isin(values) | series.astype(str).isin(
+                [str(v) for v in values]
+            )
+            df = df[mask]
+    if df.empty:
+        raise SpecError(f"no rows left in {file} after the filter")
+    return df
+
+
+def numeric(df: Any, col: str, file: str) -> Any:
+    import pandas as pd
+
+    series = df[col]
+    if pd.api.types.is_numeric_dtype(series):
+        return series.astype(float)
+    cleaned = series.astype(str).str.replace(r"[,$€£¥%\s]", "", regex=True)
+    values = pd.to_numeric(cleaned.where(series.notna()), errors="coerce")
+    bad = series[
+        series.notna() & values.isna() & (series.astype(str).str.strip() != "")
+    ]
+    if len(bad):
+        sample = ", ".join(repr(v) for v in bad.head(3).tolist())
+        raise SpecError(
+            f'{file} column "{col}" has values that are not numbers ({sample})'
+        )
+    return values
+
+
+def dates(df: Any, col: str, file: str) -> Any:
+    import pandas as pd
+
+    series = df[col]
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series
+    parsed = pd.to_datetime(series.astype(str), errors="coerce", format="mixed")
+    bad = series[series.notna() & parsed.isna()]
+    if len(bad):
+        sample = ", ".join(repr(v) for v in bad.head(3).tolist())
+        raise SpecError(
+            f'{file} column "{col}" has values that are not dates ({sample})'
+        )
+    return parsed
+
+
+def bucket_labels(periods: Any, bucket: str) -> list[str]:
+    """Readable period names: "Jan", "Q1", "Mar 4"; with the year when the range spans years."""
+    periods = list(periods)
+    years = len({p.start_time.year for p in periods}) > 1
+    out = []
+    for p in periods:
+        start = p.start_time
+        if bucket == "year":
+            out.append(f"{start:%Y}")
+        elif bucket == "quarter":
+            out.append(f"Q{p.quarter} {start:%Y}" if years else f"Q{p.quarter}")
+        elif bucket == "month":
+            out.append(f"{start:%b %Y}" if years else f"{start:%b}")
+        else:
+            out.append(f"{start:%b} {start.day}, {start:%Y}" if years else f"{start:%b} {start.day}")
+    return out
+
+
+# A text column already holding months or quarters ("2026-01", "2026-Q1") is read as periods.
+# (Full dates stay categories unless the spec names a bucket.)
+PERIOD_PATTERNS = (("month", r"\d{4}-\d{1,2}"), ("quarter", r"\d{4}-?Q[1-4]"))
+
+
+def inferred_bucket(series: Any) -> str | None:
+    """The bucket a date-like x column implies when the spec names none."""
+    values = series.dropna().astype(str).str.strip()
+    if values.empty:
+        return None
+    for bucket, pattern in PERIOD_PATTERNS:
+        if values.str.fullmatch(pattern, case=False).all():
+            return bucket
+    return None
+
+
+def period_index(series: Any, bucket: str, file: str, col: str) -> Any:
+    """Periods of a date column, also for "2026-Q1"-style quarter text."""
+    import pandas as pd
+
+    if bucket == "quarter" and not pd.api.types.is_datetime64_any_dtype(series):
+        text = series.astype(str).str.strip().str.upper()
+        if text.str.fullmatch(r"\d{4}-?Q[1-4]").all():
+            return pd.PeriodIndex(text.str.replace("-", "", regex=False), freq="Q").to_series(
+                index=series.index
+            )
+    return dates(series.to_frame(col), col, file).dt.to_period(BUCKETS[bucket])
+
+
+# Column-name words shown differently on the page.
+WORDS = {"pct": "%", "percent": "%", "perc": "%", "id": "ID", "avg": "average", "qty": "quantity"}
+
+
+def humanise(name: Any) -> str:
+    """A column name as a reader would write it: "margin_pct" is "Margin %", "orderCount"
+    "Order count". Names already written for people ("Revenue (USD)") are kept."""
+    text = str(name).strip()
+    if not re.fullmatch(r"[a-z0-9_\-\s]+|[a-z]+(?:[A-Z][a-z0-9]*)+", text):
+        return text
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text).lower()
+    words = [WORDS.get(w, w) for w in re.split(r"[_\-\s]+", text) if w]
+    if not words:
+        return str(name)
+    out = " ".join(words)
+    return out[0].upper() + out[1:]
+
+
+# ---------------------------------------------------------------------------------------------
+# Computing
+# ---------------------------------------------------------------------------------------------
+
+
+def clean(value: Any) -> float | int | None:
+    if value is None:
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    if number.is_integer() and abs(number) < 2**53:
+        return int(number)
+    return float(f"{number:.12g}")
+
+
+def agg_name(block: dict[str, Any]) -> str:
+    agg = block.get("agg", "sum")
+    if agg not in AGGS:
+        raise SpecError(f'"{block_name(block)}": agg must be one of {", ".join(AGGS)}')
+    return agg
+
+
+def group_key(df: Any, block: dict[str, Any], file: str) -> tuple[Any, str, str | None]:
+    """The x of every row (a date bucket or a category), a description of it, and its bucket."""
+    x = column(df, block.get("x"), file, "x")
+    given = block.get("bucket")
+    bucket = given or inferred_bucket(df[x])
+    if bucket:
+        if bucket not in BUCKETS:
+            raise SpecError(f"bucket must be one of {', '.join(BUCKETS)}")
+        described = f"{bucket} of {x}" if given and x.lower() != bucket else x
+        return period_index(df[x], bucket, file, x), described, bucket
+    return df[x], x, None
+
+
+def agg_phrase(col: str, agg: str, weight: str | None) -> str:
+    """How one measure was computed, for the source line: "margin_pct averaged (weighted by revenue)"."""
+    weighted = f" (weighted by {weight})" if weight and agg == "mean" else ""
+    return f"{col} {AGGS[agg]}{weighted}"
+
+
+def weight_column(df: Any, block: dict[str, Any], file: str, aggs: list[str]) -> str | None:
+    """The ``weight`` column of a weighted mean, checked."""
+    if block.get("weight") is None:
+        return None
+    if "mean" not in aggs:
+        raise SpecError('"weight" weights a mean: use it with "agg": "mean" (or "agg2": "mean")')
+    return column(df, block.get("weight"), file, "weight")
+
+
+def chart_data(df: Any, block: dict[str, Any], file: str) -> dict[str, Any]:
+    """Labels and series for one chart, computed from the file."""
+    import pandas as pd
+
+    kind = block.get("type", "bar")
+    if kind not in CHART_TYPES:
+        raise SpecError(
+            f'"{block_name(block)}": type must be one of {", ".join(CHART_TYPES)}'
+        )
+    if kind == "scatter":
+        return scatter_data(df, block, file)
+    agg = agg_name(block)
+    ys = block.get("y")
+    ys = [ys] if isinstance(ys, str) else list(ys or [])
+    if not ys and agg != "count":
+        raise SpecError(f'"{block_name(block)}" needs "y": the column(s) to plot')
+    y2 = block.get("y2")
+    if kind == "combo" and not (ys and isinstance(y2, str)):
+        raise SpecError(
+            'a combo chart needs "y" (the bars) and "y2" (the line on the right axis)'
+        )
+    agg2 = agg_name({**block, "agg": block.get("agg2", agg)})
+    split = block.get("split")
+    if split and len(ys) > 1:
+        raise SpecError('"split" works with one "y" column')
+
+    key, x_desc, bucket = group_key(df, block, file)
+    work = pd.DataFrame({"__x": key.values}, index=df.index)
+    value_cols: list[str] = []
+    aggs: dict[str, str] = {}
+    measures = [(y, agg, "y") for y in ys] + ([(y2, agg2, "y2")] if kind == "combo" else [])
+    for y, how, role in measures:
+        col = column(df, y, file, role)
+        work[col] = numeric(df, col, file)
+        value_cols.append(col)
+        aggs[col] = how
+    weight = weight_column(df, block, file, list(aggs.values()))
+    if weight:
+        weights = numeric(df, weight, file)
+        for col, how in aggs.items():
+            if how == "mean":
+                work[f"__w {col}"] = weights.where(work[col].notna())
+                work[f"__wv {col}"] = work[col] * work[f"__w {col}"]
+    if split:
+        split_col = column(df, split, file, "split")
+        work["__s"] = df[split_col].astype(str)
+    work = work[work["__x"].notna()]
+
+    def reduce(frame: Any) -> Any:
+        grouped = frame.groupby(["__x", *(["__s"] if split else [])], sort=False)
+        if not value_cols:
+            return grouped.size().rename("count").to_frame()
+        out = {}
+        for col, how in aggs.items():
+            if how == "count":
+                out[col] = grouped[col].count()
+            elif how == "mean" and weight:
+                out[col] = grouped[f"__wv {col}"].sum() / grouped[f"__w {col}"].sum()
+            else:
+                out[col] = grouped[col].agg(how)
+        return pd.DataFrame(out)
+
+    table = reduce(work)
+    if split:
+        col = value_cols[0] if value_cols else "count"
+        wide = table[col].unstack("__s")
+        order = wide.sum().sort_values(ascending=False).index
+        if len(order) > MAX_SERIES:
+            raise SpecError(
+                f'"{split}" has {len(order)} values; a chart reads with {MAX_SERIES} series at most. '
+                'Filter with "where" or chart fewer groups.'
+            )
+        wide = wide[order]
+        series_names = [str(c) for c in wide.columns]
+        frame = wide
+    else:
+        frame = table
+        series_names = list(frame.columns)
+
+    notes = []
+    if bucket:
+        frame = frame.sort_index()
+        labels = bucket_labels(frame.index, bucket)
+    else:
+        sort = block.get("sort") or (
+            "value" if kind in ("bar", "pie", "doughnut") else "none"
+        )
+        if sort == "value":
+            frame = frame.loc[frame.sum(axis=1).sort_values(ascending=False).index]
+        elif sort == "label":
+            frame = frame.sort_index()
+        elif sort != "none":
+            raise SpecError("sort must be value, label or none")
+        limit = block.get("limit")
+        if limit is None and len(frame) > MAX_CATEGORIES:
+            raise SpecError(
+                f'"{block_name(block)}" has {len(frame)} categories; add "limit" for the top ones'
+            )
+        if isinstance(limit, int) and 0 < limit < len(frame):
+            rest = frame.iloc[limit:]
+            frame = frame.iloc[:limit]
+            additive = all(how in ADDITIVE for how in aggs.values()) if aggs else True
+            if additive and block.get("other", True):
+                frame.loc["Other"] = rest.sum()
+                notes.append(f"top {limit}, the rest as Other")
+            else:
+                notes.append(f"top {limit} shown")
+        labels = [str(v) for v in frame.index]
+
+    names = block.get("names") or {}
+    if not isinstance(names, dict):
+        raise SpecError('"names" maps a column to its label: {"margin_pct": "Margin %"}')
+    line_col = column(df, y2, file, "y2") if kind == "combo" else None
+    datasets = []
+    for name in series_names:
+        values = [clean(v) for v in frame[name].tolist()]
+        # Split values are the data's own words; column names are humanised unless named.
+        label = names.get(str(name)) or (str(name) if split else humanise(name))
+        datasets.append(
+            {
+                "label": str(label),
+                "data": values,
+                **({"kind": "line", "axis": "y2"} if name == line_col else {}),
+            }
+        )
+    if kind in ("pie", "doughnut") and len(datasets) > 1:
+        raise SpecError("a pie or doughnut shows one series: one y column, no split")
+    if value_cols:
+        phrases = [agg_phrase(col, how, weight) for col, how in aggs.items()]
+        if len(set(aggs.values())) == 1 and not (weight and agg == "mean"):
+            phrases = [f"{', '.join(value_cols)} {AGGS[agg]}"]
+        measured = " and ".join(phrases)
+    else:
+        measured = "rows counted"
+    describe = f"{measured} by {x_desc}" + (f" and {split}" if split else "")
+    if notes:
+        describe += f" ({'; '.join(notes)})"
+    return {"labels": labels, "datasets": datasets, "describe": describe}
+
+
+def scatter_data(df: Any, block: dict[str, Any], file: str) -> dict[str, Any]:
+    x = column(df, block.get("x"), file, "x")
+    y = block.get("y")
+    if not isinstance(y, str):
+        raise SpecError('a scatter chart needs one "y" column')
+    y = column(df, y, file, "y")
+    xs, ys = numeric(df, x, file), numeric(df, y, file)
+    split = block.get("split")
+    groups = [("", df.index)]
+    if split:
+        split_col = column(df, split, file, "split")
+        groups = list(df.groupby(df[split_col].astype(str)).groups.items())
+        if len(groups) > MAX_SERIES:
+            raise SpecError(
+                f'"{split}" has {len(groups)} values; use {MAX_SERIES} at most'
+            )
+    datasets = []
+    for name, index in groups:
+        points = [
+            {"x": clean(a), "y": clean(b)}
+            for a, b in zip(xs.loc[index], ys.loc[index], strict=True)
+            if clean(a) is not None and clean(b) is not None
+        ]
+        if len(points) > MAX_SCATTER_POINTS:
+            raise SpecError(
+                f"a scatter chart draws {MAX_SCATTER_POINTS} points at most"
+            )
+        datasets.append({"label": name or humanise(y), "data": points})
+    return {
+        "labels": [],
+        "datasets": datasets,
+        "describe": f"{y} against {x}, one point per row"
+        + (f", by {split}" if split else ""),
+        "xTitle": humanise(x),
+        "yTitle": humanise(y),
+    }
+
+
+def literal_chart(block: dict[str, Any]) -> dict[str, Any]:
+    """A chart whose numbers were computed elsewhere and typed in, with how they were derived."""
+    data = block.get("data") or {}
+    labels = [str(v) for v in data.get("labels", [])]
+    series = data.get("series") or {}
+    if not labels or not isinstance(series, dict) or not series:
+        raise SpecError('"data" needs "labels" and "series": {"name": [numbers]}')
+    datasets = []
+    for name, values in series.items():
+        if len(values) != len(labels):
+            raise SpecError(
+                f'series "{name}" has {len(values)} values for {len(labels)} labels'
+            )
+        datasets.append({"label": str(name), "data": [clean(v) for v in values]})
+    return {
+        "labels": labels,
+        "datasets": datasets,
+        "describe": block["derived"].strip(),
+    }
+
+
+def kpi_data(df: Any, block: dict[str, Any], file: str) -> dict[str, Any]:
+    agg = agg_name(block)
+    value_col = block.get("value")
+    if value_col is None and agg != "count":
+        raise SpecError(f'KPI "{block_name(block)}" needs "value": a column name')
+    col = column(df, value_col, file, "value") if value_col is not None else None
+    values = numeric(df, col, file) if col else None
+    weight = weight_column(df, block, file, [agg])
+    weights = numeric(df, weight, file).where(values.notna()) if weight else None
+
+    def reduce(frame_index: Any) -> float | None:
+        if col is None:
+            return float(len(frame_index))
+        part = values.loc[frame_index]
+        if agg == "count":
+            return float(part.count())
+        if weights is not None:
+            w = weights.loc[frame_index]
+            total = w.sum()
+            return (part * w).sum() / total if total else None
+        result = getattr(part, agg)()
+        return (
+            None
+            if result is None or (isinstance(result, float) and math.isnan(result))
+            else result
+        )
+
+    out: dict[str, Any] = {"label": str(block.get("label") or humanise(col or "rows"))}
+    measured = agg_phrase(col, agg, weight) if col else "rows counted"
+    date_col = block.get("date")
+    if not date_col:
+        out["value"] = clean(reduce(df.index))
+        out["describe"] = f"{measured}, all rows"
+        return out
+    bucket = block.get("bucket", "month")
+    if bucket not in BUCKETS:
+        raise SpecError(f"bucket must be one of {', '.join(BUCKETS)}")
+    date = column(df, date_col, file, "date")
+    periods = period_index(df[date], bucket, file, date)
+    groups = sorted(df.groupby(periods).groups.items())
+    if not groups:
+        raise SpecError(f'KPI "{block_name(block)}": no dates in {date}')
+    series = [clean(reduce(index)) for _, index in groups]
+    names = bucket_labels([p for p, _ in groups], bucket)
+    out.update(
+        value=series[-1], period=names[-1], labels=names[-24:], values=series[-24:]
+    )
+    if len(series) > 1 and series[-2] not in (None, 0) and series[-1] is not None:
+        out["change"] = (series[-1] - series[-2]) / abs(series[-2])
+        out["previous"] = names[-2]
+    of = f" of {date}" if date.lower() != bucket else ""
+    out["describe"] = f"{measured}, latest {bucket}{of}"
+    return out
+
+
+def compute(spec: dict[str, Any], base: Path) -> tuple[list[dict], list[dict], Sources]:
+    if not isinstance(spec, dict):
+        raise SpecError("the spec is a JSON object")
+    refuse_typed_numbers(spec)
+    sources = Sources(base)
+    kpis = []
+    for index, block in enumerate(spec.get("kpis") or []):
+        if isinstance(block.get("derived"), str) and block["derived"].strip():
+            kpi = {
+                "label": str(block.get("label") or ""),
+                "value": clean(block.get("value")),
+                "describe": block["derived"].strip(),
+            }
+        else:
+            df, file = sources.frame(block, spec)
+            kpi = kpi_data(df, block, file)
+            kpi["file"] = file
+        kpi.update(
+            id=f"k{index + 1}",
+            format=block.get("format") or {},
+            good=block.get("good", "up"),
+        )
+        kpis.append(kpi)
+    charts = []
+    blocks = spec.get("charts") or []
+    if not blocks and not kpis:
+        raise SpecError('the spec needs "charts" or "kpis"')
+    for index, block in enumerate(blocks):
+        if not isinstance(block, dict):
+            raise SpecError("each chart is a JSON object")
+        if "data" in block:
+            if not (isinstance(block.get("derived"), str) and block["derived"].strip()):
+                raise SpecError(
+                    f'"{block_name(block)}" types its data. Name a source file and columns, or '
+                    'add "derived": "<how it was computed>".'
+                )
+            computed = literal_chart(block)
+        else:
+            df, file = sources.frame(block, spec)
+            computed = chart_data(df, block, file)
+            computed["file"] = file
+        kind = block.get("type", "bar")
+        chart = {
+            "id": f"c{index + 1}",
+            "type": kind,
+            "title": str(block.get("title") or ""),
+            "note": str(block.get("note") or ""),
+            "wide": bool(block.get("wide")),
+            "stacked": bool(block.get("stacked")),
+            "horizontal": bool(block.get("horizontal")) and kind == "bar",
+            "format": block.get("format") or {},
+            "format2": block.get("format2") or {},
+            "formatX": block.get("format_x") or {},
+            "height": block.get("height"),
+            **computed,
+        }
+        charts.append(chart)
+    return kpis, charts, sources
+
+
+# ---------------------------------------------------------------------------------------------
+# Formatting and the page
+# ---------------------------------------------------------------------------------------------
+
+
+def format_value(value: float | int | None, fmt: dict[str, Any] | None) -> str:
+    """The template's JavaScript ``format`` in Python: one number, the same rules."""
+    if value is None:
+        return "–"
+    fmt = fmt or {}
+    v = float(value) * (100 if fmt.get("percent") else 1)
+    unit = ""
+    digits = fmt.get("decimals")
+    if fmt.get("compact"):
+        for size, letter in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+            if abs(v) >= size:
+                v, unit = v / size, letter
+                break
+        if unit and digits is None:
+            digits = 1 if abs(v) < 100 else 0
+    if digits is None:
+        digits = (2 if abs(v) < 10 else 1) if v % 1 else 0
+    text = f"{abs(v):,.{digits}f}"
+    if unit and "." in text:
+        text = text.rstrip("0").rstrip(".")
+    sign = "-" if v < 0 and float(text.replace(",", "") or 0) != 0 else ""
+    return f"{sign}{fmt.get('prefix', '')}{text}{unit}{'%' if fmt.get('percent') else ''}{fmt.get('suffix', '')}"
+
+
+def esc(text: Any) -> str:
+    return html.escape(str(text), quote=True)
+
+
+def kpi_html(kpi: dict[str, Any]) -> str:
+    period = (
+        f' <span class="period">· {esc(kpi["period"])}</span>'
+        if kpi.get("period")
+        else ""
+    )
+    parts = [
+        f'    <article class="card kpi" id="{kpi["id"]}" title="{esc(source_text(kpi))}">',
+        f'      <p class="label">{esc(kpi["label"])}{period}</p>',
+        f'      <p class="value">{esc(format_value(kpi["value"], kpi["format"]))}</p>',
+    ]
+    change = kpi.get("change")
+    if change is not None:
+        up = change >= 0
+        good = up if kpi.get("good", "up") != "down" else not up
+        arrow = "▲" if up else "▼"
+        parts.append(
+            f'      <p class="change"><b class="{"up" if good else "down"}">{arrow} '
+            f"{abs(change) * 100:.1f}%</b> vs {esc(kpi['previous'])}</p>"
+        )
+    if kpi.get("values") and len(kpi["values"]) > 1:
+        parts.append(
+            f'      <div class="spark"><canvas id="{kpi["id"]}-spark" aria-hidden="true"></canvas></div>'
+        )
+    parts.append("    </article>")
+    return "\n".join(parts)
+
+
+def source_text(block: dict[str, Any]) -> str:
+    if block.get("file"):
+        return f"Source: {block['file']}, {block['describe']}"
+    return f"Derived: {block['describe']}"
+
+
+def table_html(chart: dict[str, Any]) -> str:
+    if chart["type"] == "scatter":
+        head = [chart.get("xTitle", "x"), chart.get("yTitle", "y")] + (
+            ["Series"] if len(chart["datasets"]) > 1 else []
+        )
+        rows = []
+        for d in chart["datasets"]:
+            for p in d["data"]:
+                rows.append(
+                    [
+                        format_value(p["x"], chart["formatX"]),
+                        format_value(p["y"], chart["format"]),
+                    ]
+                    + ([d["label"]] if len(chart["datasets"]) > 1 else [])
+                )
+    else:
+        head = [""] + [d["label"] for d in chart["datasets"]]
+        rows = []
+        for i, label in enumerate(chart["labels"]):
+            row = [label]
+            for d in chart["datasets"]:
+                fmt = chart["format2"] if d.get("axis") == "y2" else chart["format"]
+                row.append(format_value(d["data"][i], fmt))
+            rows.append(row)
+    shown = rows[:TABLE_ROWS]
+    body = "".join(
+        "<tr>" + "".join(f"<td>{esc(c)}</td>" for c in r) + "</tr>" for r in shown
+    )
+    more = (
+        f'<tr><td colspan="{len(head)}">{len(rows) - len(shown):,} more rows</td></tr>'
+        if len(rows) > len(shown)
+        else ""
+    )
+    return (
+        "<table><thead><tr>"
+        + "".join(f"<th>{esc(h)}</th>" for h in head)
+        + f"</tr></thead><tbody>{body}{more}</tbody></table>"
+    )
+
+
+def chart_html(chart: dict[str, Any]) -> str:
+    height = int(chart.get("height") or (320 if chart["wide"] else 260))
+    if chart["horizontal"]:
+        height = max(height, min(28 * len(chart["labels"]) + 40, 640))
+    label = esc(f"{chart['title']}. {source_text(chart)}")
+    note = f'\n      <p class="note">{esc(chart["note"])}</p>' if chart["note"] else ""
+    return (
+        f'    <article class="card chart{" wide" if chart["wide"] else ""}" id="{chart["id"]}">\n'
+        f"      <h2>{esc(chart['title'])}</h2>{note}\n"
+        f'      <div class="plot" style="--h:{height}px"><canvas id="{chart["id"]}-canvas" role="img" aria-label="{label}"></canvas></div>\n'
+        f'      <p class="source">{esc(source_text(chart))}</p>\n'
+        f'      <details class="data"><summary>Data</summary><div class="table">{table_html(chart)}</div></details>\n'
+        "    </article>"
+    )
+
+
+def script_json(value: Any) -> str:
+    """JSON that cannot close the script element it sits in."""
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    return (
+        text.replace("<", "\\u003c")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def render(
+    spec: dict[str, Any], kpis: list[dict], charts: list[dict], sources: Sources
+) -> str:
+    title = str(spec.get("title") or "Dashboard")
+    header = []
+    if spec.get("eyebrow"):
+        header.append(f'    <p class="eyebrow">{esc(spec["eyebrow"])}</p>')
+    header.append(f"    <h1>{esc(title)}</h1>")
+    if spec.get("subtitle"):
+        header.append(f'    <p class="sub">{esc(spec["subtitle"])}</p>')
+    kpi_block = ""
+    if kpis:
+        kpi_block = (
+            '  <section class="kpis" aria-label="Key numbers">\n'
+            + "\n".join(kpi_html(k) for k in kpis)
+            + "\n  </section>"
+        )
+    now = dt.datetime.now().astimezone()
+    files = [
+        f"{esc(f['name'])} ({f['rows']:,} rows, updated {f['modified']:%-d %b %Y %H:%M})"
+        for f in sources.files.values()
+    ]
+    footer = [
+        f"    <p>Generated {now:%-d %b %Y, %H:%M} {esc(now.tzname() or '')} from {', '.join(files) or 'derived numbers'}.</p>"
+    ]
+    data = {
+        "charts": [
+            {
+                k: c[k]
+                for k in (
+                    "id",
+                    "type",
+                    "labels",
+                    "datasets",
+                    "stacked",
+                    "horizontal",
+                    "format",
+                    "format2",
+                    "formatX",
+                )
+            }
+            | {k: c[k] for k in ("xTitle", "yTitle") if k in c}
+            for c in charts
+        ],
+        "kpis": [
+            {"id": k["id"], "labels": k.get("labels"), "values": k.get("values")}
+            for k in kpis
+        ],
+    }
+    fields = {
+        "title": esc(title),
+        "header": "\n".join(header),
+        "kpis": kpi_block,
+        "charts": "\n".join(chart_html(c) for c in charts),
+        "footer": "\n".join(footer),
+        "chartjs": asset("chart.umd.js").read_text("utf-8"),
+        "data": script_json(data),
+    }
+    template = asset("template.html").read_text("utf-8")
+    return re.sub(r"\{\{(\w+)\}\}", lambda m: fields[m.group(1)], template)
+
+
+def output_path(out: str) -> Path:
+    path = Path(out)
+    if not path.name.lower().endswith(SUFFIX):
+        stem = (
+            path.name[: -len(".html")]
+            if path.name.lower().endswith(".html")
+            else path.name
+        )
+        path = path.with_name(stem + SUFFIX)
+    return path
+
+
+def build(spec_path: Path, out: str) -> dict[str, Any]:
+    spec = load_spec(spec_path)
+    kpis, charts, sources = compute(spec, spec_base(spec_path))
+    page = render(spec, kpis, charts, sources)
+    path = output_path(out)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(page, "utf-8")
+    return {
+        "ok": True,
+        "path": str(path),
+        "kpis": len(kpis),
+        "charts": len(charts),
+        "bytes": path.stat().st_size,
+        "sources": list(sources.files),
+    }
+
+
+def spec_base(spec_path: Path) -> Path:
+    """Where the spec's paths start: its folder, or the current one for a spec on stdin."""
+    return Path.cwd() if spec_path == STDIN else spec_path.parent
+
+
+def load_spec(spec_path: Path) -> dict[str, Any]:
+    try:
+        if spec_path == STDIN:
+            return json.loads(sys.stdin.read())
+        return json.loads(spec_path.read_text("utf-8"))
+    except FileNotFoundError as exc:
+        raise SpecError(f"spec not found: {spec_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise SpecError(f"the spec is not valid JSON: {exc}") from exc
+
+
+def data_only(spec_path: Path) -> dict[str, Any]:
+    spec = load_spec(spec_path)
+    kpis, charts, _ = compute(spec, spec_base(spec_path))
+    return {
+        "ok": True,
+        "kpis": [{k: v for k, v in kpi.items() if k != "format"} for kpi in kpis],
+        "charts": [
+            {k: c[k] for k in ("title", "type", "labels", "datasets")}
+            | {"source": source_text(c)}
+            for c in charts
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------------------------
+# PDF: the deck exporter's headless Chromium, printing the page as it is
+# ---------------------------------------------------------------------------------------------
+
+PDF_PAGE_INCHES = (11.0, 8.5)  # Letter landscape
+PDF_VIEWPORT_WIDTH = 966  # px: the printable width (10.06in) at 0.47in margins, so charts print as laid out
+
+
+def export_pdf(html_path: Path, out: Path) -> dict[str, Any]:
+    import base64
+    import importlib.machinery
+    import importlib.util
+    import shutil
+
+    exporter = (
+        os.environ.get("SUPERCHAT_DECK_EXPORT")
+        or shutil.which("superchat-deck-export")
+        or str(HERE / "superchat-deck-export")
+    )
+    loader = importlib.machinery.SourceFileLoader("superchat_deck_export", exporter)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    if not html_path.is_file():
+        raise SpecError(f"not found: {html_path}")
+    with module.Chromium() as browser:
+        browser.set_viewport(PDF_VIEWPORT_WIDTH, 1200)
+        browser.send(
+            "Emulation.setEmulatedMedia",
+            {"features": [{"name": "prefers-color-scheme", "value": "light"}]},
+        )
+        browser.load_document(html_path)
+        browser.wait_for_printable_content()
+        browser.next_frames()
+        pdf = browser.send(
+            "Page.printToPDF",
+            {
+                "printBackground": True,
+                "preferCSSPageSize": False,
+                "paperWidth": PDF_PAGE_INCHES[0],
+                "paperHeight": PDF_PAGE_INCHES[1],
+                "marginTop": 0.47,
+                "marginBottom": 0.47,
+                "marginLeft": 0.47,
+                "marginRight": 0.47,
+                "transferMode": "ReturnAsBase64",
+            },
+            timeout_s=120,
+        )
+    data = pdf.get("data")
+    if not data:
+        raise SpecError("Chromium returned no PDF")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(base64.b64decode(data))
+    return {"ok": True, "path": str(out), "bytes": out.stat().st_size}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="superchat-dashboard",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    b = sub.add_parser(
+        "build", help="compute the spec's numbers and write the dashboard page"
+    )
+    b.add_argument("spec", help="the spec file, or - to read it from stdin")
+    b.add_argument("-o", "--out", required=True, help="the page, NAME.dashboard.html")
+    d = sub.add_parser("data", help="print the computed numbers as JSON")
+    d.add_argument("spec", help="the spec file, or - to read it from stdin")
+    p = sub.add_parser("pdf", help="print a dashboard page to PDF")
+    p.add_argument("html")
+    p.add_argument("-o", "--out", required=True)
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "build":
+            result = build(Path(args.spec), args.out)
+        elif args.command == "data":
+            result = data_only(Path(args.spec))
+        else:
+            result = export_pdf(Path(args.html), Path(args.out))
+    except SpecError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}))
+        return 1
+    except Exception as exc:  # noqa: BLE001 - deck exporter failures carry their own message
+        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
+        return 1
+    print(json.dumps(result, ensure_ascii=False, default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

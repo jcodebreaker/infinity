@@ -1,0 +1,32 @@
+{
+  "name": "@superchat/chat-ui",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    "./web": "./src/markdown.web.tsx"
+  },
+  "scripts": {
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run --root ../../.. web/packages/chat-ui/src"
+  },
+  "dependencies": {
+    "@superchat/contracts": "workspace:*",
+    "@superchat/ui-tokens": "workspace:*",
+    "@superchat/ui-web": "workspace:*",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1"
+  },
+  "peerDependencies": {
+    "react": "19.2.3",
+    "react-dom": "19.2.3"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.7",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11"
+  }
+}

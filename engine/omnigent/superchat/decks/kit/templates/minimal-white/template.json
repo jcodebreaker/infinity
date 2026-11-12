@@ -1,0 +1,35 @@
+{
+  "id": "minimal-white",
+  "name": "Minimal White",
+  "tagline": "Pure type, no ornament",
+  "description": "Pure white, near-black ink, strong type hierarchy and almost no ornament.",
+  "best_for": "internal reviews, one-to-one briefings, serious topics that should not compete with content",
+  "category": "professional",
+  "mode": "light",
+  "upstream": "https://github.com/lewislulu/html-ppt-skill",
+  "source": "nexu-io/open-design design-templates/html-ppt/assets/themes/minimal-white.css@802708f",
+  "license": "MIT (see LICENSE); fonts SIL OFL 1.1 (see ../../fonts/OFL-*.txt)",
+  "fonts": [
+    {
+      "family": "Inter",
+      "weight": 400,
+      "style": "normal",
+      "file": "Inter-400.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Inter",
+      "weight": 600,
+      "style": "normal",
+      "file": "Inter-600.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Inter",
+      "weight": 700,
+      "style": "normal",
+      "file": "Inter-700.ttf",
+      "license": "OFL-inter.txt"
+    }
+  ]
+}

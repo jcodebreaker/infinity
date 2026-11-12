@@ -1,0 +1,167 @@
+name: superchat
+
+# Superchat, the whole stack: Postgres, the engine (API + web + published apps) and the host
+# image the engine starts for each person. Nothing else. From the repo root:
+#
+#   deployment/build.sh                                  # builds superchat/engine and superchat/host
+#   docker compose --env-file .env -f deployment/compose.yaml up -d --wait
+#
+# Paths in this file are relative to deployment/, so the repo root is "..". Values come from .env
+# at the repo root (.env.docker.example lists them). Volume names match the previous stack, so
+# existing local data is kept.
+
+x-proxy-env: &proxy-env
+  HTTP_PROXY: ${HTTP_PROXY:-${http_proxy:-}}
+  HTTPS_PROXY: ${HTTPS_PROXY:-${https_proxy:-}}
+  NO_PROXY: ${NO_PROXY:-${no_proxy:-}}
+  http_proxy: ${http_proxy:-${HTTP_PROXY:-}}
+  https_proxy: ${https_proxy:-${HTTPS_PROXY:-}}
+  no_proxy: ${no_proxy:-${NO_PROXY:-}}
+
+services:
+  # One database with an `engine` schema, created on first init.
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-omnigent}
+      POSTGRES_USER: ${POSTGRES_USER:-omnigent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/schemas.sql:/docker-entrypoint-initdb.d/schemas.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-omnigent} -d ${POSTGRES_DB:-omnigent}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # The engine. Each host's runner dials it back at ENGINE_PUBLIC_URL, so it is published on
+  # the host as well as serving the web.
+  engine:
+    image: ${IMAGE_REGISTRY:-superchat}/engine:${IMAGE_TAG:-local}
+    build:
+      context: ..
+      dockerfile: deployment/engine.Dockerfile
+      args:
+        - NODE_IMAGE
+        - PYTHON_IMAGE
+        - PYPI_INDEX_URL
+        - NPM_CONFIG_REGISTRY
+        - TORCH_INDEX_URL
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *proxy-env
+      DATABASE_URL: postgres://${POSTGRES_USER:-omnigent}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-omnigent}?options=-csearch_path%3Dengine
+      ENGINE_PUBLIC_URL: ${ENGINE_PUBLIC_URL:-http://host.docker.internal:${SUPERCHAT_ENGINE_PORT:-8012}}
+      # Identity: the engine trusts an identity header only alongside this secret, so a sign-in
+      # broker in front of it can name the person. With OMNIGENT_LOCAL_SINGLE_USER on, a request
+      # with no identity header is the one local person; turn it off behind a broker.
+      OMNIGENT_AUTH_PROVIDER: header
+      OMNIGENT_LOCAL_SINGLE_USER: ${OMNIGENT_LOCAL_SINGLE_USER:-1}
+      OMNIGENT_AUTH_HEADER_SECRET: ${OMNIGENT_PROXY_SECRET:?Set OMNIGENT_PROXY_SECRET in .env}
+      OMNIGENT_VAULT_KEY: ${OMNIGENT_VAULT_KEY:?Set OMNIGENT_VAULT_KEY in .env}
+      # Each person's host: a container from the image below, home on its own volume.
+      OMNIGENT_HOST_PROVIDER: docker
+      OMNIGENT_HOST_IMAGE: ${IMAGE_REGISTRY:-superchat}/host:${IMAGE_TAG:-local}
+      OMNIGENT_HOST_MEMORY: ${HOST_MEMORY:-2g}
+      OMNIGENT_HOST_CPUS: ${HOST_CPUS:-2}
+      OMNIGENT_HOST_PIDS_LIMIT: ${HOST_PIDS_LIMIT:-2048}
+      # Hosts are named <project>-host-<key>, so a second project never takes this one's hosts.
+      OMNIGENT_HOST_NAME_PREFIX: ${COMPOSE_PROJECT_NAME:-superchat}
+      # The harness a new conversation runs on; each person can switch in Settings > Models.
+      OMNIGENT_SUPERCHAT_DEFAULT_AGENT: ${SUPERCHAT_DEFAULT_AGENT:-superchat-claude}
+      # Model access: a key, or both LiteLLM values to route every model call through a proxy.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      LITELLM_BASE_URL: ${LITELLM_BASE_URL:-}
+      LITELLM_API_KEY: ${LITELLM_API_KEY:-}
+      # Optional: artifacts in S3/R2 instead of the /data volume.
+      OMNIGENT_ARTIFACT_URI: ${OMNIGENT_ARTIFACT_URI:-}
+      # Harness prompt cache kept 1 hour instead of 5 minutes (pi and Claude Code); 0 turns it off.
+      OMNIGENT_PROMPT_CACHE_1H: ${PROMPT_CACHE_1H:-1}
+      # Context fold and handoffs (docs/context.md, "Rollover"); empty keeps the code defaults.
+      # Settled-turn lines (tokens) past which the engine folds; default 2000.
+      OMNIGENT_FOLD_TURN_LINES_TOKENS: ${FOLD_TURN_LINES_TOKENS:-}
+      # Dev only, off when empty: a folder INSIDE each host where every model call is traced
+      # (engine/scripts/llm_trace.py reads it), e.g. /home/superchat/.omnigent/llm-trace.
+      OMNIGENT_LLM_TRACE_DIR: ${OMNIGENT_LLM_TRACE_DIR:-}
+      # Dev only, off when empty: a folder INSIDE the engine where each Round view sent to the web
+      # is logged (engine/scripts/ux_log.py reads it), e.g. /data/ux-log.
+      OMNIGENT_UX_LOG_DIR: ${OMNIGENT_UX_LOG_DIR:-}
+      # Dev only, off when empty: a markdown file INSIDE the engine standing in for the owner's
+      # inbox (ADR 0039; format in engine/omnigent/superchat/mail/__init__.py, example in
+      # deployment/dev/mailbox.example.md), e.g. /data/dev/mailbox.md. Never a production provider.
+      OMNIGENT_DEV_MAILBOX: ${OMNIGENT_DEV_MAILBOX:-}
+      # Dev only: seconds between mail polls instead of 10 / 60 minutes (in / outside hours).
+      OMNIGENT_MAIL_POLL_SECONDS: ${OMNIGENT_MAIL_POLL_SECONDS:-}
+      # Optional traces (ADR 0041), off when empty. With the "observability" profile:
+      # OTEL_EXPORTER_OTLP_ENDPOINT=http://host.docker.internal:6006, protocol http/protobuf,
+      # metrics and logs none (Phoenix takes traces only). The same names reach each host's
+      # runner through runner_env. Telemetry turns on with the endpoint, and only then.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OMNIGENT_TELEMETRY_ENABLED: ${OTEL_EXPORTER_OTLP_ENDPOINT:+true}
+      OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-}
+      OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-}
+      OTEL_LOGS_EXPORTER: ${OTEL_LOGS_EXPORTER:-}
+      # Dev and admin only: prompts and answers on spans.
+      OMNIGENT_OTEL_CAPTURE_CONTENT: ${OMNIGENT_OTEL_CAPTURE_CONTENT:-}
+      # Eval persons (ADR 0043, docs/evals.md): this address names the eval domain, and runs play
+      # as eval+<run>@<that domain>.
+      SUPERCHAT_EVAL_EMAIL: ${SUPERCHAT_EVAL_EMAIL:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${SUPERCHAT_ENGINE_BIND:-127.0.0.1}:${SUPERCHAT_ENGINE_PORT:-8012}:8000"
+      - "127.0.0.1:${SUPERCHAT_WEB_PORT:-5173}:8000"
+    volumes:
+      - artifact-data:/data
+      # The engine starts each person's host over this socket. Never mounted into a host.
+      - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  # Build-only: the host image. Under the "build" profile so `up` never starts one; the engine
+  # starts them, one per person.
+  host:
+    image: ${IMAGE_REGISTRY:-superchat}/host:${IMAGE_TAG:-local}
+    profiles: ["build"]
+    build:
+      context: ..
+      dockerfile: deployment/host.Dockerfile
+      args:
+        - UBUNTU_IMAGE
+        - NODE_IMAGE
+        - CHROMIUM_IMAGE
+        - PYPI_INDEX_URL
+        - NPM_CONFIG_REGISTRY
+    command: ["true"]
+    restart: "no"
+
+  # Optional trace viewer (ADR 0041), and the traces an eval service reads (docs/evals.md).
+  # Under the "observability" profile, so a plain `up` never starts it. Keeps its data in its own
+  # schema on the stack's Postgres. Published on loopback only; auth stays off for this local dev use.
+  phoenix:
+    image: arizephoenix/phoenix:21.0.0
+    profiles: ["observability"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PHOENIX_SQL_DATABASE_URL: postgresql://${POSTGRES_USER:-omnigent}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-omnigent}
+      PHOENIX_SQL_DATABASE_SCHEMA: phoenix
+      PHOENIX_ENABLE_AUTH: "false"
+    ports:
+      - "127.0.0.1:${PHOENIX_PORT:-6006}:6006"
+
+volumes:
+  postgres-data:
+  artifact-data:

@@ -1,0 +1,314 @@
+/* Interactive card for GFM markdown tables (sc-table-*). `.sc-table-box` is
+   the shared scope for internal styles — it sits on the inline card and on
+   the portaled dialog, so cell/scroll rules reach both. */
+
+.sc-table-head {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.15em;
+  padding: 0.3em 0.45em;
+}
+
+.sc-table-tool {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 1.7em;
+  height: 1.7em;
+  border: 0;
+  border-radius: 0.45em;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  padding: 0;
+}
+
+.sc-table-tool:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.sc-table-tool:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--foreground);
+}
+
+/* Chrome is not table text: row numbers, the toolbar strip, the pager range,
+   and the empty state must stay out of text selections so a dragged excerpt
+   still matches the message's rendered text for quoting. */
+.sc-table-head,
+.sc-table-gutter,
+.sc-table-footer,
+.sc-table-empty {
+  user-select: none;
+}
+
+.sc-table-scroll {
+  overflow: auto;
+  max-height: 20em;
+}
+
+.sc-table td {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.92em;
+  color: var(--foreground);
+}
+
+.sc-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--muted);
+  font-weight: 600;
+  text-align: left;
+}
+
+.sc-table-sort {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6em;
+}
+
+button.sc-table-sort {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  padding: 0;
+  cursor: pointer;
+  text-align: inherit;
+}
+
+.sc-table-sort-trigger {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  cursor: pointer;
+}
+
+.sc-table-sort-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sc-table-sort-icon {
+  display: inline-flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  line-height: 0;
+}
+
+.sc-table-empty {
+  text-align: center;
+  color: var(--muted-foreground);
+  padding: 1em;
+}
+
+.sc-table-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.4em;
+  border-top: 1px solid var(--border);
+  padding: 0.2em 0.5em;
+  font-size: 0.8em;
+  color: var(--muted-foreground);
+}
+
+.sc-table-cell-text {
+  display: block;
+  max-width: 60ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sc-table .sc-align-right {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.sc-table .sc-align-center {
+  text-align: center;
+}
+
+.sc-table-box .sc-table .sc-table-gutter {
+  width: 2.2em;
+  min-width: 2.2em;
+  text-align: center;
+  color: var(--muted-foreground);
+  background: var(--muted);
+  border-inline-end: 1px solid var(--border);
+  font-size: 0.85em;
+  padding-left: 0.3em;
+  padding-right: 0.3em;
+}
+
+.sc-align-right .sc-table-sort {
+  flex-direction: row-reverse;
+}
+
+/* Bubbles use dir="auto", not dir="rtl" — :dir() matches the resolved
+   direction so RTL content actually triggers the flip. */
+.sc-align-right .sc-table-sort:dir(rtl) {
+  flex-direction: row;
+}
+
+.sc-table-sort-icon .sc-sort-off {
+  color: var(--muted-foreground);
+  opacity: 0.45;
+}
+
+.sc-table-sort-icon .sc-sort-on {
+  color: var(--foreground);
+}
+
+.sc-table-footer .sc-table-range {
+  margin-inline-end: auto;
+}
+
+.sc-chat-markdown .sc-table-card {
+  position: relative;
+  margin: 0.65em 0;
+  border: 1px solid var(--border);
+  border-radius: 0.75em;
+  background: var(--card);
+  overflow: hidden;
+}
+
+/* Inline card: reserved static strip so tools never overlay sortable headers.
+   Tools fade in on hover/focus; the dialog head stays always-visible. */
+.sc-table-card > .sc-table-head {
+  position: static;
+  padding: 0.3em 0.45em;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+}
+
+.sc-table-card > .sc-table-head .sc-table-tool {
+  opacity: 0;
+}
+
+.sc-table-dialog .sc-table-head {
+  padding: 0.45em 0.7em;
+  border-bottom: 1px solid var(--border);
+}
+
+.sc-table-box .sc-table {
+  display: table;
+  width: max-content;
+  min-width: 100%;
+  /* Cancel the legacy .sc-chat-markdown table clamp so wide tables overflow
+     into .sc-table-scroll instead of scrolling the <table> element itself. */
+  max-width: none;
+  overflow: visible;
+  margin: 0;
+  border-collapse: collapse;
+  font-size: 0.85em;
+}
+
+.sc-table-box .sc-table th,
+.sc-table-box .sc-table td {
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  padding: 0.35em 0.75em;
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
+.sc-table-card:hover > .sc-table-head .sc-table-tool,
+.sc-table-card:focus-within > .sc-table-head .sc-table-tool {
+  opacity: 1;
+}
+
+@media (hover: none), (pointer: coarse) {
+  .sc-table-tool {
+    width: 44px;
+    height: 44px;
+  }
+
+  button.sc-table-sort,
+  .sc-table-sort-trigger {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .sc-table-card > .sc-table-head .sc-table-tool {
+    opacity: 1;
+  }
+}
+
+/* DialogContent's default text-sm shrinks cells below the card's; the dialog
+   is the expanded view, so it tracks the document base size instead. */
+.sc-table-dialog {
+  display: flex;
+  flex-direction: column;
+  font-size: 1rem;
+  min-width: min(32rem, 94vw);
+  max-width: 94vw;
+  max-height: 90vh;
+  gap: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 0.9em;
+  background: var(--popover);
+  color: var(--popover-foreground);
+  box-shadow: 0 8px 30px var(--overlay);
+  overflow: hidden;
+}
+
+.sc-table-dialog-title {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.sc-table-dialog .sc-table th,
+.sc-table-dialog .sc-table td,
+.sc-table-dialog .sc-table-cell-text {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.sc-table-dialog .sc-table-cell-text {
+  max-width: min(60ch, 76vw);
+  overflow: visible;
+  text-overflow: clip;
+}
+
+.sc-table-box .sc-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.sc-table-dialog-scroll {
+  max-height: none;
+  flex: 1;
+  min-height: 0;
+}
+
+.sc-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

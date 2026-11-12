@@ -1,0 +1,5 @@
+# Recorded Round streams
+One Round event per line, in the vocabulary of `omnigent/superchat/rounds/fold.py`, with `t` in seconds from the start of the recording. `tests/superchat/test_rounds.py` folds every cut of each stream.
+- `claude_A_normal.jsonl` and `pi_A_normal.jsonl`: "Make a 5-slide deck about Uruguay." A Helper builds the deck, its result wakes the Assistant, and the Assistant hands it back.
+- `claude_B_stop.jsonl` and `pi_B_stop.jsonl`: the same ask, Stop 8 s after the Helper starts, then "Did it finish?".
+Recorded on 2026-10-18 by a validation script driving the engine's Claude and pi executors against a live model, teeing executor events and tool checkpoints; absolute paths were replaced with `/workspace`. The recordings used an earlier vocabulary and were rewritten into this one mechanically: `request` became `round`, the actor `super` became `assistant`, the Helper's events got its id `h1`, each tool call got a call id, a tool result kept only whether it worked, and the facts its result carried became their own events (an `artifact_save` result a `file.saved`, a `suggest_follow_ups` result `chips`).

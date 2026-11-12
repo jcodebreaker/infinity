@@ -1,0 +1,57 @@
+# STAGE B (bring-your-own key) Omnigent server config for the Superchat engine. To switch a
+# deployment to it, set ENGINE_CONFIG_TEMPLATE=/opt/bundle/engine/config.byok.yaml.tmpl and
+# OMNIGENT_SUPERCHAT_DEFAULT_AGENT=superchat-pi.
+# Omnigent server config for the Superchat engine. NON-SECRET: start.sh renders
+# __ENGINE_PUBLIC_URL__ from the ENGINE_PUBLIC_URL variable; ${...} is expanded by the engine.
+#
+# No model is named here. Each person's model picker lists what their saved key serves (or the
+# organization's); an admin picks the default, fast and strong models in Settings > Models.
+# Background work (memory upkeep, summaries) runs on the fast model with the owner's key.
+hosts:
+  provider: docker
+  # Where the runner inside each host dials back: this service's PUBLIC https URL.
+  server_url: __ENGINE_PUBLIC_URL__
+  # NAMES only. Resolved from this service's environment and handed to each host's runner.
+  # No model key here: the agent can run shell commands in its host, so a key in its env is
+  # readable. Model calls go through the engine's model proxy with the PERSON's own saved key
+  # (host_config below). Self-hosting with one operator key for everyone: in host_config, replace
+  # the `byok` provider with the `operator` block, and add ANTHROPIC_API_KEY back to this list.
+  runner_env:
+    - OMNIGENT_BROWSER_BACKEND
+    - OMNIGENT_SUBAGENT_MAX_CONCURRENT
+    - OMNIGENT_LLM_TRACE_DIR
+    - OMNIGENT_PROMPT_CACHE_1H
+    - OTEL_EXPORTER_OTLP_ENDPOINT
+    - OMNIGENT_TELEMETRY_ENABLED
+    - OTEL_EXPORTER_OTLP_PROTOCOL
+    - OTEL_METRICS_EXPORTER
+    - OTEL_LOGS_EXPORTER
+    - OMNIGENT_OTEL_CAPTURE_CONTENT
+  host_config:
+    providers:
+      # Bring-your-own key: base_url + auth are filled per person at session start (a person
+      # without a saved key gets `model_key_required`), and the model list is read from the
+      # provider with that key.
+      byok:
+        kind: gateway
+        connection: model
+        anthropic:
+          # Model limits pi is told (it otherwise assumes 128k context / 16k output).
+          context_window: 1000000
+          max_output_tokens: 32000
+      # Operator key for everyone (self-hosting). Unused unless a binding below selects it, and
+      # needs ANTHROPIC_API_KEY in runner_env above.
+      # operator:
+      #   kind: gateway
+      #   anthropic:
+      #     base_url: https://api.anthropic.com
+      #     api_key_ref: env:ANTHROPIC_API_KEY
+    inference:
+      harnesses:
+        claude-sdk:
+          provider: byok          # operator-key self-hosting: provider: operator
+        # pi is the hosted default Muse harness (OMNIGENT_SUPERCHAT_DEFAULT_AGENT=superchat-pi). With an
+        # Anthropic key it speaks Anthropic Messages through /v1/model/anthropic; with an
+        # OpenRouter key it speaks Chat Completions through /v1/model/openrouter/v1.
+        pi:
+          provider: byok

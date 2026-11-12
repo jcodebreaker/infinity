@@ -1,0 +1,140 @@
+{
+  "id": "offsite",
+  "title": "Team offsite: facts that change over the conversation",
+  "note": "must: every regex must match the reply (case-insensitive). must_not: a match fails the probe unless its 'unless' regex matches in the rest of its sentence, before or after it (e.g. 'was CAD 18,500', 'because the week of March 9 clashes'). Task checks read the task reply plus its tool-call arguments (a file it wrote). {file}, {version} and {option2} are filled at probe time: any saved file's id prefix, name or title, any saved version, and the second option named in turn 3's reply; a check whose slot is unknown is reported as unchecked.",
+  "turns": [
+    "I'm planning a team offsite for my analytics team. 14 people. Budget is CAD 18,500 all-in. One person, Priya, uses a wheelchair, so every venue must be step-free.",
+    "Dates: we're thinking the week of March 9.",
+    "Draft me a short page listing three venue options within two hours of Toronto.",
+    "Drop the second option. The owner told me their elevator is out until April.",
+    "Actually move the dates to the week of March 23. March 9 clashes with quarter close.",
+    "Dinner on night one needs to work for two vegans.",
+    "Unrelated: suggest a name for our team Slack channel.",
+    "Finance approved more: the budget is now CAD 21,000.",
+    "Update the page with the new dates and budget.",
+    "Unrelated: what's a quick way to explain p-values to a non-technical manager? Two sentences.",
+    "Unrelated: give me three icebreaker questions.",
+    "Unrelated: what's a good structure for a 30-minute retro?",
+    "Unrelated: one tip for running a hybrid meeting."
+  ],
+  "chain": [
+    3,
+    6,
+    9,
+    11,
+    13
+  ],
+  "probes": [
+    {
+      "id": "P1",
+      "question": "How many people are coming, and what can we spend?",
+      "task": "Give me a per-person budget.",
+      "truth": "14 people; CAD 21,000 all-in (raised from 18,500).",
+      "must": [
+        "14",
+        "21[, ]?000"
+      ],
+      "must_not": [
+        {
+          "re": "18[, ]?500",
+          "unless": "\\b(old|earlier|previous|was|up from|from|moved|because|clash|clashes|instead of|not|no longer)\\b"
+        }
+      ],
+      "task_must": [],
+      "task_must_not": []
+    },
+    {
+      "id": "P2",
+      "question": "When is it, and why then?",
+      "task": null,
+      "truth": "The week of March 23; moved from March 9 because March 9 clashes with quarter close.",
+      "must": [
+        "March 23|23 March|Mar 23",
+        "quarter close"
+      ],
+      "must_not": [
+        {
+          "re": "(week of )?March 9",
+          "unless": "\\b(old|earlier|previous|was|up from|from|moved|because|clash|clashes|instead of|not|no longer)\\b"
+        }
+      ]
+    },
+    {
+      "id": "P3",
+      "question": "Remind me of every hard requirement I gave you for the venues.",
+      "task": null,
+      "truth": "Step-free for Priya, who uses a wheelchair; 14 people; within two hours of Toronto; CAD 21,000 all-in; dinner on night one works for two vegans.",
+      "must": [
+        "step-free|wheelchair|accessib"
+      ],
+      "must_not": []
+    },
+    {
+      "id": "P4",
+      "question": "Which venues did we rule out, and why?",
+      "task": null,
+      "truth": "The second option of the three, because its elevator is out until April.",
+      "must": [
+        "elevator"
+      ],
+      "must_not": []
+    },
+    {
+      "id": "P5",
+      "question": "Tell me everything you know about the attendees.",
+      "task": null,
+      "truth": "14 people on the analytics team; Priya uses a wheelchair; two are vegan.",
+      "must": [
+        "14",
+        "Priya",
+        "vegan"
+      ],
+      "must_not": []
+    },
+    {
+      "id": "P6",
+      "question": "Did I tell you which city the team is flying in from?",
+      "task": null,
+      "truth": "No. Only that venues must be within two hours of Toronto.",
+      "must": [
+        "\\b(no|didn't|did not|haven't|not mention)\\b"
+      ],
+      "must_not": [
+        {
+          "re": "(flying|fly|flights?) in from (Toronto|Montreal|Vancouver|Calgary|Ottawa)",
+          "unless": "\\b(not|n't|no|never|whether|if|didn't|did not)\\b"
+        }
+      ]
+    },
+    {
+      "id": "P7",
+      "question": "Which file are we working on, which version is it, and what changed last?",
+      "task": "Write the invitation email to the team.",
+      "truth": "The venue page; its newest version; the last change set the dates to the week of March 23 and the budget to CAD 21,000.",
+      "must": [
+        "{file}",
+        "\\bv(?:ersion)?\\W{0,4}{version}\\b"
+      ],
+      "must_not": [],
+      "task_must": [
+        "March 23|23 March|Mar 23",
+        "step-free|accessib|wheelchair",
+        "vegan|dietary"
+      ],
+      "task_must_not": [
+        {
+          "re": "March 9",
+          "unless": "\\b(old|earlier|previous|was|up from|from|moved|because|clash|clashes|instead of|not|no longer)\\b"
+        },
+        {
+          "re": "18[, ]?500",
+          "unless": "\\b(old|earlier|previous|was|up from|from|moved|because|clash|clashes|instead of|not|no longer)\\b"
+        },
+        {
+          "re": "{option2}",
+          "unless": "\\b(removed|dropped|ruled out|not|no longer|elevator|instead of)\\b"
+        }
+      ]
+    }
+  ]
+}

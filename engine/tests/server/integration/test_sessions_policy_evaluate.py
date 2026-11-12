@@ -1,0 +1,1318 @@
+"""
+Integration tests for ``POST /v1/sessions/{id}/policies/evaluate``.
+
+The endpoint receives proto-compatible ``EvaluationRequest`` JSON,
+evaluates policies via the policy engine, and returns an
+``EvaluationResponse`` with the verdict. Used by Claude Code's
+``PreToolUse`` / ``PostToolUse`` command hooks to enforce admin
+policies on native tools.
+
+Tests cover:
+
+- TOOL_CALL ALLOW: no matching policy → ``POLICY_ACTION_ALLOW``.
+- TOOL_CALL DENY: ``default_policies`` deny → ``POLICY_ACTION_DENY``
+  with reason.
+- TOOL_RESULT DENY: tool result policy fires.
+- Missing session → 404.
+- Malformed body → 400.
+- Unknown event type → 400.
+
+Uses the shared ``client`` fixture from ``tests/server/conftest.py``
+(real stores + mock LLM).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+import pytest_asyncio
+from fastapi import FastAPI
+
+from omnigent.runtime import get_caps, session_stream
+from omnigent.runtime.caps import RuntimeCaps
+from omnigent.spec.types import FunctionPolicySpec, FunctionRef
+from omnigent.stores.conversation_store.sqlalchemy_store import (
+    SqlAlchemyConversationStore,
+)
+from tests.server.helpers import create_test_agent
+
+pytestmark = pytest.mark.asyncio
+
+
+# ── Policy callables ────────────────────────────────────────
+
+
+def _deny_bash_tool(event: dict[str, Any]) -> dict[str, Any]:
+    """
+    Policy that denies Bash tool calls.
+
+    :param event: V0 event dict.
+    :returns: DENY for Bash tool calls, ALLOW otherwise.
+    """
+    if event.get("type") != "tool_call":
+        return {"result": "ALLOW"}
+    data = event.get("data")
+    tool = data.get("name", "") if isinstance(data, dict) else ""
+    if tool == "Bash":
+        return {
+            "result": "DENY",
+            "reason": "Bash is blocked by admin policy.",
+        }
+    return {"result": "ALLOW"}
+
+
+def _deny_bash_tool_result(event: dict[str, Any]) -> dict[str, Any]:
+    """
+    Policy that denies tool RESULTS from Bash, scoped by tool name.
+
+    Reads the name from the container the engine populates, so it fires only
+    when the route resolved a tool name for this phase — which is what makes
+    the normalization of alternative wire spellings observable.
+
+    :param event: V0 event dict.
+    :returns: DENY for Bash tool results, ALLOW otherwise.
+    """
+    if event.get("type") != "tool_result":
+        return {"result": "ALLOW"}
+    # ``target`` is the resolved tool name in the V0 event dict.
+    if event.get("target") == "Bash":
+        return {"result": "DENY", "reason": "Bash results are blocked."}
+    return {"result": "ALLOW"}
+
+
+def _deny_sensitive_output(event: dict[str, Any]) -> dict[str, Any]:
+    """
+    Policy that denies tool results containing ``SECRET``.
+
+    :param event: V0 event dict.
+    :returns: DENY if tool result contains SECRET, ALLOW otherwise.
+    """
+    if event.get("type") != "tool_result":
+        return {"result": "ALLOW"}
+    data = event.get("data")
+    result = data.get("result", "") if isinstance(data, dict) else str(data)
+    if isinstance(result, str) and "SECRET" in result:
+        return {
+            "result": "DENY",
+            "reason": "Output contains sensitive data.",
+        }
+    return {"result": "ALLOW"}
+
+
+def _deny_large_llm_request(event: dict[str, Any]) -> dict[str, Any]:
+    """
+    Policy that denies LLM requests with more than 100 messages.
+
+    :param event: V0 event dict.
+    :returns: DENY for large requests, ALLOW otherwise.
+    """
+    if event.get("type") != "llm_request":
+        return {"result": "ALLOW"}
+    data = event.get("data")
+    count = data.get("messages_count", 0) if isinstance(data, dict) else 0
+    if isinstance(count, int) and count > 100:
+        return {
+            "result": "DENY",
+            "reason": f"LLM request too large: {count} messages",
+        }
+    return {"result": "ALLOW"}
+
+
+def _deny_llm_response_with_pii(event: dict[str, Any]) -> dict[str, Any]:
+    """
+    Policy that denies LLM responses containing ``SSN``.
+
+    :param event: V0 event dict.
+    :returns: DENY if response text contains SSN, ALLOW otherwise.
+    """
+    if event.get("type") != "llm_response":
+        return {"result": "ALLOW"}
+    data = event.get("data")
+    text = data.get("text_preview", "") if isinstance(data, dict) else ""
+    if isinstance(text, str) and "SSN" in text:
+        return {
+            "result": "DENY",
+            "reason": "LLM response contains PII.",
+        }
+    return {"result": "ALLOW"}
+
+
+def _deny_blocked_actor(event: dict[str, Any]) -> dict[str, Any]:
+    """
+    Policy that denies if ``run_as`` is ``blocked@test.com``.
+
+    :param event: V0 event dict.
+    :returns: DENY when actor matches, ALLOW otherwise.
+    """
+    actor = event.get("context", {}).get("actor", {})
+    if actor.get("run_as") == "blocked@test.com":
+        return {"result": "DENY", "reason": "Blocked user"}
+    return {"result": "ALLOW"}
+
+
+def _ask_for_bash(event: dict[str, Any]) -> dict[str, Any]:
+    """
+    Policy that requires human approval (ASK) for Bash tool calls.
+
+    :param event: V0 event dict.
+    :returns: ASK for Bash tool calls, ALLOW otherwise.
+    """
+    if event.get("type") != "tool_call":
+        return {"result": "ALLOW"}
+    data = event.get("data")
+    tool = data.get("name", "") if isinstance(data, dict) else ""
+    if tool == "Bash":
+        return {"result": "ASK", "reason": "Approve running Bash?"}
+    return {"result": "ALLOW"}
+
+
+# ── Helpers ─────────────────────────────────────────────────
+
+
+async def _create_session(client: httpx.AsyncClient, agent_id: str) -> str:
+    """
+    Create a session bound to an agent.
+
+    :param client: Test HTTP client.
+    :param agent_id: Agent to bind.
+    :returns: New session id.
+    """
+    resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
+    assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
+    return resp.json()["id"]
+
+
+def _tool_call_request(
+    tool_name: str = "Bash",
+    arguments: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Build a PHASE_TOOL_CALL EvaluationRequest.
+
+    :param tool_name: Tool name, e.g. ``"Bash"``.
+    :param arguments: Tool arguments dict.
+    :returns: EvaluationRequest JSON dict.
+    """
+    return {
+        "event": {
+            "type": "PHASE_TOOL_CALL",
+            "target": "",
+            "data": {
+                "name": tool_name,
+                "arguments": arguments or {},
+            },
+            "context": {},
+        },
+    }
+
+
+def _tool_result_request(
+    result: str = "",
+    tool_name: str = "Bash",
+) -> dict[str, Any]:
+    """
+    Build a PHASE_TOOL_RESULT EvaluationRequest.
+
+    :param result: Tool result string.
+    :param tool_name: Original tool name for request_data.
+    :returns: EvaluationRequest JSON dict.
+    """
+    return {
+        "event": {
+            "type": "PHASE_TOOL_RESULT",
+            "target": "",
+            "data": {"result": result},
+            "context": {},
+            "request_data": {"name": tool_name, "arguments": {}},
+        },
+    }
+
+
+def _llm_request_payload(
+    model: str = "gpt-4o",
+    messages_count: int = 10,
+) -> dict[str, Any]:
+    """
+    Build a PHASE_LLM_REQUEST EvaluationRequest.
+
+    :param model: Model name for the LLM call.
+    :param messages_count: Number of messages in the prompt.
+    :returns: EvaluationRequest JSON dict.
+    """
+    return {
+        "event": {
+            "type": "PHASE_LLM_REQUEST",
+            "data": {
+                "model": model,
+                "messages_count": messages_count,
+                "tools_count": 5,
+                "system_prompt_preview": "You are a helpful assistant.",
+            },
+            "context": {},
+        },
+    }
+
+
+def _llm_response_payload(
+    text_preview: str = "Hello!",
+    tool_calls_count: int = 0,
+) -> dict[str, Any]:
+    """
+    Build a PHASE_LLM_RESPONSE EvaluationRequest.
+
+    :param text_preview: Preview of the LLM response text.
+    :param tool_calls_count: Number of tool calls in the response.
+    :returns: EvaluationRequest JSON dict.
+    """
+    return {
+        "event": {
+            "type": "PHASE_LLM_RESPONSE",
+            "data": {
+                "model": "gpt-4o",
+                "text_preview": text_preview,
+                "tool_calls_count": tool_calls_count,
+            },
+            "context": {},
+        },
+    }
+
+
+# ── Tests ───────────────────────────────────────────────────
+
+
+async def test_tool_call_allow_when_no_matching_policy(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A tool call with no matching policy returns ALLOW.
+
+    The agent has no guardrails and no default_policies are configured,
+    so the engine returns ALLOW for any tool call. If the endpoint
+    crashed or returned the wrong action, this would fail.
+    """
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Read"),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    # No policies → ALLOW (the default engine result).
+    assert body["result"] == "POLICY_ACTION_ALLOW"
+    assert "reason" not in body
+
+
+async def test_tool_call_deny_with_default_policy(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A default_policy that denies Bash returns DENY with reason.
+
+    This exercises the full path: route handler → get_conversation →
+    agent lookup → build_policy_engine(default_policies=...) → evaluate
+    → DENY response. If any link in this chain breaks (e.g. the
+    conversation_store.get() bug), this test fails.
+    """
+    deny_bash_policy = FunctionPolicySpec(
+        name="admin__deny_bash",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_bash_tool"),
+    )
+    original_caps = get_caps()
+    patched_caps = RuntimeCaps(
+        execution_timeout=original_caps.execution_timeout,
+        default_policies=[deny_bash_policy],
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: patched_caps,
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    # Bash → DENY by the admin policy.
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Bash"),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_DENY"
+    assert body["reason"] == "Bash is blocked by admin policy."
+
+    # Read → ALLOW (the policy only denies Bash).
+    resp2 = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Read"),
+    )
+    assert resp2.status_code == 200
+    assert resp2.json()["result"] == "POLICY_ACTION_ALLOW"
+
+
+async def test_deny_verdict_log_carries_deciding_policy_workspace_id(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    The DENY verdict log names the *deciding policy's own* workspace id.
+
+    The denying policy carries ``workspace_id`` (as ``_stored_policy_to_spec``
+    stamps it from the stored row). The value logged is sourced from the
+    policy, not the ambient request — proven here by giving the policy a
+    distinctive id while the request context stays at the OSS default (0).
+    """
+    deny_bash_policy = FunctionPolicySpec(
+        name="admin__deny_bash",
+        on=None,
+        # Stand in for a stored row owned by this workspace; distinct from
+        # the request's current_workspace_id() (0) so the source is provable.
+        workspace_id=7780,
+        function=FunctionRef(path=f"{__name__}._deny_bash_tool"),
+    )
+    original_caps = get_caps()
+    patched_caps = RuntimeCaps(
+        execution_timeout=original_caps.execution_timeout,
+        default_policies=[deny_bash_policy],
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: patched_caps,
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.sessions"):
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_call_request("Bash"),
+        )
+    assert resp.status_code == 200
+    assert resp.json()["result"] == "POLICY_ACTION_DENY"
+
+    verdict_logs = [
+        r.getMessage() for r in caplog.records if "policy_eval_verdict" in r.getMessage()
+    ]
+    assert verdict_logs, "expected a policy_eval_verdict log for the DENY"
+    assert "policy_workspace=7780" in verdict_logs[0], verdict_logs[0]
+
+
+async def test_tool_result_deny_with_default_policy(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A TOOL_RESULT phase policy that denies sensitive output returns DENY.
+
+    Verifies the endpoint correctly handles PHASE_TOOL_RESULT events
+    and passes ``request_data`` through to the engine context.
+    """
+    deny_sensitive = FunctionPolicySpec(
+        name="admin__deny_sensitive_output",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_sensitive_output"),
+    )
+    original_caps = get_caps()
+    patched_caps = RuntimeCaps(
+        execution_timeout=original_caps.execution_timeout,
+        default_policies=[deny_sensitive],
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: patched_caps,
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    # Tool result with SECRET → DENY.
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_result_request("output contains SECRET data"),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_DENY"
+    assert body["reason"] == "Output contains sensitive data."
+
+    # Clean tool result → ALLOW.
+    resp2 = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_result_request("normal output"),
+    )
+    assert resp2.status_code == 200
+    assert resp2.json()["result"] == "POLICY_ACTION_ALLOW"
+
+
+async def test_missing_session_returns_404(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Evaluating a policy against a non-existent session returns 404.
+
+    If the endpoint silently defaulted to ALLOW on missing sessions,
+    an attacker could bypass policies by guessing session ids.
+    """
+    resp = await client.post(
+        "/v1/sessions/nonexistent_session_id/policies/evaluate",
+        json=_tool_call_request(),
+    )
+    assert resp.status_code == 404
+
+
+async def test_malformed_body_returns_400(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A malformed body (missing ``event``) returns 400.
+
+    If the endpoint silently accepted bad input, policy bypasses
+    could go undetected.
+    """
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    # Missing event field entirely.
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json={"not_event": {}},
+    )
+    assert resp.status_code == 400
+
+    # Unknown event type.
+    resp2 = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json={"event": {"type": "PHASE_UNKNOWN", "data": {}}},
+    )
+    assert resp2.status_code == 400
+
+
+async def test_unknown_event_type_returns_400(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    An unknown event type returns 400.
+
+    Only PHASE_TOOL_CALL, PHASE_TOOL_RESULT, PHASE_LLM_REQUEST, and
+    PHASE_LLM_RESPONSE are recognized. Anything else is a client error.
+    """
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json={"event": {"type": "PHASE_INVALID", "data": {}}},
+    )
+    assert resp.status_code == 400
+
+
+# ── Actor wiring tests ────────────────────────────────────────
+
+
+def test_build_actor_with_user_id() -> None:
+    """
+    ``_build_actor`` returns ``{"run_as": user_id}`` when a user is
+    authenticated. Without this, ``event.context.actor`` is always empty
+    and policies that gate on identity are blind.
+    """
+    from omnigent.server.routes.sessions import _build_actor
+
+    assert _build_actor("alice@example.com") == {"run_as": "alice@example.com"}
+
+
+def test_build_actor_without_user_id() -> None:
+    """
+    ``_build_actor`` returns ``None`` when no user is authenticated (tests,
+    legacy callers). Policies should see an empty actor dict.
+    """
+    from omnigent.server.routes.sessions import _build_actor
+
+    assert _build_actor(None) is None
+
+
+async def test_evaluate_endpoint_passes_actor_to_policy(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The evaluate endpoint threads the authenticated user's identity into
+    ``event.context.actor`` so policy callables can inspect it.
+
+    A policy that inspects ``event["context"]["actor"]["run_as"]``
+    and denies if the user is ``"blocked@test.com"`` verifies the full
+    wiring from HTTP request → ``_build_actor`` → ``EvaluationContext``
+    → ``FunctionPolicy`` event dict.
+    """
+    policy = FunctionPolicySpec(
+        name="admin__deny_blocked_actor",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_blocked_actor"),
+    )
+    original_caps = get_caps()
+    patched_caps = RuntimeCaps(
+        execution_timeout=original_caps.execution_timeout,
+        default_policies=[policy],
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: patched_caps,
+    )
+    # Patch _get_user_id to simulate an authenticated user.
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_user_id",
+        lambda _req, _auth: "blocked@test.com",
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Read"),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_DENY"
+    assert body["reason"] == "Blocked user"
+
+
+async def test_evaluate_server_stashed_turn_actor_overrides_request_user_id(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When the server has stashed a turn-initiating actor for the session
+    (set at forward time from the human's verified ``created_by``), that
+    identity is used for policy evaluation instead of the HTTP request's
+    ``user_id`` (the runner's service-account credential).
+
+    No actor field in the request body is needed or trusted.
+    """
+    policy = FunctionPolicySpec(
+        name="admin__deny_blocked_actor",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_blocked_actor"),
+    )
+    original_caps = get_caps()
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            execution_timeout=original_caps.execution_timeout,
+            default_policies=[policy],
+        ),
+    )
+    # HTTP request carries the runner's service-account identity.
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_user_id",
+        lambda _req, _auth: "runner-svc@example.com",
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    # Simulate the server persisting the turn-initiating human's identity
+    # (normally written by _forward_event_to_runner via set_labels).
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes.sessions import _TURN_ACTOR_LABEL
+
+    await asyncio.to_thread(
+        get_conversation_store().set_labels,
+        session_id,
+        {_TURN_ACTOR_LABEL: "blocked@test.com"},
+    )
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Read"),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_DENY", (
+        "persisted turn actor label should override the request user_id"
+    )
+    assert body["reason"] == "Blocked user"
+
+
+async def test_evaluate_body_actor_field_is_ignored(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A caller cannot spoof the policy actor by injecting ``context.actor``
+    into the event payload — the body field is ignored; only the
+    server-stashed turn actor (or the request ``user_id``) is used.
+    """
+    policy = FunctionPolicySpec(
+        name="admin__deny_blocked_actor",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_blocked_actor"),
+    )
+    original_caps = get_caps()
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            execution_timeout=original_caps.execution_timeout,
+            default_policies=[policy],
+        ),
+    )
+    # HTTP request is unauthenticated; no turn actor stashed server-side.
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_user_id",
+        lambda _req, _auth: None,
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    # Caller tries to spoof actor via the event context body field.
+    payload = _tool_call_request("Read")
+    payload["event"]["context"] = {"actor": {"run_as": "blocked@test.com"}}
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=payload,
+    )
+    assert resp.status_code == 200
+    # Policy should NOT fire — the body field is ignored, actor is None.
+    assert resp.json()["result"] == "POLICY_ACTION_ALLOW", (
+        "body-injected context.actor must not influence the policy actor"
+    )
+
+
+async def test_evaluate_falls_back_to_request_user_id_when_no_turn_actor(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When no turn actor is stashed (direct API callers, no-auth mode),
+    the HTTP request's ``user_id`` is used — no regression.
+    """
+    policy = FunctionPolicySpec(
+        name="admin__deny_blocked_actor",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_blocked_actor"),
+    )
+    original_caps = get_caps()
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            execution_timeout=original_caps.execution_timeout,
+            default_policies=[policy],
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_user_id",
+        lambda _req, _auth: "blocked@test.com",
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Read"),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_DENY"
+    assert body["reason"] == "Blocked user"
+
+
+# ── Native ASK gate (URL-based elicitation) ──────────────────
+
+
+async def _drain_elicitation_id(session_id: str, *, timeout_s: float = 5.0) -> str:
+    """
+    Block on the session SSE stream until a
+    ``response.elicitation_request`` arrives; return its id.
+
+    :param session_id: Session to subscribe to.
+    :param timeout_s: Max seconds to wait before failing the test.
+    :returns: The published ``elicitation_id``.
+    """
+    async with asyncio.timeout(timeout_s):
+        async for event in session_stream.subscribe(session_id):
+            if event.get("type") == "response.elicitation_request":
+                eid = event.get("elicitation_id")
+                assert isinstance(eid, str) and eid, f"missing id: {event!r}"
+                return eid
+    raise AssertionError("subscribe loop ended without an elicitation event")
+
+
+def _patch_default_policies(monkeypatch: pytest.MonkeyPatch, fn_path: str) -> None:
+    """
+    Install a single function policy as the runtime default_policies.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param fn_path: Dotted path to the policy callable, e.g.
+        ``"<module>._ask_for_bash"``.
+    """
+    policy = FunctionPolicySpec(
+        name="admin__ask_bash",
+        on=None,
+        function=FunctionRef(path=fn_path),
+    )
+    original_caps = get_caps()
+    patched_caps = RuntimeCaps(
+        execution_timeout=original_caps.execution_timeout,
+        default_policies=[policy],
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: patched_caps,
+    )
+
+
+async def test_tool_call_ask_holds_gate_and_returns_allow_on_accept(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A TOOL_CALL ASK holds the gate server-side and collapses to
+    ``POLICY_ACTION_ALLOW`` when the human accepts via the resolve URL.
+
+    This is the native anti-bypass: the evaluate endpoint must NOT
+    return ``POLICY_ACTION_ASK`` (which the hook would map to ``defer``,
+    letting a permissive permission_mode auto-approve). Instead it
+    parks, publishes an elicitation, and waits for the URL-based
+    verdict. If the parking regressed, the POST would return ASK
+    immediately and the drain below would still see the event but the
+    final result would be ASK, not ALLOW.
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._ask_for_bash")
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    # The evaluate POST parks until the verdict arrives — run it
+    # concurrently and learn the elicitation id from the stream.
+    drain = asyncio.create_task(_drain_elicitation_id(session_id))
+    await asyncio.sleep(0.05)
+    evaluate = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_call_request("Bash"),
+        )
+    )
+
+    elicitation_id = await drain
+    verdict = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "accept"},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await evaluate
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["result"] == "POLICY_ACTION_ALLOW"
+
+
+async def test_tool_call_ask_returns_deny_on_decline(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A declined TOOL_CALL ASK collapses to ``POLICY_ACTION_DENY`` —
+    fail-closed. If the human refuses at the approve URL, the native
+    tool must not run.
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._ask_for_bash")
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    drain = asyncio.create_task(_drain_elicitation_id(session_id))
+    await asyncio.sleep(0.05)
+    evaluate = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_call_request("Bash"),
+        )
+    )
+
+    elicitation_id = await drain
+    verdict = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "decline"},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await evaluate
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["result"] == "POLICY_ACTION_DENY"
+
+
+# ── Concurrent ASK-gate serialization (parallel tool calls) ──
+
+
+def test_native_ask_gate_lock_keys_by_session_and_policy() -> None:
+    """
+    ``_native_ask_gate_lock`` returns one lock per (session, policy).
+
+    The same ``(conversation_id, deciding_policy)`` pair must return the
+    *same* lock object (so concurrent asks for one checkpoint serialize),
+    while a different session OR a different policy returns a *different*
+    lock (so unrelated approvals are not forced into a single global
+    queue). If the helper ignored either key dimension, two of these
+    asserts would see the same object and fail.
+    """
+    from omnigent.server.routes.sessions import _native_ask_gate_lock
+
+    lock_a = _native_ask_gate_lock("8e32600337d08f59ad381caf96a90659", "session_cost_guard")
+    # Same key → same lock: this is what makes parallel tool calls that
+    # all trip one checkpoint share a single gate.
+    assert (
+        _native_ask_gate_lock("8e32600337d08f59ad381caf96a90659", "session_cost_guard") is lock_a
+    )
+    # Different policy on the same session → different lock, so a cost ask
+    # and (say) a destructive-file ask can prompt concurrently.
+    assert _native_ask_gate_lock("8e32600337d08f59ad381caf96a90659", "other_policy") is not lock_a
+    # Different session → different lock, so sessions stay independent.
+    assert (
+        _native_ask_gate_lock("19b2d8e5c4e1733f25034907cb7d05ed", "session_cost_guard")
+        is not lock_a
+    )
+
+
+# ── LLM_REQUEST / LLM_RESPONSE phase tests ───────────────────
+
+
+async def test_llm_request_allow_when_no_matching_policy(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    PHASE_LLM_REQUEST with no policies returns ALLOW (unspecified
+    pass-through).
+
+    Verifies the proto mapping ``PHASE_LLM_REQUEST`` →
+    ``Phase.LLM_REQUEST`` is correct. If the mapping still pointed
+    at ``Phase.REQUEST``, the policy engine would route to the wrong
+    phase and possibly match session-level REQUEST policies instead.
+    """
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_llm_request_payload(messages_count=10),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # No policies registered → ALLOW (unspecified pass-through).
+    assert body["result"] in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"), (
+        f"Expected ALLOW or UNSPECIFIED for no-policy session, got {body['result']}. "
+        "If DENY, a default policy may be incorrectly matching LLM_REQUEST."
+    )
+
+
+async def test_llm_request_deny_by_function_policy(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A function policy targeting ``llm_request`` correctly denies
+    large prompt payloads.
+
+    The policy checks ``messages_count > 100`` in the data dict.
+    This verifies that ``_build_evaluation_context`` passes the
+    full data dict as ``content`` for LLM_REQUEST (not just text).
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._deny_large_llm_request")
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    # Small request → ALLOW
+    resp_allow = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_llm_request_payload(messages_count=50),
+    )
+    assert resp_allow.status_code == 200, resp_allow.text
+    assert resp_allow.json()["result"] == "POLICY_ACTION_ALLOW", (
+        "50 messages should be allowed by the policy (threshold is 100). "
+        "If DENY, the policy condition is wrong or the data wasn't passed correctly."
+    )
+
+    # Large request → DENY
+    resp_deny = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_llm_request_payload(messages_count=200),
+    )
+    assert resp_deny.status_code == 200, resp_deny.text
+    deny_body = resp_deny.json()
+    assert deny_body["result"] == "POLICY_ACTION_DENY", (
+        "200 messages should be denied by the policy (threshold is 100). "
+        "If ALLOW, the messages_count data wasn't passed through to the policy callable."
+    )
+    assert "200 messages" in deny_body.get("reason", ""), (
+        "Reason should mention the message count to confirm data propagation."
+    )
+
+
+async def test_llm_response_deny_by_function_policy(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A function policy targeting ``llm_response`` correctly denies
+    responses containing PII markers.
+
+    The policy checks for ``SSN`` in ``text_preview``. This
+    verifies the ``_build_evaluation_context`` passes the data dict
+    as ``content`` for ``LLM_RESPONSE``.
+    """
+    _patch_default_policies(monkeypatch, f"{__name__}._deny_llm_response_with_pii")
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    # Clean response → ALLOW
+    resp_allow = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_llm_response_payload(text_preview="Hello, how can I help?"),
+    )
+    assert resp_allow.status_code == 200, resp_allow.text
+    assert resp_allow.json()["result"] == "POLICY_ACTION_ALLOW", (
+        "Clean response should be allowed. "
+        "If DENY, the policy fired incorrectly on non-PII content."
+    )
+
+    # PII response → DENY
+    resp_deny = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_llm_response_payload(text_preview="Your SSN is 123-45-6789"),
+    )
+    assert resp_deny.status_code == 200, resp_deny.text
+    deny_body = resp_deny.json()
+    assert deny_body["result"] == "POLICY_ACTION_DENY", (
+        "Response containing SSN should be denied. "
+        "If ALLOW, the text_preview wasn't passed to the policy callable."
+    )
+    assert "PII" in deny_body.get("reason", ""), (
+        "Reason should mention PII to confirm the correct policy fired."
+    )
+
+
+async def test_llm_response_allow_when_no_matching_policy(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    PHASE_LLM_RESPONSE with no policies returns ALLOW.
+
+    Symmetric with the LLM_REQUEST no-policy test.
+    """
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_llm_response_payload(),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["result"] in ("POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"), (
+        f"Expected ALLOW or UNSPECIFIED for no-policy session, got {body['result']}."
+    )
+
+
+# The wire phases the evaluate route accepts, and whether ``event.data`` may
+# be a bare string on that phase. Both the guard and this table are derived
+# from the same rule, so a phase cannot be validated in production and left
+# out of the oracle — which is how null and empty-string survived a round.
+_EVALUATE_PHASES: tuple[tuple[str, bool], ...] = (
+    ("PHASE_TOOL_CALL", False),
+    ("PHASE_TOOL_RESULT", False),
+    ("PHASE_LLM_REQUEST", False),
+    ("PHASE_LLM_RESPONSE", False),
+    ("PHASE_REQUEST", True),
+)
+
+# Everything that is not an object, including the two that normalize to an
+# empty object rather than erroring. A non-empty list is included alongside
+# the empty one deliberately: both are non-dict and must be rejected the
+# same way, but a mutation that special-cased "falsy" values (None, False,
+# 0, "", []) while accepting any truthy non-dict would have passed with only
+# the empty list present — [] is falsy, [1] is not.
+_NON_OBJECT_DATA: tuple[tuple[object, str], ...] = (
+    (None, "null"),
+    (False, "false"),
+    (0, "zero"),
+    ("", "empty-string"),
+    ("a string", "raw-string"),
+    ([], "empty-list"),
+    ([1], "non-empty-list"),
+    (7, "int"),
+)
+
+
+def _valid_name_fields(phase: str) -> dict[str, object]:
+    """Fields that satisfy the tool-name rule for *phase*, if it has one."""
+    if phase == "PHASE_TOOL_RESULT":
+        return {"request_data": {"name": "Bash"}}
+    return {}
+
+
+def _malformed_evaluate_events() -> list[tuple[dict[str, object], str]]:
+    """Build the malformed-payload table from the rules being enforced.
+
+    Generated rather than hand-listed so neither rule can be covered for one
+    phase and missed for another — the defect this guard was written for, and
+    then repeated twice: once by validating raw ``data`` only on phases that
+    keep their tool name there, and once by accepting every falsy value that
+    normalizes to an empty object.
+    """
+    cases: list[tuple[dict[str, object], str]] = [
+        ({"type": ["not", "hashable"]}, "unhashable event.type"),
+    ]
+    for phase, allows_string in _EVALUATE_PHASES:
+        for bad, why in _NON_OBJECT_DATA:
+            if allows_string and isinstance(bad, str):
+                continue  # a legitimate wire form on this phase
+            event: dict[str, object] = {"type": phase, **_valid_name_fields(phase)}
+            if bad is not None:
+                event["data"] = bad
+            cases.append((event, f"{why} data on {phase}"))
+    cases += [
+        ({"type": "PHASE_TOOL_CALL", "data": {}}, "no name key in TOOL_CALL data"),
+        ({"type": "PHASE_TOOL_CALL", "data": {"name": ""}}, "empty TOOL_CALL name"),
+        ({"type": "PHASE_TOOL_CALL", "data": {"name": 7}}, "non-string TOOL_CALL name"),
+        ({"type": "PHASE_TOOL_RESULT", "data": {"result": "ok"}}, "no name source at all"),
+        (
+            {"type": "PHASE_TOOL_RESULT", "data": {"result": "ok"}, "request_data": {"name": ""}},
+            "empty request_data.name and no target",
+        ),
+        (
+            {"type": "PHASE_TOOL_RESULT", "data": {"result": "ok"}, "target": ""},
+            "empty target and no request_data",
+        ),
+        (
+            {"type": "PHASE_TOOL_RESULT", "data": {"result": "ok"}, "request_data": "a string"},
+            "non-object request_data with no target",
+        ),
+        (
+            {"type": "PHASE_TOOL_CALL", "data": {"name": "Bash"}, "context": 7},
+            "non-object context",
+        ),
+    ]
+    return cases
+
+
+@pytest.mark.asyncio
+async def test_policy_evaluate_rejects_malformed_event_shapes(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Malformed hook payloads must be rejected with a structured 400.
+
+    Every falsy ``data`` here used to normalize to ``{}`` before validation
+    and return 200/ALLOW — on a tool phase that means tool-name-scoped
+    policies were skipped entirely on a BLOCKING hook, which is worse than
+    the 500s the earliest guards were added for. The phase strings are the
+    wire values (``PHASE_*``); using the internal names short-circuits at the
+    unknown-type check and never reaches these guards, so the suite once
+    stayed green with the validation deleted.
+
+    One session for the whole table: each case is an independent request, so a
+    fresh session per case bought nothing but setup time. Every acceptance is
+    collected before asserting, so one run reports every case that regressed,
+    and the structured error code is checked rather than the status alone.
+    """
+    from tests.server.helpers import create_test_session
+
+    snap = await create_test_session(client, title="malformed-events")
+    accepted: list[str] = []
+    for event, why in _malformed_evaluate_events():
+        resp = await client.post(
+            f"/v1/sessions/{snap['id']}/policies/evaluate",
+            json={"event": event},
+        )
+        if resp.status_code != 400:
+            accepted.append(f"{why}: {resp.status_code} {resp.text[:120]}")
+            continue
+        body = resp.json()
+        code = (body.get("error") or {}).get("code") if isinstance(body, dict) else None
+        if code != "invalid_input":
+            accepted.append(f"{why}: 400 but code={code!r}")
+    assert not accepted, "malformed payloads accepted:\n" + "\n".join(accepted)
+
+
+_EVALUATE_USER = "alice@example.com"
+
+
+@pytest.fixture()
+def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+    """App with permissions + header auth, for route-level SQL budgeting."""
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.app import create_app
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        auth_provider=UnifiedAuthProvider(source="header"),
+    )
+
+
+@pytest_asyncio.fixture()
+async def auth_client(auth_app: FastAPI, mock_llm: Any, tmp_path: Path):
+    """Async client against the auth-enabled app."""
+    from omnigent.runtime import set_harness_process_manager
+    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+
+    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
+    await pm.start()
+    set_harness_process_manager(pm)
+    transport = httpx.ASGITransport(app=auth_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+    mock_llm.release_all()
+    set_harness_process_manager(None)
+    await pm.shutdown()
+
+
+async def _seed_authenticated_session(auth_client: httpx.AsyncClient, db_uri: str) -> str:
+    """Create a real agent-bound session and grant it to the test user.
+
+    Uses the real create path (a genuine uploaded bundle) so the agent
+    cache can load the spec — a fabricated agent row with a fake bundle
+    location cannot be loaded and the route would bail before the work
+    this budget measures.
+    """
+    import json as _json
+
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+    from tests.server.helpers import build_agent_bundle
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    perms.ensure_user(_EVALUATE_USER)
+    headers = {"X-Forwarded-Email": _EVALUATE_USER}
+    resp = await auth_client.post(
+        "/v1/sessions",
+        data={"metadata": _json.dumps({"title": "budget"})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                # The agent MUST declare a policy: with no policies the route
+                # short-circuits via ``any_policies_apply`` before building an
+                # engine, so a budget measured without one would not cover the
+                # preload path at all (it silently didn't, first time round).
+                build_agent_bundle(
+                    name="budget-agent",
+                    guardrails={
+                        "policies": {
+                            "allow_all": {
+                                "type": "function",
+                                "on": ["tool_call"],
+                                "function": "tests.runtime.policies.conftest._always_allow",
+                            }
+                        }
+                    },
+                ),
+                "application/gzip",
+            )
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["session_id"]
+    perms.grant(_EVALUATE_USER, session_id, LEVEL_OWNER)
+    return session_id
+
+
+# Measured SQL-statement budget for the AUTHENTICATED evaluate route — the
+# blocking PreToolUse hook. Counted as executed statements, not store-method
+# calls: a store-call oracle cannot see that one call fans out to three
+# statements (conversation + metadata + labels), which is exactly how an
+# earlier "6 queries" claim survived being wrong by five.
+#
+# Measured (both dialects) for the seed below: one owner grant, one agent
+# declaring one tool_call policy, one conversation, no declared labels, no
+# children. Composition: the handler's conversation load 3, session-policy
+# lookup, agent row, spawn-tree scan 3.
+#
+# ACL resolution used to add 3 more (users + the user and public grants). The
+# warm-up request below now also warms the permission store's resolve_access
+# cache, so the steady-state route serves the access decision from memory —
+# which is the production hot path, since the check re-runs on every event of a
+# turn. A cold process still pays those 3.
+#
+# This is the number the PR must quote — an earlier description claimed 6.
+# It is also the oracle for the preload optimisation: dropping the
+# ``conversation=`` argument makes the builder re-read the conversation and
+# pushes this up, which no behavioural assertion can see because both
+# variants return the same verdict.
+_EVALUATE_ROUTE_SQL_BUDGET = 8
+
+
+@pytest.mark.asyncio
+async def test_authenticated_evaluate_route_sql_budget(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Pin the route's SQL count so the description cannot drift from the code,
+    and so removing the preload is detectable.
+
+    This is the oracle for the preload optimisation: dropping the
+    ``conversation=`` argument in ``_build_engine`` makes the builder read
+    the conversation again, which changes this count. A behavioural
+    assertion alone cannot see that, because both variants return the same
+    verdict.
+    """
+    from sqlalchemy import event as sa_event
+
+    from omnigent.db.utils import _engine_cache
+
+    session_id = await _seed_authenticated_session(auth_client, db_uri)
+    headers = {"X-Forwarded-Email": _EVALUATE_USER}
+    payload = {
+        "event": {
+            "type": "PHASE_TOOL_CALL",
+            "data": {"name": "Bash", "arguments": {"command": "ls"}},
+        }
+    }
+    # Warm the spec / policy / ACL caches so the count is the steady-state one.
+    await auth_client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate", json=payload, headers=headers
+    )
+
+    engine = _engine_cache[db_uri]
+    statements: list[str] = []
+
+    def _on_exec(conn, cursor, statement, parameters, context, executemany):
+        if not statement.lstrip().upper().startswith("PRAGMA"):
+            statements.append(statement)
+
+    sa_event.listen(engine, "before_cursor_execute", _on_exec)
+    try:
+        resp = await auth_client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate", json=payload, headers=headers
+        )
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", _on_exec)
+
+    assert resp.status_code == 200, resp.text
+    assert len(statements) == _EVALUATE_ROUTE_SQL_BUDGET, [
+        s.split("\n")[0][:80] for s in statements
+    ]

@@ -1,0 +1,587 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnigent"
+# Keep in sync with omnigent/version.py's VERSION constant.
+version = "0.17.0.dev0"
+description = "Omnigent: declarative agent authoring and runtime framework"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    { name = "Databricks, Inc." },
+]
+keywords = ["agents", "llm", "ai", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    # SDK path-dep, version-locked: the two packages release together at
+    # one version, so a published `omnigent==X` must resolve the SDK wheel
+    # built alongside it (release-omnigent.yml verifies this pin matches the
+    # release tag). Local/editable installs still resolve via tool.uv.sources.
+    "omnigent-client==0.17.0.dev0",
+    # Merged from omnigent + omnigent.
+    "pyyaml>=6.0,<7",
+    # OpenClaw stores its wrapped acpx registry as JSON5.
+    "json5>=0.10,<1",
+    # openai-agents<0.18.2 omits a field required by openai>=2.45.
+    # Keep this cap until the websockets<15 compatibility pin can be lifted.
+    "openai>=1.0,<2.45",
+    # >=14: the `e2b` extra's SDK (>=2.26) needs rich>=14 (was >=13,<14).
+    "rich>=14,<15",
+    "prompt_toolkit>=3.0,<4",
+    "mcp>=1.0,<2",
+    "starlette>=1.0.1,<2",
+    "uvicorn[standard]>=0.30,<1",
+    # websockets >=15 asyncio client hangs on macOS before emitting any handshake
+    # bytes; pin below 15 until upstream fixes the regression (see issue #1514).
+    "websockets>=10.4,<15",
+    "httpx>=0.27,<1",
+    "ftfy>=6.0",
+    # Reading and editing .xlsx artifacts by hand (omnigent/superchat/artifacts/table.py).
+    "openpyxl>=3.1,<4",
+    # Portable zombie-aware PID liveness checks for the host daemon
+    # lifecycle (omnigent/host/local_server.py).
+    "psutil>=5.9,<8",
+    # CEL (Common Expression Language) for inline policy evaluation.
+    # Non-Turing-complete, side-effect-free, guaranteed to terminate.
+    # NOT pure-Python: cel-python hard-depends on google-re2 (a C++ extension,
+    # imported at celpy module scope with no fallback), whose sdist needs bazel.
+    # Packagers must pin its prebuilt wheel — see WHEEL_PACKAGES in
+    # .github/scripts/homebrew/generate_formula.py.
+    "cel-python>=0.5",
+    # OS keychain for storing model-provider API keys (OSS model
+    # selection). Used by omnigent/onboarding/secrets.py; falls back to
+    # a 0600 file when no keyring backend is available (e.g. headless).
+    "keyring>=24,<26",
+    # Decode and validate public branding assets before serving them.
+    "pillow>=12.2,<13",
+    # PDF text layer + page rendering for the file search that runs in the host
+    # (omnigent/superchat/knowledge/pdf.py). Apache-2.0 / BSD-3 bindings to PDFium (BSD-3);
+    # bundled wheels, no system poppler/ghostscript. Pinned: page text and renders feed the index.
+    "pypdfium2==5.0.0",
+    # Vector half of that index (omnigent/superchat/knowledge/db.py): a SQLite extension, MIT OR
+    # Apache-2.0, one small wheel with the extension inside (no torch, no numpy). BM25 is SQLite's
+    # own FTS5. See docs/adr/0014-files-live-in-the-host.md.
+    "sqlite-vec>=0.1.9,<0.2",
+    # Round-trip (comment/format-preserving) TOML editing of codex's
+    # config.toml (omnigent/harnesses/codex_executor.py). stdlib tomllib is read-only.
+    "tomlkit>=0.12,<1",
+    # omnigent deps (runtime, spec, server, persistent terminal, etc.).
+    "alembic>=1.0,<2",
+    "anyio>=4.0,<5",
+    "cachetools>=5.0,<7",
+    "filelock>=3.0",
+    # _HostGroup (omnigent/cli.py) rewrites a leading positional server URL
+    # into `--server` before Click parses it, so it no longer depends on
+    # Click's internal `protected_args` (made read-only in click 8.2, slated
+    # for removal in click 9). Upper bound `<10` only guards against an
+    # as-yet-unreleased click 10 with unknown breaking changes.
+    "click>=8.0,<10",
+    "fastapi>=0.100,<1",
+    # pexpect/pyte back the POSIX tmux/PTY terminal stack, which is disabled
+    # on Windows (no usable PTY); omnigent never imports them on the core
+    # path, so skip them there to avoid shipping an unusable dependency.
+    "pexpect>=4.9,<5; platform_system != 'Windows'",
+    "pyte>=0.8,<1; platform_system != 'Windows'",
+    "pydantic>=2.0,<3",
+    "sqlalchemy>=2.0,<3",
+    # Client-side compression for opaque text columns (omnigent/db/compression.py),
+    # so per-conversation JSON/text is stored uniformly compressed across SQLite,
+    # PostgreSQL, and MySQL rather than depending on each backend's storage engine.
+    "zstandard>=0.22,<1",
+    "tiktoken>=0.7,<1",
+    # Server performance metrics use the no-op API even when tracing is off.
+    "opentelemetry-api>=1.20,<2",
+    # The Claude Code and OpenAI Agents harnesses are part of the
+    # baseline install — every CUJ command in the README depends on at
+    # least one of them, so making them optional just forces every user
+    # to remember `--extra all`. Issue #406.
+    "claude-agent-sdk>=0.1.62",
+    "openai-agents>=0.0.17",
+    "PyJWT[crypto]>=2.8,<3",
+    "argon2-cffi>=23.1,<24",
+    # PEP 440 version parsing (runner, extensions, telemetry); imported
+    # directly, so pinned here rather than left transitive.
+    "packaging>=23,<26",
+    # CA root bundle for client TLS verification (omnigent/tls.py,
+    # omnigent/harnesses/egress/ca.py). Required as a real fallback on uv /
+    # python-build-standalone interpreters whose OpenSSL has no default cert
+    # path; previously only transitive, pinned here now that we import it.
+    "certifi>=2023.7",
+    # Protobuf schema for the AI-gateway routing API
+    # (omnigent/api/routing/v1/routing.proto).
+    # Previously only a transitive dep; declared directly now that we ship a proto.
+    # Upper bound widened to <8 so the google-antigravity extra can pull in
+    # protobuf 7.x without conflicting with this core floor.  Our own
+    # routing_pb2 gencode was compiled against protobuf 6.x; the protobuf
+    # runtime guarantee allows a newer runtime (7.x) to load older gencode, so
+    # a plain install stays on 6.x and an antigravity install upgrades to 7.x.
+    "protobuf>=6,<8",
+    # RFC 5545 recurrence rules for the scheduled-task scheduler
+    # (omnigent/server/scheduled/rrule.py). Imported at module top and pulled
+    # onto the core server boot path via app.py; previously only a transitive
+    # dep, declared directly now that we import it.
+    "python-dateutil>=2.8,<3",
+    # IANA time-zone database for `zoneinfo`. Windows ships no system tz
+    # database, so `ZoneInfo("UTC")` raises ZoneInfoNotFoundError there
+    # unless this package is installed. Evaluated at module top in
+    # omnigent/server/scheduled/rrule.py and scheduler.py, both pulled onto
+    # the core server boot path via app.py, so a Windows install crashes on
+    # `omnigent server start` without it. POSIX platforms use the system
+    # database and don't need the wheel.
+    "tzdata>=2024.1; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+# Retained as a no-op alias so existing `--extra` invocations keep
+# working; the underlying packages are now default deps above.
+claude-sdk = []
+# `all` carries dependencies moved out of the default install that internal
+# CI / dev workflows still exercise.
+all = [
+    "omnigent[otel]",
+    "opentelemetry-instrumentation-fastapi>=0,<1",
+    "opentelemetry-instrumentation-httpx>=0,<1",
+    "opentelemetry-instrumentation-sqlalchemy>=0,<1",
+]
+# Trace export (runtime/telemetry.py): without the SDK and an exporter,
+# telemetry.init installs nothing and spans are dropped. The engine and host
+# images install it, so setting OTEL_EXPORTER_OTLP_ENDPOINT is enough (ADR 0041). The FastAPI and
+# HTTPX instrumentations stay in `all`: they publish only pre-releases, which pip skips.
+otel = [
+    "opentelemetry-sdk>=1.20,<2",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.20,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.20,<2",
+]
+# The credential store's AWS KMS backend (omnigent/stores/credential_store/secret_cipher.py)
+# imports boto3 lazily, only when OMNIGENT_CREDENTIAL_KMS_KEY_ID is set. Its own extra, so a
+# KMS deployment installs `omnigent[kms]`; the backend-agnostic base store does not need it.
+kms = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
+# S3-compatible artifact store (AWS S3, Cloudflare R2, MinIO, …). Selected
+# with ``OMNIGENT_ARTIFACT_URI=s3://bucket/prefix``; the store imports boto3
+# lazily, so only users of this backend need the extra.
+s3 = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
+# Omnigent's own long-term memory (the memory_* built-in tools backing
+# docs/context.md). txtai (hybrid BM25 + dense search) and litellm
+# (its embeddings backend) are imported lazily, so only servers that wire a
+# MemoryService need this extra — several GB (txtai pulls faiss-cpu and
+# transformers/torch, unused at runtime since the index uses the pure-numpy
+# ANN backend, but still a txtai import-time dependency).
+memory = ["txtai>=8,<9", "litellm>=1,<2"]
+# PostgreSQL storage backend. The server builds a psycopg engine whenever
+# the database URI is Postgres (``OMNIGENT_DATABASE_URI=postgresql+psycopg://…``
+# / ``--database-uri``). That is a general-purpose escape hatch — any
+# standalone Postgres deployment needs the driver — so it gets its own extra.
+# ``_create_engine`` raises an actionable "install omnigent[postgres]" error
+# when the URI is Postgres but this driver is absent.
+postgres = ["psycopg[binary]>=3.1,<4"]
+
+# Repository-only workflows use PEP 735 dependency groups so development
+# tooling is not published as an installable Omnigent capability.
+[dependency-groups]
+lint = [
+    "ruff>=0.6",
+    "pyrefly==1.1.1",
+    "pre-commit>=3.5",
+    # protoc + the well-known-type protos, for regenerating the routing API
+    # bindings (omnigent/api/routing/v1/routing_pb2.*). Bundles its own compiler so no
+    # system protoc is needed. Capped below 1.83 so the bundled libprotoc emits
+    # protobuf 6.x gencode; routing_pb2 must stay at gencode 6.x because
+    # cwsandbox/modal installs are pinned to a protobuf 6.x runtime and the
+    # protobuf runtime cannot be older than the gencode version. A 7.x runtime
+    # (antigravity) also loads 6.x gencode under the forward-compat guarantee,
+    # so 6.x gencode satisfies all install forks.
+    "grpcio-tools>=1.68,<=1.81.1",
+    # Enforces the package layers ([tool.importlinter] below); run `lint-imports` from engine/.
+    "import-linter>=2.1,<3",
+]
+test = [
+    "pytest>=7.0",
+    # Imported by the ASGI-level server tests (asgiref's ApplicationCommunicator) and the tracing
+    # tests (the OTel SDK, which the runtime only gets from the `all` extra); without them those
+    # files fail to collect.
+    "asgiref>=3.7,<4",
+    "opentelemetry-sdk>=1.20,<2",
+    # Builds the tiny PDF fixtures of the knowledge tests (BSD-3-Clause; test-only).
+    "reportlab>=4,<5",
+    # PEP 517 frontend used by the standalone-package artifact checks.
+    "build>=1.2",
+    # These clients are optional product capabilities, but their tests import
+    # and execute the real packages against mocks.
+    "hindsight-client>=0.4.0",
+    "nimble-python>=1.2.0,<2",
+    "pytest-asyncio>=0.21",
+    "pytest-xdist>=3.6",
+    # Line coverage during the unit-test matrix. Each CI shard writes its
+    # own data file; the code-coverage workflow combines them. See
+    # `[tool.coverage.run]` below for the relative-files setting that makes
+    # cross-runner combine work.
+    "pytest-cov>=5",
+    "pytest-playwright>=0.7",
+    # Visual-regression snapshot plugin for the e2e_ui suite. Provides the
+    # `assert_snapshot` fixture + `--update-snapshots` flag the UI diff gate
+    # uses (see tests/e2e_ui/visual/ and .github/workflows/ui-snapshot.yml).
+    # Requires pytest-playwright>=0.7 (hence the floor bump above).
+    "pytest-playwright-visual-snapshot>=0.5.1",
+    # Hash-partition the test suite across N shards for the nightly
+    # matrix. Pinned to a known-stable older release. Used by e2e.yml;
+    # the e2e-ui suite uses its own round-robin `--splits`/`--group`
+    # split (see tests/e2e_ui/conftest.py), so no extra dep there.
+    "pytest-shard==0.1.2",
+    # Per-test wallclock cap. Without this, a single hung test (e.g.
+    # a pexpect REPL test waiting for a terminal pattern that never
+    # arrives) blocks the whole pytest session until the workflow's
+    # step-level timeout-minutes fires, killing the worker without
+    # producing a junit XML or per-test traceback. With --timeout=N,
+    # pytest-timeout fails the offending test with a clear traceback
+    # and lets the rest of the suite continue. Pinned exactly to a
+    # known-good release for consistency with pytest-shard above.
+    "pytest-timeout==2.4.0",
+    # Retry LLM-driven harness tests up to 2 extra times on codex; see
+    # ``pytest_collection_modifyitems`` in ``tests/harnesses/conftest.py``.
+    # Pinned exactly to a known-stable release for consistency with
+    # pytest-shard / pytest-timeout above. 16.2+ is required under
+    # pytest 9: 14.0 predates pytest 9 and corrupts fixture-finalizer
+    # state around reruns (stale FixtureDef._finalizers / SetupState
+    # surgery, fixed upstream in 16.2), which leaked one test's
+    # monkeypatch of ``sessions._get_runner_client`` into later tests
+    # on the same xdist worker and flaked the WS-tunnel suite (the
+    # "Runner stream relay exited before becoming ready" 503s).
+    "pytest-rerunfailures==16.3",
+    "filelock>=3.0",
+    # Cloud-service mocks for the artifact-store / Cloudflare integration
+    # tests: moto is the standard S3-compatible mock (used for R2), respx is
+    # the standard HTTPX mock (used to back the Cloudflare D1 REST API with an
+    # in-memory SQLite), and boto3 backs the S3 artifact store under test.
+    "moto[s3]>=5,<6",
+    "respx>=0.21,<1",
+    "boto3>=1.30,<2",
+    # The Cloudflare D1 SQLAlchemy dialect, exercised by the D1 FTS integration
+    # test (tests/db/test_d1_fts_dialect.py) via respx + sqlite3.
+    "sqlalchemy-cloudflare-d1==0.3.10",
+]
+dev = [
+    { include-group = "lint" },
+    { include-group = "test" },
+]
+
+[project.scripts]
+# `omnigent host --server <url>` runs in every host container.
+omnigent = "omnigent.cli:main"
+
+[tool.uv]
+default-groups = []
+
+# uv path-dep for the sibling SDK package.
+[tool.uv.sources]
+omnigent-client = { path = "sdks/python-client", editable = true }
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+# Discovers the `omnigent` package (including `omnigent.harnesses.*` and
+# all omnigent subpackages absorbed during unification).
+include = ["omnigent*"]
+
+[tool.setuptools.package-data]
+"omnigent.db" = ["alembic.ini"]
+"omnigent.db.migrations" = ["script.py.mako"]
+# The deck kit: skeleton, layout vocabulary, templates (themes, licenses) and their embedded fonts.
+"omnigent.superchat.decks" = ["kit/**/*"]
+# The landing page served at "/" when no web build is mounted (OMNIGENT_WEB_UI_DIST).
+"omnigent.server" = ["static/api_only_landing.html"]
+
+[tool.pytest.ini_options]
+# auto mode: async tests without @pytest.mark.asyncio() are auto-
+# collected as asyncio. Inner (omnigent-legacy) tests rely on
+# this. SDK tests (tests/frontends/sdk/) use explicit markers;
+# both work under auto.
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# tests/e2e_ui, tests/browser_ui, and tests/e2e_live require
+# credentials and/or extra setup (Databricks profile; npm build + Playwright
+# browsers for the UI suites; a deployed Databricks App URL for the live
+# suite). Opt in via explicit pytest invocation.
+# structlog-config's pytest plugin clobbers unittest's private item._excinfo.
+# Disable it until the plugin stops writing to that attribute.
+addopts = "-p no:structlog_config --ignore=tests/e2e_ui --ignore=tests/browser_ui --ignore=tests/e2e_live --ignore=tests/integration"
+# Default per-test wallclock cap. Catches infinite hangs in any
+# suite (unit, harnesses, integration, e2e) without bothering tests
+# that actually finish. The longest legitimate integration tests
+# are well under 5 min; anything longer than that is almost
+# certainly a hang and should surface a traceback rather than
+# stall the worker. CLI overrides still work: e2e workflows pass
+# a stricter --timeout=180; individual tests can opt out via
+# ``@pytest.mark.timeout(N)``. ``thread`` method is more reliable
+# than the default ``signal`` method when tests fork subprocesses
+# (SIGALRM doesn't reach blocked-on-pty children) — see
+# pytest-timeout README.
+timeout = 300
+timeout_method = "signal"
+# SDK tests under ``tests/frontends/sdk/`` import the
+# ``omnigent_client`` package that lives in ``sdks/python-client/``.
+# Without this pythonpath the imports fail at collection time
+# with ``ModuleNotFoundError: No module named 'omnigent_client'``
+# unless the SDK is installed editable into the venv. Listing
+# the relative path here keeps the test suite self-contained.
+pythonpath = [".", "sdks/python-client"]
+markers = [
+    "live: end-to-end tests requiring real LLM API key (run with --llm-api-key)",
+    "live_app: end-to-end tests requiring a deployed Databricks App server",
+    "databricks: requires psycopg. Deselected on the standard lanes via -m 'not databricks'. Use for tests that build a postgresql+psycopg engine.",
+    "model(name, ...): one arg pins this test to that model overriding the suite-wide --model CLI default; multiple args fan the test out across all listed models via indirect parametrize.",
+    "model_pinned: opt out of tests/_model_pools.py spreading and retry rotation; literal model strings are used as written.",
+    "flaky(reruns=2, reruns_delay=0): rerun a nondeterministic test on failure (pytest-rerunfailures). Use for tests flaky due to timing/scheduling races (e.g. PTY drain timing), NOT real-LLM nondeterminism — those use llm_flaky, which rotates models per attempt.",
+    "llm_flaky(reruns=2, reruns_delay=1): rerun a nondeterministic real-LLM test on failure, rotating to a different model each attempt (tests/_model_pools.py). Never apply to heavy e2e tests that can hit the CI --timeout=180 cap (rerun + loadscope can crash the shard).",
+    "in_process_sessions: run a server integration test with the legacy in-process sessions path instead of sessions-native runner dispatch.",
+    "nightly: runs only in the scheduled/dispatch pass of its suite; PR and push runs exclude it via -m 'not nightly'. Remove the marker to promote a burned-in test to the PR gate.",
+    "compat_smoke: core server↔runner and UI↔server protocol boundary test. Must use mock LLM and exercise a cross-component interaction. Selected by the backwards-compat PR gate (-m compat_smoke) for a fast multi-test signal before the full overnight matrix.",
+    "min_server_version(version): skip this test when the live server under test is older than `version` (PEP 440 release-tuple comparison, so a `.devN` of X satisfies X). Used by the server-version backwards-compat CI (docs/SERVER_VERSION_COMPAT_CI.md); inert in normal runs where the server is current.",
+    "min_runner_version(version): skip this test when the pinned runner/host under test is older than `version` (PEP 440 release-tuple comparison, so a `.devN` of X satisfies X). Used by the runner/host backwards-compat CI (Config 2); inert in normal runs (no OMNIGENT_COMPAT_RUNNER_VERSION set).",
+    "visual: UI diff visual-regression snapshot (pytest-playwright-visual-snapshot). Runs only in the pinned-runner gate (.github/workflows/ui-snapshot.yml); the main e2e_ui suite excludes it via -m 'not visual' since it runs on the unpinned ubuntu-latest.",
+    "workspace_panel_product_default: UI test that must exercise the real collapsed-by-default Workspace panel state instead of the open-panel E2E baseline.",
+    "posix_only: test relies on POSIX-only behaviour (fork, PTY, tmux, Unix sockets, signals); auto-skipped on Windows by tests/conftest.py.",
+    "windows_only: test relies on Windows-only behaviour (Job Objects, cmd.exe); auto-skipped on POSIX by tests/conftest.py.",
+]
+# Visual snapshot baselines are committed here, keyed per-OS by the plugin
+# (e.g. test_empty_landing_matches_baseline[linux].png). Failure artifacts
+# (actual/expected/diff PNGs) land in the gitignored sibling dir. Both are
+# relative to the repo root, which is where pytest is always invoked.
+playwright_visual_snapshots_path = "tests/e2e_ui/visual/snapshots"
+playwright_visual_snapshot_failures_path = "tests/e2e_ui/visual/snapshot_failures"
+
+# The package layers (docs/adr/0019-repository-layout-and-layers.md, engine/README.md). Run
+# `lint-imports` from engine/. The contracts check direct imports: transitively almost every
+# package still reaches server and superchat through the shared and data layers (for example
+# db.account_authority -> server.auth), which the layering waves untangle.
+# deployment/entrypoint.py also imports superchat; it sits outside the package, so no contract
+# covers it.
+[tool.importlinter]
+root_package = "omnigent"
+
+[[tool.importlinter.contracts]]
+name = "HOST (host, runner, harnesses) never imports the engine server"
+type = "forbidden"
+source_modules = ["omnigent.host", "omnigent.runner", "omnigent.harnesses"]
+forbidden_modules = ["omnigent.server"]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Only the engine server and the runner's dispatch import superchat"
+type = "forbidden"
+source_modules = [
+    "omnigent._platform",
+    "omnigent._startup_profile",
+    "omnigent._wrapper_labels",
+    "omnigent.api",
+    "omnigent.cli",
+    "omnigent.cli_auth",
+    "omnigent.config",
+    "omnigent.connections",
+    "omnigent.context",
+    "omnigent.db",
+    "omnigent.debug_logging",
+    "omnigent.entities",
+    "omnigent.errors",
+    "omnigent.evals",
+    "omnigent.extensions",
+    "omnigent.gateway_inference",
+    "omnigent.git_credential_github",
+    "omnigent.harness_aliases",
+    "omnigent.harness_availability",
+    "omnigent.harness_capabilities",
+    "omnigent.harness_install_spec",
+    "omnigent.harness_plugins",
+    "omnigent.harness_startup_config",
+    "omnigent.harnesses",
+    "omnigent.host",
+    "omnigent.hosts",
+    "omnigent.inference_config",
+    "omnigent.llms",
+    "omnigent.memory",
+    "omnigent.models",
+    "omnigent.onboarding",
+    "omnigent.policies",
+    "omnigent.process_logging",
+    "omnigent.resources",
+    "omnigent.runtime",
+    "omnigent.sandbox",
+    "omnigent.session_event_batch",
+    "omnigent.spec",
+    "omnigent.stores",
+    "omnigent.telemetry",
+    "omnigent.terminals",
+    "omnigent.tools",
+    "omnigent.util",
+    "omnigent.version",
+    "omnigent.workspace_fs",
+]
+forbidden_modules = ["omnigent.superchat"]
+allow_indirect_imports = true
+
+[tool.coverage.run]
+# Measure the shipped package only; tests live under tests/.
+source = ["omnigent"]
+# Each CI shard sets COVERAGE_FILE=artifacts/.coverage.<group> and writes
+# one data file (pytest-cov already combines the xdist workers within a
+# shard). `relative_files` stores paths relative to the repo root so the
+# code-coverage workflow can `coverage combine` data files produced on
+# separate sharded runners with differing absolute checkout paths.
+relative_files = true
+
+[tool.coverage.report]
+show_missing = true
+# Report-only for now: no `fail_under`, so coverage never fails a build.
+# The code-coverage workflow reports against a plain `git checkout` that
+# has no generated files (e.g. omnigent/_build_info.py, written during
+# `uv sync` in the CI shards). Without this, `coverage report`/`xml` exit
+# 1 on "No source for code" and fail the step under `set -e`; ignore those
+# unreadable-source files instead.
+ignore_errors = true
+
+[tool.ruff]
+line-length = 99
+# NOTE: kept at py310 even though requires-python is >=3.12. Bumping this to
+# py312 makes ruff's UP041 rewrite `asyncio.TimeoutError` -> `TimeoutError`
+# (aliased since 3.11) across the whole codebase — a separate, out-of-scope
+# migration that belongs in its own cleanup PR.
+target-version = "py310"
+# Vendored upstream code — not ours to restyle.
+#  - ``assistant-ui/``: assistant-ui.com React/Python suite imported as a
+#    vendored snapshot; tracked upstream, no in-tree edits.
+extend-exclude = [
+    "assistant-ui",
+    # Protobuf-generated code (DO NOT EDIT); not ours to restyle.
+    "omnigent/api/**/*_pb2.py",
+    "omnigent/api/**/*_pb2.pyi",
+]
+
+[tool.ruff.lint]
+# ``E``/``F``  — pycodestyle + pyflakes baseline
+# ``I``        — import sorting
+# ``UP``       — pyupgrade (modernize syntax)
+# ``ARG``      — unused function arguments
+# ``BLE``      — blind ``except Exception``
+# ``B``        — flake8-bugbear (latent bugs, e.g. mutable defaults,
+#                unbound loop variables in closures, raise-from)
+# ``SIM``      — flake8-simplify (reduce unnecessary complexity)
+# ``RET``      — flake8-return (consistent return statements)
+# ``C4``       — flake8-comprehensions (cleaner list/dict/set comprehensions)
+# ``PIE``      — flake8-pie (misc correctness + style)
+# ``DTZ``      — flake8-datetimez (explicit timezone-aware datetimes)
+# ``LOG``      — flake8-logging (correct exception and logger usage)
+# ``RUF``      — ruff-specific (sorted ``__all__``, dangling asyncio
+#                tasks, unused noqa, ...)
+select = ["E", "F", "I", "UP", "ARG", "BLE", "B", "SIM", "RET", "C4", "PIE", "DTZ", "LOG", "RUF"]
+ignore = [
+    # ARG003 (unused class-method args): too noisy on ABC-subclass signatures
+    # where the arg is required by the interface contract.
+    "ARG003",
+    # RUF001/002/003 ambiguous-unicode: the repo uses ``—`` / ``–`` / ``×`` /
+    # ``╱`` in docstrings and CLI UI strings intentionally. The rule was
+    # designed for source strings that could be confused with ASCII and
+    # throws off on legitimate typographic characters in prose.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # SIM102/103/108: style-only transforms (collapse nested if / return
+    # condition directly / rewrite if-else as ternary). Often make code
+    # harder to read when the conditions are non-trivial. Kept available
+    # as manual refactoring hints but not enforced.
+    "SIM102",
+    "SIM103",
+    "SIM108",
+]
+
+[tool.ruff.lint.isort]
+# Classify first-party imports by NAME, not by file existence. Ruff's
+# default detection resolves each module against the filesystem, so an
+# import of an optional submodule absent from a given checkout (e.g.
+# omnigent.onboarding.internal_beta) would be reclassified as third-party
+# there, demanding a different import order per checkout. Pinning the
+# package name keeps one canonical order everywhere.
+known-first-party = ["omnigent"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests legitimately accept parameters they don't use (pytest fixtures,
+# mock callback signatures) and intercept broad exceptions to assert on
+# error paths. Cleaning these up is a separate cleanup pass.
+#
+# RUF012 (mutable default class attribute): test fake classes and
+# Textual/pytest harnesses routinely declare class-level
+# ``BINDINGS = [...]`` / ``inputSchema: dict = {...}`` that are never
+# mutated — the rule's production-shared-state concern doesn't apply.
+#
+# B007 (loop var unused): occasional ``for i, x in enumerate(...)`` in
+# tests where only ``x`` matters; style not worth policing.
+#
+# B008 (function call in default): pytest / factory_boy idioms.
+#
+# SIM117 (combined with): already-legible nested ``with`` in test
+# fixtures that would be harder to read if merged.
+"tests/**/*.py" = [
+    "ARG001", "ARG002", "ARG004", "ARG005", "BLE001",
+    "RUF012", "B007", "B008", "SIM117",
+]
+# Example scripts predate the rule and are exempted until they graduate.
+"tests/resources/examples/**/*.py" = [
+    "ARG001", "ARG002", "ARG004", "ARG005", "BLE001",
+    "RUF012", "B007", "B008", "SIM117",
+]
+# Graduation backlog for code migrated from omnigent during the
+# unification. Pre-unification Omnigent' ruff config only selected
+# ``E, F, I, UP`` — none of the ARG/BLE/B/SIM/... rules — so these
+# files have a backlog of unused-arg, blind-except, and bugbear issues
+# that were invisible before. Graduate each subpath out of this list
+# as it's cleaned up.
+"omnigent/llms/**/*.py" = [
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+]
+"omnigent/onboarding/**/*.py" = [
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+]
+"omnigent/hosts/*.py" = [
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+]
+"omnigent/runtime/**/*.py" = [
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+]
+"omnigent/terminals/**/*.py" = [
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+]
+"omnigent/tools/**/*.py" = [
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+]
+# Super Chat feature tool defs moved here from omnigent/tools/builtins (same schema-class style).
+"omnigent/superchat/*/tools.py" = [
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+]
+# Telemetry modules intentionally catch all exceptions at every boundary —
+# telemetry must never disrupt the application under any circumstances.
+"omnigent/telemetry/*.py" = ["BLE001", "SIM105"]
+"sdks/**/*.py" = [
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+]
+# slack_bolt dispatches to handlers by parameter NAME (``body``, ``event``,
+# ``client``, ``ack``, ``view``), so unused handler args can't be renamed to
+# ``_`` without breaking injection. The bot also has deliberate boundary
+# catches (best-effort acks, background login tasks) that must never abort a
+# turn, hence BLE001.
+"integrations/slack/**/*.py" = [
+    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
+]
+# The sessions route is a facade over an implementation package. Its explicit
+# imports intentionally re-export implementation names and load route modules
+# for registration, so F401 remains expected in this package.
+"omnigent/server/routes/sessions/__init__.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401"]
+"omnigent/server/routes/sessions/*.py" = ["ARG001", "ARG002", "BLE001", "E501", "F401"]

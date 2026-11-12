@@ -1,0 +1,35 @@
+{
+  "id": "sharp-mono",
+  "name": "Sharp Mono",
+  "tagline": "Hard black capitals",
+  "description": "Hard black on white, Archivo Black capitals, one red flare.",
+  "best_for": "manifestos, high-impact statements, short punchy talks",
+  "category": "bold",
+  "mode": "light",
+  "upstream": "https://github.com/lewislulu/html-ppt-skill",
+  "source": "nexu-io/open-design design-templates/html-ppt/assets/themes/sharp-mono.css@802708f",
+  "license": "MIT (see LICENSE); fonts SIL OFL 1.1 (see ../../fonts/OFL-*.txt)",
+  "fonts": [
+    {
+      "family": "Inter",
+      "weight": 400,
+      "style": "normal",
+      "file": "Inter-400.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Inter",
+      "weight": 600,
+      "style": "normal",
+      "file": "Inter-600.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Archivo Black",
+      "weight": 400,
+      "style": "normal",
+      "file": "ArchivoBlack-400.ttf",
+      "license": "OFL-archivoblack.txt"
+    }
+  ]
+}

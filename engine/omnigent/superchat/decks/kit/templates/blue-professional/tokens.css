@@ -1,0 +1,18 @@
+      --bg: #fdfae7;
+      --fg: #111111;
+      --muted: #55554f;
+      --accent: #1e2bfa;
+      --surface: #f4f1da;
+      --shell: #08090d;
+      --line: #cfd0f3;
+      --radius: 20px;
+      --font-display: "Space Grotesk", "Helvetica Neue", Arial, sans-serif;
+      --font-body: "Inter", "Helvetica Neue", Arial, sans-serif;
+      --font-mono: "Space Grotesk", "Helvetica Neue", Arial, sans-serif;
+      --display-weight: 700;
+      --display-tracking: -0.02em;
+      --accent-2: #f26b3a;
+      --accent-3: #1b8a5a;
+      --good: #1b8a5a;
+      --warn: #d9822b;
+      --font-serif: var(--font-display);

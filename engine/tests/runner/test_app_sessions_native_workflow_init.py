@@ -1,0 +1,1848 @@
+"""Tests for native session initialization, dispatch, status, and streams."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+
+from omnigent.entities.session_resources import SessionResourceView
+from omnigent.runner import create_runner_app
+from omnigent.runner import tool_dispatch as _tool_dispatch
+from omnigent.runner.app import (
+    _RUNNER_DISPATCHED_FIELD,
+    ResolvedSpec,
+    _resolved_workdir_for_spec,
+    _session_labels_for_runner_spawn,
+)
+from omnigent.runner.resource_registry import (
+    SessionResourceRegistry,
+)
+from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo
+from tests.runner.conftest import (
+    _build_app_with_mcp_tool,
+    _build_interrupt_app,
+    _build_lifecycle_app,
+    _FakeFileServerClient,
+    _FakeProcessManager,
+    _ReadTimeoutTransport,
+    _runner_client,
+    _ScriptedHarnessClient,
+    _sse,
+)
+from tests.runner.helpers import NullServerClient
+
+
+@pytest.mark.asyncio
+async def test_session_labels_for_runner_spawn_timeout_is_quiet(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Timed-out optional label resolution returns ``None``, not ``{}``, quietly.
+
+    Native harness spawn can recover by using the session id when labels
+    cannot be fetched. A slow Omnigent session lookup therefore must not emit a
+    warning with traceback; that was noisy and misleading for a best-effort
+    lookup. ``None`` (not a confirmed-empty ``{}``) lets a cache built from
+    this result (``_rollover_labels_for_session``) tell "unknown, retry" apart
+    from "really has no labels" and avoid caching a transient failure forever.
+
+    :param caplog: Pytest log capture fixture.
+    :returns: None.
+    """
+    transport = _ReadTimeoutTransport()
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        with caplog.at_level(logging.DEBUG, logger="omnigent.runner.app"):
+            labels = await _session_labels_for_runner_spawn(
+                server_client=client,
+                session_id="1dbe53c9796da07f3960b9226435a5c8",
+            )
+
+    assert labels is None
+    assert [(request.method, request.url.path) for request in transport.requests] == [
+        ("GET", "/v1/sessions/1dbe53c9796da07f3960b9226435a5c8/labels")
+    ]
+    timeout = transport.requests[0].extensions.get("timeout")
+    assert isinstance(timeout, dict)
+    assert timeout["read"] == 1.0
+
+    timeout_records = [
+        record
+        for record in caplog.records
+        if "Timed out resolving session labels" in record.getMessage()
+    ]
+    assert len(timeout_records) == 1
+    assert timeout_records[0].levelno == logging.DEBUG
+    assert timeout_records[0].exc_info is None
+    assert "Failed to resolve session labels" not in caplog.text
+
+
+# --- native LAUNCH dispatch (1.5b): adapters + shared shell ------------------
+
+
+class _FakeTerminalRegistry:
+    """Minimal terminal registry for launch-shell tests."""
+
+    def __init__(self, existing: bool = False) -> None:
+        self._existing = existing
+        self.cleaned: list[str] = []
+
+    def get(self, session_id: str, terminal_name: str, session_key: str) -> object | None:
+        return object() if self._existing else None
+
+    async def cleanup_conversation(self, session_id: str) -> None:
+        self.cleaned.append(session_id)
+        self._existing = False
+
+
+class _FakeResourceRegistry:
+    def __init__(self, terminal_registry: _FakeTerminalRegistry | None) -> None:
+        self.terminal_registry = terminal_registry
+
+
+class _FakeEnsureRegistry:
+    """Resource registry stub for the ensure-shell (attach path) tests.
+
+    The ensure shell is view-based: it reads the existing terminal via
+    ``get_terminal_resource`` and replaces a non-owned one via
+    ``close_terminal``. ``terminal_registry`` is unused by the ensure shell
+    but present for interface parity.
+    """
+
+    terminal_registry = None
+
+    def __init__(self, existing: SessionResourceView | None = None, close_ok: bool = True) -> None:
+        self._existing = existing
+        self._close_ok = close_ok
+        self.closed: list[tuple[str, str]] = []
+
+    async def get_terminal_resource(
+        self, session_id: str, terminal_id: str
+    ) -> SessionResourceView | None:
+        return self._existing
+
+    async def close_terminal(self, session_id: str, terminal_id: str) -> bool:
+        self.closed.append((session_id, terminal_id))
+        return self._close_ok
+
+
+def _terminal_view(name: str, terminal_id: str = "terminal_claude_main") -> SessionResourceView:
+    return SessionResourceView(id=terminal_id, type="terminal", session_id="conv_e", name=name)
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_resolves_file_id_before_harness() -> None:
+    """Remote runner resolves raw web ``file_id`` blocks before harness input."""
+    harness_client = _ScriptedHarnessClient(
+        [_sse({"type": "response.completed", "response": {"id": "resp_1"}})]
+    )
+    pm = _FakeProcessManager(harness_client)
+    server_client = _FakeFileServerClient()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/d43f93c220661ddaf203a63b45050304/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "0e36e3219954d2deaef06b8e2a936f38",
+                "model": "test-agent",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "file_id": "07b38328508bae2010c8b9933a310846",
+                        "filename": "photo.png",
+                    },
+                    {"type": "input_text", "text": "what is this?"},
+                ],
+            },
+        )
+
+    assert resp.status_code == 202
+    session = "/v1/sessions/d43f93c220661ddaf203a63b45050304"
+    file_path = f"{session}/resources/files/07b38328508bae2010c8b9933a310846"
+    calls = server_client.get_calls
+    # file_id blocks are resolved first (before the harness sees them), then the cold in-memory
+    # cache is rehydrated from the store (empty here) before the turn is dispatched.
+    assert (
+        calls.index(file_path)
+        < calls.index(f"{file_path}/content")
+        < calls.index(f"{session}/items")
+    ), calls
+    for _ in range(20):
+        if harness_client.posted_bodies:
+            break
+        await asyncio.sleep(0.05)
+    posted = harness_client.posted_bodies[0]
+    image_block = posted["content"][0]["content"][0]
+    assert image_block == {
+        "type": "input_image",
+        "filename": "photo.png",
+        "image_url": "data:image/png;base64,cG5nLWJ5dGVz",
+    }
+    assert "file_id" not in image_block
+
+
+class _MalformedMetaFileServerClient(_FakeFileServerClient):
+    """File metadata GETs answer 200 with a non-JSON body (a proxy error page)."""
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        response = await super().get(url, **kwargs)
+        if "/resources/files/" in url and not url.endswith("/content"):
+
+            def _raise_not_json() -> dict[str, Any]:
+                raise ValueError("body is not JSON")
+
+            response.content = b"<html>gateway error</html>"
+            response.json = _raise_not_json
+        return response
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_malformed_file_metadata_is_nonfatal() -> None:
+    """A 200-but-unparseable metadata body must not break attachment resolution.
+
+    The metadata fetch only supplies the media-type hint; when a proxy
+    answers 200 with an HTML error page, the resolver falls back to the
+    content response's Content-Type and the attachment still inlines.
+    """
+    harness_client = _ScriptedHarnessClient(
+        [_sse({"type": "response.completed", "response": {"id": "resp_1"}})]
+    )
+    pm = _FakeProcessManager(harness_client)
+    server_client = _MalformedMetaFileServerClient()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/e54fa4d331772eeb0314b74c56161415/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "0e36e3219954d2deaef06b8e2a936f38",
+                "model": "test-agent",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "file_id": "07b38328508bae2010c8b9933a310846",
+                        "filename": "photo.png",
+                    },
+                    {"type": "input_text", "text": "what is this?"},
+                ],
+            },
+        )
+
+    assert resp.status_code == 202
+    for _ in range(20):
+        if harness_client.posted_bodies:
+            break
+        await asyncio.sleep(0.05)
+    image_block = harness_client.posted_bodies[0]["content"][0]["content"][0]
+    # Bytes came from the content response; the media type came from its
+    # Content-Type header, not the unparseable metadata body.
+    assert image_block == {
+        "type": "input_image",
+        "filename": "photo.png",
+        "image_url": "data:image/png;base64,cG5nLWJ5dGVz",
+    }
+    assert "file_id" not in image_block
+
+
+class _HistoryFileServerClient(_FakeFileServerClient):
+    """Server client whose stored history carries an unresolved ``file_id``."""
+
+    def __init__(self, *, fail_file_fetch: bool = False) -> None:
+        super().__init__()
+        self._fail_file_fetch = fail_file_fetch
+        # Prior turn persisted in pre-resolution form: the image block
+        # still references the server-side file store by file_id.
+        self._items_payload: dict[str, Any] = {
+            "data": [
+                {
+                    "id": "item_prior_user",
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "file_id": "file_img",
+                            "filename": "photo.png",
+                        },
+                        {"type": "input_text", "text": "look at this image"},
+                    ],
+                },
+                {
+                    "id": "item_prior_assistant",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "A photo."}],
+                },
+            ],
+            "has_more": False,
+        }
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        if self._fail_file_fetch and not url.endswith("/items"):
+            self.get_calls.append(url)
+            raise httpx.ConnectError("file resource endpoint unreachable")
+        response = await super().get(url, **kwargs)
+        if url.endswith("/items"):
+            response.json = lambda: self._items_payload
+        return response
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_resolves_history_file_id_on_cold_reload() -> None:
+    """Cold-cache history reload resolves prior-turn ``file_id`` blocks.
+
+    Remote runners have no file/artifact stores, so history reloaded from
+    the server still carries raw ``file_id`` blocks. Without runner-side
+    resolution the harness receives them unresolved and the attachment is
+    silently dropped downstream — the model then hallucinates the image.
+    """
+    harness_client = _ScriptedHarnessClient(
+        [_sse({"type": "response.completed", "response": {"id": "resp_1"}})]
+    )
+    pm = _FakeProcessManager(harness_client)
+    server_client = _HistoryFileServerClient()
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/conv_hist/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_abc",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "what did I show you before?"}],
+            },
+        )
+
+    assert resp.status_code == 202
+    # The cold-cache reload must fetch the prior image's bytes back from
+    # the server, same as the current-turn fallback path does.
+    assert "/v1/sessions/conv_hist/resources/files/file_img" in server_client.get_calls
+    assert "/v1/sessions/conv_hist/resources/files/file_img/content" in server_client.get_calls
+    for _ in range(20):
+        if harness_client.posted_bodies:
+            break
+        await asyncio.sleep(0.05)
+    posted = harness_client.posted_bodies[0]
+    # content = [prior user message, prior assistant message, new message]
+    prior_image_block = posted["content"][0]["content"][0]
+    assert prior_image_block == {
+        "type": "input_image",
+        "filename": "photo.png",
+        "image_url": "data:image/png;base64,cG5nLWJ5dGVz",
+    }
+    assert "file_id" not in prior_image_block
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_history_file_id_fetch_failure_is_nonfatal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed history file fetch keeps the block and logs, not crashes.
+
+    The turn must still run with the rest of the history; the unresolved
+    block passes through so downstream executors can surface a visible
+    could-not-load marker instead of dropping the attachment silently.
+    """
+    harness_client = _ScriptedHarnessClient(
+        [_sse({"type": "response.completed", "response": {"id": "resp_1"}})]
+    )
+    pm = _FakeProcessManager(harness_client)
+    server_client = _HistoryFileServerClient(fail_file_fetch=True)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            resp = await client.post(
+                "/v1/sessions/conv_hist_fail/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_abc",
+                    "model": "test-agent",
+                    "content": [{"type": "input_text", "text": "what was that image?"}],
+                },
+            )
+
+    assert resp.status_code == 202
+    assert "failed to resolve file_id" in caplog.text
+    for _ in range(20):
+        if harness_client.posted_bodies:
+            break
+        await asyncio.sleep(0.05)
+    posted = harness_client.posted_bodies[0]
+    prior_image_block = posted["content"][0]["content"][0]
+    assert prior_image_block["file_id"] == "file_img"
+
+
+@pytest.mark.asyncio
+async def test_runner_session_tool_schemas_use_resolved_bundle_workdir(tmp_path: Path) -> None:
+    bundle_dir = tmp_path / "bundle"
+    tool_dir = bundle_dir / "tools" / "python"
+    tool_dir.mkdir(parents=True)
+    (tool_dir / "bundle_tool.py").write_text(
+        "from omnigent_client.tools import tool\n\n"
+        "@tool\n"
+        "def bundle_tool(text: str) -> str:\n"
+        "    return text\n"
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentSpec(
+        spec_version=1,
+        name="bundle-agent",
+        local_tools=[
+            LocalToolInfo(
+                name="bundle_tool",
+                path="tools/python/bundle_tool.py",
+                language="python",
+            )
+        ],
+    )
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse(
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "status": "action_required",
+                    "name": "bundle_tool",
+                    "call_id": "call_bundle",
+                    "arguments": json.dumps({"text": "from-bundle"}),
+                },
+            }
+        ),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    harness_client = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        runner_workspace=workspace,
+    )
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/c7f36aa769270cac30144784fad50acc/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "31ebfedf721b44dabd76f662cb70a400",
+                "model": "bundle-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "claude-sdk",
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(20):
+            if harness_client.posted_bodies:
+                break
+            await asyncio.sleep(0.05)
+        for _ in range(100):
+            if harness_client.patched_events:
+                break
+            await asyncio.sleep(0.05)
+
+    assert harness_client.posted_bodies, "harness must receive the turn"
+    schemas = harness_client.posted_bodies[0].get("tools") or []
+    assert any(s.get("function", {}).get("name") == "bundle_tool" for s in schemas), (
+        f"expected bundled local tool schema, got {schemas}"
+    )
+
+
+def test_resolved_workdir_for_spec_prefers_bundle_workdir(tmp_path: Path) -> None:
+    """``_resolved_workdir_for_spec`` uses ``ResolvedSpec.workdir`` over fallback.
+
+    Bundle-deployed agents carry their own workdir (where
+    ``tools/python/*.py`` live). The dispatch path must thread that
+    workdir into ``dispatch_tool_locally`` so native python tools are
+    found at call time — not the generic ``runner_workspace``.
+    """
+    bundle_dir = tmp_path / "bundle"
+    runner_workspace = tmp_path / "workspace"
+    spec = AgentSpec(spec_version=1, name="bundle-agent")
+    entry = ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    assert _resolved_workdir_for_spec(entry, runner_workspace) == bundle_dir
+
+
+def test_resolved_workdir_for_spec_falls_back_without_bundle(tmp_path: Path) -> None:
+    """Only an UNWRAPPED spec falls back to ``runner_workspace``.
+
+    A bare ``AgentSpec`` carries no bundle information at all, so dispatch
+    keeps using the CLI launch workspace exactly as base did. A
+    ``ResolvedSpec`` with ``workdir=None`` is different: resolution ran and
+    concluded there is no bundle dir for this agent. Falling back there is
+    what leaked a parent bundle into a sub-agent, so the ``None`` is
+    returned verbatim.
+    """
+    runner_workspace = tmp_path / "workspace"
+    bare_spec = AgentSpec(spec_version=1, name="plain-agent")
+
+    # Unwrapped spec → no workdir → fallback.
+    assert _resolved_workdir_for_spec(bare_spec, runner_workspace) == runner_workspace
+    # Wrapped with no workdir → an answered "no bundle", not a fallback.
+    wrapped_no_workdir = ResolvedSpec(spec=bare_spec, workdir=None)
+    assert _resolved_workdir_for_spec(wrapped_no_workdir, runner_workspace) is None
+    # Missing fallback stays None (don't fabricate a path).
+    assert _resolved_workdir_for_spec(bare_spec, None) is None
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_dispatches_native_tool_with_bundle_workdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bundle agent's native python tool dispatches against the bundle workdir.
+
+    End-to-end through ``POST /v1/sessions/{conv}/events`` (no live LLM):
+    the scripted harness emits an ``action_required`` for a spec-declared
+    python tool, and the runner must dispatch it locally with the session
+    workspace kept separate from the resolved ``ResolvedSpec.workdir``. This is the
+    dispatch-time counterpart to
+    :func:`test_runner_session_tool_schemas_use_resolved_bundle_workdir`,
+    which only proved schema generation used the bundle workdir.
+    """
+    bundle_dir = tmp_path / "bundle"
+    tool_dir = bundle_dir / "tools" / "python"
+    tool_dir.mkdir(parents=True)
+    (tool_dir / "bundle_tool.py").write_text(
+        "from omnigent_client.tools import tool\n\n"
+        "@tool\n"
+        "def bundle_tool(text: str) -> str:\n"
+        "    return text\n"
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    session_workspace = tmp_path / "session-worktree"
+    session_workspace.mkdir()
+    spec = AgentSpec(
+        spec_version=1,
+        name="bundle-agent",
+        local_tools=[
+            LocalToolInfo(
+                name="bundle_tool",
+                path="tools/python/bundle_tool.py",
+                language="python",
+            )
+        ],
+    )
+
+    captured_workspaces: list[tuple[Path | None, Path | None]] = []
+
+    async def _fake_dispatch(
+        *,
+        runner_workspace: Path | None = None,
+        local_tool_workdir: Path | None = None,
+        **kwargs: Any,
+    ) -> str:
+        captured_workspaces.append((runner_workspace, local_tool_workdir))
+        return "ok"
+
+    monkeypatch.setattr(_tool_dispatch, "dispatch_tool_locally", _fake_dispatch)
+
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse(
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "status": "action_required",
+                    "name": "bundle_tool",
+                    "call_id": "call_bundle",
+                    "arguments": json.dumps({"text": "from-bundle"}),
+                },
+            }
+        ),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    harness_client = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    class _WorkspaceServerClient(NullServerClient):
+        class _WorkspaceResponse(NullServerClient._Response):
+            def json(self) -> dict[str, Any]:
+                return {
+                    "workspace": str(session_workspace),
+                    "agent_id": "31ebfedf721b44dabd76f662cb70a400",
+                }
+
+        async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            if url.startswith("/v1/sessions/"):
+                return self._WorkspaceResponse()
+            return await super().get(url, **kwargs)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_WorkspaceServerClient(),  # type: ignore[arg-type]
+        runner_workspace=workspace,
+    )
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/c7f36aa769270cac30144784fad50acc/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "31ebfedf721b44dabd76f662cb70a400",
+                "model": "bundle-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "claude-sdk",
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(100):
+            if captured_workspaces:
+                break
+            await asyncio.sleep(0.05)
+
+    assert captured_workspaces, "native tool must be dispatched locally"
+    assert captured_workspaces[0] == (session_workspace.resolve(), bundle_dir)
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_marks_and_clears_in_flight_turn() -> None:
+    """proxy_stream registers the live turn with the process manager.
+
+    Regression test for #1414. The idle reaper skips conversations present in
+    the manager's ``_in_flight_response_ids``, but that map had no writers, so
+    a turn running past the idle window was reaped mid-stream. The runner must
+    call ``mark_in_flight`` on ``response.created`` (so the reaper spares the
+    live turn) and ``clear_in_flight`` at stream end (so the now-idle entry can
+    later be reclaimed — not leaked, cf. #1349). Before the fix the runner
+    never called either, so both recorded lists stay empty.
+    """
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_live"}}),
+        _sse({"type": "response.completed", "response": {"id": "resp_live"}}),
+    ]
+    harness_client = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(harness_client)
+    spec = AgentSpec(spec_version=1, name="plain-agent")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/ce84b0dc308668bb715607e42ae268b0/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "e61df75e32ee590087e03aa37b33abac",
+                "model": "plain-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "claude-sdk",
+            },
+        )
+        assert resp.status_code == 202
+        # Wait for the background turn to finish (clear runs at stream end).
+        for _ in range(100):
+            if pm.cleared_in_flight:
+                break
+            await asyncio.sleep(0.05)
+
+    # Live turn was registered with the reaper's in-flight guard on
+    # response.created, then cleared once the stream ended.
+    assert pm.marked_in_flight == [("ce84b0dc308668bb715607e42ae268b0", "resp_live")], (
+        pm.marked_in_flight
+    )
+    assert pm.cleared_in_flight == ["ce84b0dc308668bb715607e42ae268b0"], pm.cleared_in_flight
+
+
+class _StreamErrorHarnessClient(_ScriptedHarnessClient):
+    """Harness whose stream yields its frames then drops mid-stream.
+
+    Mirrors the production reaper-kill failure: after ``response.created``
+    the per-conversation client is force-closed and ``aiter_text`` raises
+    ``httpx.ReadError``, which proxy_stream surfaces as the
+    "Harness stream connection error." terminal failure.
+    """
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        """Return a context manager whose stream errors after the frames."""
+        del method, url, timeout
+        self.posted_bodies.append(json)
+        frames = self._sse_frames
+
+        class _ErrCtx:
+            status_code = 200
+
+            async def __aenter__(self) -> _StreamErrorHarnessClient._ErrHandle:
+                return _StreamErrorHarnessClient._ErrHandle(frames)
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        return _ErrCtx()
+
+    class _ErrHandle:
+        """Stream handle that raises ``ReadError`` after yielding its frames."""
+
+        status_code = 200
+
+        def __init__(self, frames: list[str]) -> None:
+            """Store the frames to yield before erroring."""
+            self._frames = frames
+
+        async def aiter_text(self) -> AsyncIterator[str]:
+            """Yield each scripted frame, then drop the stream mid-flight."""
+            for frame in self._frames:
+                yield frame
+            raise httpx.ReadError("harness subprocess closed mid-stream")
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_clears_in_flight_when_stream_errors() -> None:
+    """clear_in_flight fires even when a turn ends abnormally.
+
+    The fix clears the reaper's in-flight marker in ``_on_proxy_stream_end``,
+    which is reached on every terminal path — not only on ``response.completed``.
+    A turn that streams ``response.created`` and then drops mid-stream (exactly
+    the reaper-kill failure: ``httpx.ReadError`` → "Harness stream connection
+    error.") must still clear the marker; a missed clear would leave the entry
+    permanently in-flight and therefore never reaped — the inverse of #1414
+    (cf. #1349).
+    """
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_drop"}}),
+    ]
+    harness_client = _StreamErrorHarnessClient(sse_frames)
+    pm = _FakeProcessManager(harness_client)
+    spec = AgentSpec(spec_version=1, name="plain-agent")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/9217a860245985f541fd686eb2a32b73/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "965906f5d9fb596610dda599a80faaee",
+                "model": "plain-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "claude-sdk",
+            },
+        )
+        assert resp.status_code == 202
+        # Wait for the background turn to error out (clear runs at stream end).
+        for _ in range(100):
+            if pm.cleared_in_flight:
+                break
+            await asyncio.sleep(0.05)
+
+    # Marked live on response.created, then cleared despite the mid-stream drop.
+    assert pm.marked_in_flight == [("9217a860245985f541fd686eb2a32b73", "resp_drop")], (
+        pm.marked_in_flight
+    )
+    assert pm.cleared_in_flight == ["9217a860245985f541fd686eb2a32b73"], pm.cleared_in_flight
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_clears_in_flight_on_context_overflow_live_stream() -> None:
+    """clear_in_flight fires for a live (``stream=true``) turn that overflows context.
+
+    Regression for a leak where a context-window overflow on the live-stream
+    path left the reaper's in-flight marker set forever: proxy_stream raised
+    _ContextWindowOverflow uncaught on this path, so _on_proxy_stream_end never
+    ran and the idle reaper (which skips anything in-flight) never reclaimed
+    the harness. The background-turn path already handled this; live turns did
+    not.
+    """
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_overflow"}}),
+        _sse(
+            {
+                "type": "response.failed",
+                "error": {
+                    "message": (
+                        "context_length_exceeded: 5000 tokens > 4096 maximum context length"
+                    ),
+                    "code": "context_length_exceeded",
+                },
+            }
+        ),
+    ]
+    harness_client = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(harness_client)
+    spec = AgentSpec(spec_version=1, name="plain-agent")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    conv_id = "b4f6a4f0f2f74d76a2e4c0c9a8e0f9aa"
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "965906f5d9fb596610dda599a80faaee",
+                "model": "plain-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "claude-sdk",
+            },
+        )
+        # Drain the live SSE stream like a real browser client would. Pre-fix
+        # this can surface the uncaught overflow as a transport error; either
+        # way the assertions below are what pin the regression.
+        with contextlib.suppress(Exception):
+            async for _chunk in resp.aiter_text():
+                pass
+
+    # Marked live on response.created, then cleared despite the overflow.
+    assert pm.marked_in_flight == [(conv_id, "resp_overflow")], pm.marked_in_flight
+    assert pm.cleared_in_flight == [conv_id], (
+        f"in-flight marker never cleared on live-stream context overflow "
+        f"(got {pm.cleared_in_flight}) -- the reaper would skip this "
+        f"conversation's harness forever"
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_session_clears_in_flight_marker() -> None:
+    """A mid-stream cancel clears the reaper's in-flight marker.
+
+    Guards the in-flight-tracking contract against a #1349-class inverse leak:
+    because ``mark_in_flight`` (set on ``response.created``) *persists*, a
+    cancel must still clear it, or ``has_active_turn`` stays true and the idle
+    reaper skips the subprocess forever. The clear happens because cancelling
+    the turn task raises ``CancelledError`` into ``_run_turn_bg``'s handler,
+    which runs ``_on_proxy_stream_end`` (→ ``clear_in_flight``). This test locks
+    that path so a future change to the cancel teardown can't silently strand
+    the marker.
+    """
+    import asyncio as _aio
+
+    gate = _aio.Event()  # never set → harness blocks after response.created
+    app, pm, hc = _build_interrupt_app(gate)
+    conv_id = "a136ad3e8265e86eba8564d6cda81a14"
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "b528b24f9d6ece39ef11de7fb6dfeedf",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "blocked"}],
+                "harness": "claude-sdk",
+            },
+        )
+        assert resp.status_code == 202
+        # Wait until response.created is processed (marker set), then stop.
+        await _aio.wait_for(hc.post_seen.wait(), timeout=5.0)
+        for _ in range(100):
+            if pm.marked_in_flight:
+                break
+            await _aio.sleep(0.05)
+        assert pm.marked_in_flight == [(conv_id, "resp_int")], pm.marked_in_flight
+
+        stop_resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "stop_session"},
+        )
+        assert stop_resp.status_code == 204, stop_resp.text
+        gate.set()  # release the blocked stream so teardown completes cleanly
+        for _ in range(100):
+            if pm.cleared_in_flight:
+                break
+            await _aio.sleep(0.05)
+
+    # The cancel teardown must have cleared the marker (else the reaper would
+    # skip this subprocess forever and has_active_turn would stay true). Clear
+    # is idempotent, so it may fire on more than one teardown path — what
+    # matters is the end state: marked, then cleared, no longer active.
+    assert conv_id in pm.cleared_in_flight, pm.cleared_in_flight
+    assert not pm.has_active_turn(conv_id)
+
+
+class _SignalOnCreatedHarnessClient(_ScriptedHarnessClient):
+    """Streams its frames, firing an event the moment ``response.created`` is sent.
+
+    Lets a test distinguish the lazy turn-spec resolution (which runs only after
+    the harness has started streaming) from the eager setup-phase resolutions
+    that precede it.
+    """
+
+    def __init__(self, sse_frames: list[str], created: asyncio.Event) -> None:
+        """Store the frames and the event to fire on ``response.created``."""
+        super().__init__(sse_frames)
+        self._created = created
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        """Return a context manager that signals once ``response.created`` is sent."""
+        del method, url, timeout
+        self.posted_bodies.append(json)
+        frames = self._sse_frames
+        created = self._created
+
+        class _Ctx:
+            status_code = 200
+
+            async def __aenter__(self) -> _SignalOnCreatedHarnessClient._Handle:
+                return _SignalOnCreatedHarnessClient._Handle(frames, created)
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        return _Ctx()
+
+    class _Handle:
+        """Stream handle that fires *created* right after the ``response.created`` frame."""
+
+        status_code = 200
+
+        def __init__(self, frames: list[str], created: asyncio.Event) -> None:
+            """Store the frames and the response.created signal."""
+            self._frames = frames
+            self._created = created
+
+        async def aiter_text(self) -> AsyncIterator[str]:
+            """Yield each frame, signalling once ``response.created`` has been sent."""
+            for frame in self._frames:
+                yield frame
+                if '"response.created"' in frame:
+                    self._created.set()
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_clears_in_flight_on_lazy_spec_error() -> None:
+    """A lazy turn-spec resolution failure mid-dispatch still clears the marker.
+
+    Regression for a #1349-class inverse leak. For a non-MCP agent the turn
+    spec is resolved lazily at tool-dispatch time — after ``response.created``
+    has already set the in-flight marker. A transient resolver failure there
+    drives ``proxy_stream``'s lazy-spec-error early ``return``, which (unlike a
+    stream error or a cancel) exits the generator *cleanly* — so neither the
+    drain nor ``_run_turn_bg``'s ``CancelledError`` handler runs
+    ``_on_proxy_stream_end``. Routing that early return through
+    ``_on_proxy_stream_end`` is what clears the marker; without it the reaper
+    skips the subprocess forever and ``has_active_turn`` stays true.
+
+    The resolver is gated on ``response.created`` so it succeeds for the two
+    setup-phase resolutions (spec cache + harness pick) — letting the turn
+    stream — and fails only on the lazy dispatch call.
+    """
+    import asyncio as _aio
+
+    created = _aio.Event()
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_lazy"}}),
+        _sse(
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "status": "action_required",
+                    "name": "sys_list_models",
+                    "call_id": "call_lazy",
+                    "arguments": "{}",
+                },
+            }
+        ),
+        _sse({"type": "response.completed", "response": {"id": "resp_lazy"}}),
+    ]
+    harness_client = _SignalOnCreatedHarnessClient(sse_frames, created)
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
+        # Setup-phase call: return a real spec so _resolve_harness_config picks
+        # the test harness and the turn can start. _resolve_harness_config does
+        # NOT populate _session_spec_cache, so _resolve_turn_spec_lazy still
+        # calls us after response.created — and we raise there to exercise the
+        # error path.
+        del agent_id, session_id
+        if created.is_set():
+            raise RuntimeError("transient lazy spec resolution failure")
+        return AgentSpec(
+            spec_version=1,
+            name="t",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
+        )
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    conv_id = "a15313a5b85c6fa97a92d1e2d74d44dc"
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "4d198b17724988de49d7ac2b4d29605b",
+                "model": "plain-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "claude-sdk",
+            },
+        )
+        assert resp.status_code == 202
+        # Wait for the background turn to finish; the marker should be cleared.
+        for _ in range(100):
+            if pm.cleared_in_flight:
+                break
+            await _aio.sleep(0.05)
+
+    # Marked live on response.created; the lazy-spec-error early return must
+    # still finalize the turn and clear the marker.
+    assert pm.marked_in_flight == [(conv_id, "resp_lazy")], pm.marked_in_flight
+    assert conv_id in pm.cleared_in_flight, pm.cleared_in_flight
+    assert not pm.has_active_turn(conv_id)
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_dispatches_builtin_tool_with_runner_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bundle agent's builtin OS-env tool dispatches in runner_workspace.
+
+    Bundle workdirs are only for spec-local native python tools. Builtins
+    such as ``sys_os_write`` run in the caller process and must keep the
+    original runner workspace even when the agent spec was resolved from an
+    extracted bundle directory.
+    """
+    bundle_dir = tmp_path / "bundle"
+    bundle_dir.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentSpec(spec_version=1, name="bundle-agent")
+
+    captured_workspaces: list[Path | None] = []
+
+    async def _fake_dispatch(*, runner_workspace: Path | None = None, **kwargs: Any) -> str:
+        captured_workspaces.append(runner_workspace)
+        return "ok"
+
+    monkeypatch.setattr(_tool_dispatch, "dispatch_tool_locally", _fake_dispatch)
+
+    sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sse(
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "status": "action_required",
+                    "name": "sys_os_write",
+                    "call_id": "call_write",
+                    "arguments": json.dumps(
+                        {"path": "created-by-tool.txt", "content": "from workspace"}
+                    ),
+                },
+            }
+        ),
+        _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+    ]
+    harness_client = _ScriptedHarnessClient(sse_frames)
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        runner_workspace=workspace,
+    )
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/f690906478f5c81a97fd4301a80cb213/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "31ebfedf721b44dabd76f662cb70a400",
+                "model": "bundle-agent",
+                "content": [{"type": "input_text", "text": "write a file"}],
+                "harness": "claude-sdk",
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(100):
+            if captured_workspaces:
+                break
+            await asyncio.sleep(0.05)
+
+    assert captured_workspaces, "builtin tool must be dispatched locally"
+    assert captured_workspaces[0] == workspace, (
+        "builtin OS-env dispatch must use runner_workspace, not the bundle workdir "
+        f"({bundle_dir!r}); got {captured_workspaces[0]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_dispatches_builtin_tool_with_runner_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``/mcp/execute`` also keeps builtin OS-env tools in runner_workspace."""
+    bundle_dir = tmp_path / "bundle"
+    bundle_dir.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentSpec(spec_version=1, name="bundle-agent")
+
+    captured_workspaces: list[Path | None] = []
+
+    async def _fake_execute_tool(*, runner_workspace: Path | None = None, **kwargs: Any) -> str:
+        captured_workspaces.append(runner_workspace)
+        return "ok"
+
+    monkeypatch.setattr(_tool_dispatch, "execute_tool", _fake_execute_tool)
+
+    harness_client = _ScriptedHarnessClient(
+        [_sse({"type": "response.completed", "response": {"id": "resp_1"}})]
+    )
+    pm = _FakeProcessManager(harness_client)
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec:
+        del agent_id, session_id
+        return ResolvedSpec(spec=spec, workdir=bundle_dir)
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        runner_workspace=workspace,
+    )
+    async with _runner_client(app) as client:
+        seed_resp = await client.post(
+            "/v1/sessions/38f6cf055029a2a23b227a8305f76c9d/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "31ebfedf721b44dabd76f662cb70a400",
+                "model": "bundle-agent",
+                "content": [{"type": "input_text", "text": "seed"}],
+                "harness": "claude-sdk",
+            },
+        )
+        assert seed_resp.status_code == 202
+        for _ in range(100):
+            if harness_client.posted_bodies:
+                break
+            await asyncio.sleep(0.05)
+
+        execute_resp = await client.post(
+            "/v1/sessions/38f6cf055029a2a23b227a8305f76c9d/mcp/execute",
+            json={
+                "method": "tools/call",
+                "params": {
+                    "name": "sys_os_write",
+                    "arguments": {"path": "created-by-tool.txt", "content": "from workspace"},
+                },
+            },
+        )
+
+    assert execute_resp.status_code == 200
+    assert execute_resp.json() == {"result": {"output": "ok"}}
+    assert captured_workspaces == [workspace]
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_dispatches_full_namespaced_mcp_tool_name() -> None:
+    """``/mcp/execute`` must not strip the MCP server prefix before dispatch."""
+    app, mcp_manager, _harness_client, _server_client = _build_app_with_mcp_tool(
+        tool_name="jira__search_issues"
+    )
+    async with _runner_client(app) as client:
+        seed_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "6a09e2c1b63301fc6be99bb645418905",
+                "agent_id": "0e36e3219954d2deaef06b8e2a936f38",
+            },
+        )
+        assert seed_resp.status_code == 201, seed_resp.text
+
+        execute_resp = await client.post(
+            "/v1/sessions/6a09e2c1b63301fc6be99bb645418905/mcp/execute",
+            json={
+                "method": "tools/call",
+                "params": {
+                    "name": "jira__search_issues",
+                    "arguments": {"query": "asyncio"},
+                },
+            },
+        )
+
+    assert execute_resp.status_code == 200
+    assert execute_resp.json() == {"result": {"output": "called jira__search_issues"}}
+    assert mcp_manager.call_tool_invocations == [("jira__search_issues", {"query": "asyncio"})]
+
+
+@pytest.mark.asyncio
+async def test_sessions_native_path_injects_mcp_schemas() -> None:
+    """``POST /v1/sessions/{conv}/events`` with a message body injects MCP schemas.
+
+    Sessions-native clients must get the same MCP injection that the
+    legacy ``/v1/responses`` path provides.
+    """
+    app, _mcp_manager, harness_client, _server_client = _build_app_with_mcp_tool()
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/4e92b5a0c0ee6db3f874f9c4a3f855a5/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "0e36e3219954d2deaef06b8e2a936f38",
+                "model": "test-agent",
+                "input": [{"type": "input_text", "text": "hi"}],
+                "harness": "claude-sdk",
+                "has_mcp_servers": True,
+            },
+        )
+        # Sessions-native POST returns 202; the turn runs as a
+        # background task. Wait for the background turn to complete.
+        assert resp.status_code == 202
+        await asyncio.sleep(0.1)
+
+    assert harness_client.posted_bodies, "harness must receive at least one event"
+    body = harness_client.posted_bodies[0]
+    schemas = body.get("tools") or []
+    assert any(s.get("name") == "jira_search_issues" for s in schemas), (
+        f"MCP schema must be injected on sessions-native path; got {schemas}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_action_required_marker_round_trips_to_relayed_frame() -> None:
+    """The runner stamps ``omnigent_runner_dispatched`` on action_required frames.
+
+    The Omnigent executor's ``_runner_dispatches`` predicate reads this marker
+    to skip server-side dispatch. Without the stamp it'd race the
+    runner's dispatch and return "unknown server-side tool."
+    """
+    app, _mcp_manager, _client, server_client = _build_app_with_mcp_tool()
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/4e92b5a0c0ee6db3f874f9c4a3f855a5/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "0e36e3219954d2deaef06b8e2a936f38",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "claude-sdk",
+                "has_mcp_servers": True,
+            },
+        )
+        relayed = []
+        async for chunk in resp.aiter_text():
+            relayed.append(chunk)
+    stream_text = "".join(relayed)
+
+    # The relayed action_required frame must carry the marker.
+    assert f'"{_RUNNER_DISPATCHED_FIELD}": true' in stream_text, (
+        f"action_required event must be stamped with the dispatch marker; "
+        f"stream text was {stream_text!r}"
+    )
+    # Runner dispatched the MCP tool through the Omnigent server proxy (AP mode).
+    assert server_client.call_tool_invocations == [("jira_search_issues", {})], (
+        f"runner must dispatch the MCP tool via ProxyMcpManager (AP server); "
+        f"got {server_client.call_tool_invocations}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_session_spawns_the_snapshot_harness_override() -> None:
+    """Session init must spawn the session's overridden harness, not the spec's.
+
+    ``get_client`` entries are keyed by conversation, so resolving the spawn
+    from the spec made init request a harness the turns never asked for: the
+    mismatch tears down the override subprocess the kickoff turn is streaming
+    through and replaces it with the spec's
+    (``omnigent/runtime/harnesses/process_manager.py:749-770``). When the
+    spec's harness is a native one, init also launches its terminal on top of
+    that spawn, leaving two live processes for the one session.
+    """
+    spec = AgentSpec(
+        spec_version=1,
+        name="override-agent",
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}),
+    )
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    session_id = "5b0c1f7a4d2e4c8fa1b3d6e9c0f2a4b6"
+    agent_id = "9d3e2b1c7a504f6e8c2d1b0a3f5e7c9d"
+    payload = {
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "sub_agent_name": None,
+        "session_init": {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "sub_agent_name": None,
+            "snapshot": {
+                "created_at": 1234,
+                "updated_at": 1234,
+                "workspace": None,
+                "labels": {},
+                "harness_override": "pi",
+            },
+        },
+    }
+
+    async with _runner_client(app) as client:
+        resp = await client.post("/v1/sessions", json=payload)
+
+    assert resp.status_code == 201, resp.text
+    # Whole list, not just the last call: spawning the spec's harness *as well*
+    # is the defect, and a trailing-call assertion cannot see it.
+    spawned = [(conv_id, harness) for conv_id, harness, _env in pm.get_client_calls]
+    assert spawned == [(session_id, "pi")], (
+        f"Session init must spawn the snapshot's harness_override 'pi' and "
+        f"nothing else; got {spawned}. Spawning the spec's 'claude-sdk' evicts "
+        f"the override harness the session's turns run on."
+    )
+
+
+@pytest.mark.asyncio
+async def test_message_turn_resolves_the_recorded_harness_override() -> None:
+    """A turn whose body has no ``harness_override`` still runs the override.
+
+    The native terminal forward carries the override as session state, not
+    per-event state, so a turn body can arrive without it. Resolving that
+    turn from the body alone dropped it back onto the spec's harness —
+    process-manager entries are keyed by conversation, so the respawn
+    evicted the override harness mid-session (the split-brain on the turn
+    after the kickoff).
+    """
+    spec = AgentSpec(
+        spec_version=1,
+        name="override-agent",
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}),
+    )
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    session_id = "6c1d2e8b5f3a4d9eb2c4e7fad1a3b5c7"
+    agent_id = "8e4f3c2d1b6a05f79d3e2c1b4a6f8dae"
+    payload = {
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "sub_agent_name": None,
+        "session_init": {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "sub_agent_name": None,
+            "snapshot": {
+                "created_at": 1234,
+                "updated_at": 1234,
+                "workspace": None,
+                "labels": {},
+                "harness_override": "pi",
+            },
+        },
+    }
+
+    async with _runner_client(app) as client:
+        resp = await client.post("/v1/sessions", json=payload)
+        assert resp.status_code == 201, resp.text
+        turn = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "turn two"}],
+                "agent_id": agent_id,
+            },
+        )
+        assert turn.status_code == 202, turn.text
+        # The turn runs as a background task; wait for its harness request.
+        for _ in range(200):
+            if len(pm.get_client_calls) >= 2:
+                break
+            await asyncio.sleep(0.05)
+
+    harnesses = [harness for _conv, harness, _env in pm.get_client_calls]
+    assert "claude-sdk" not in harnesses, (
+        f"A turn without a body harness_override ran the spec's harness, "
+        f"evicting the session's recorded override; got {harnesses}."
+    )
+    assert harnesses[-1] == "pi", (
+        f"The turn must run the session's recorded override 'pi'; got {harnesses}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_session_envelope_is_single_flight_and_skips_metadata_callbacks() -> None:
+    """Concurrent v2 initialization resolves once and uses supplied metadata."""
+
+    class _ServerClient:
+        def __init__(self) -> None:
+            self.get_paths: list[str] = []
+
+        async def get(self, path: str, **_kwargs: Any) -> Any:
+            self.get_paths.append(path)
+            if path.endswith("/items"):
+                return type(
+                    "Response",
+                    (),
+                    {"status_code": 200, "json": lambda self: {"data": []}},
+                )()
+            if path.endswith("/labels"):
+                # History rehydration reads the rollover label once (a superside chat skips
+                # placeholder items).
+                return type(
+                    "Response",
+                    (),
+                    {"status_code": 200, "json": lambda self: {"labels": {}}},
+                )()
+            if path.endswith("/child_sessions"):
+                # Restart recovery lists the session's children; an empty
+                # list ends the scan after this single read.
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "status_code": 200,
+                        "json": lambda self: {"data": [], "has_more": False},
+                    },
+                )()
+            raise AssertionError(f"unexpected metadata callback: {path}")
+
+    server_client = _ServerClient()
+    harness_client = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+    resolver_entered = asyncio.Event()
+    release_resolver = asyncio.Event()
+    resolver_calls = 0
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        nonlocal resolver_calls
+        del agent_id, session_id
+        resolver_calls += 1
+        resolver_entered.set()
+        await release_resolver.wait()
+        return AgentSpec(spec_version=1, name="single-flight")
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=server_client,  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(terminal_registry=None),
+    )
+    session_id = "initv2_8e32600337d08f59ad381caf96a90659"
+    agent_id = "agentv2_880b5afda28ad55ff74cbeb9b5fc67fb"
+    payload = {
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "sub_agent_name": None,
+        "session_init": {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "sub_agent_name": None,
+            "snapshot": {
+                "created_at": 1234,
+                "updated_at": 1234,
+                "workspace": None,
+                "labels": {},
+            },
+        },
+    }
+
+    async with _runner_client(app) as client:
+        first = asyncio.create_task(client.post("/v1/sessions", json=payload))
+        await resolver_entered.wait()
+        second = asyncio.create_task(client.post("/v1/sessions", json=payload))
+        await asyncio.sleep(0)
+        release_resolver.set()
+        first_response, second_response = await asyncio.gather(first, second)
+
+    assert first_response.status_code == second_response.status_code == 201
+    assert first_response.json()["created_at"] == 1234
+    assert first_response.json()["session_init_protocol_version"] == 2
+    assert resolver_calls == 1
+    assert len(pm.get_client_calls) == 1
+    # The envelope supplies session metadata, so the only snapshot-style
+    # callbacks are the history read (one items read for the latest
+    # checkpoint, one for the record after it) and its rollover-label lookup;
+    # restart recovery adds one read of the durable child-session list, empty
+    # here.
+    assert server_client.get_paths == [
+        f"/v1/sessions/{session_id}/child_sessions",
+        f"/v1/sessions/{session_id}/labels",
+        f"/v1/sessions/{session_id}/items",
+        f"/v1/sessions/{session_id}/items",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_has_active_work_reports_process_manager_turns() -> None:
+    """The runner idle watchdog sees active harness turns.
+
+    :returns: None.
+    """
+    app, pm, _hc = _build_lifecycle_app()
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "8e32600337d08f59ad381caf96a90659",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+
+    assert resp.status_code == 201
+    assert app.state.has_active_work() is False
+
+    pm.mark_turn_active("8e32600337d08f59ad381caf96a90659")
+
+    assert app.state.has_active_work() is True
+
+
+@pytest.mark.asyncio
+async def test_create_session_missing_fields() -> None:
+    """``POST /v1/sessions`` with missing fields returns 400."""
+    app, _pm, _hc = _build_lifecycle_app()
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": "8e32600337d08f59ad381caf96a90659"},
+        )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_session_scaffold_mode() -> None:
+    """``POST /v1/sessions`` returns 501 when process_manager is None."""
+    app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "8e32600337d08f59ad381caf96a90659",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+    assert resp.status_code == 501
+
+
+@pytest.mark.asyncio
+async def test_get_session_status_idle() -> None:
+    """``GET /v1/sessions/{id}`` returns idle after session creation."""
+    app, _pm, _hc = _build_lifecycle_app()
+    async with _runner_client(app) as client:
+        await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "8e32600337d08f59ad381caf96a90659",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        resp = await client.get("/v1/sessions/8e32600337d08f59ad381caf96a90659")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_get_session_status_running() -> None:
+    """``GET /v1/sessions/{id}`` returns running when a turn is active."""
+    app, pm, _hc = _build_lifecycle_app()
+    async with _runner_client(app) as client:
+        await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "8e32600337d08f59ad381caf96a90659",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        pm.mark_turn_active("8e32600337d08f59ad381caf96a90659")
+        resp = await client.get("/v1/sessions/8e32600337d08f59ad381caf96a90659")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_get_session_unknown() -> None:
+    """``GET /v1/sessions/{id}`` returns 404 for unknown session."""
+    app, _pm, _hc = _build_lifecycle_app()
+    async with _runner_client(app) as client:
+        resp = await client.get("/v1/sessions/nonexistent")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_session() -> None:
+    """``DELETE /v1/sessions/{id}`` releases harness and cleans caches."""
+    app, pm, _hc = _build_lifecycle_app()
+    async with _runner_client(app) as client:
+        await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "8e32600337d08f59ad381caf96a90659",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        resp = await client.delete("/v1/sessions/8e32600337d08f59ad381caf96a90659")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["deleted"] is True
+    assert body["session_id"] == "8e32600337d08f59ad381caf96a90659"
+    assert "8e32600337d08f59ad381caf96a90659" in pm.released
+    assert not pm.has_session("8e32600337d08f59ad381caf96a90659")
+
+
+@pytest.mark.asyncio
+async def test_delete_session_with_active_turn() -> None:
+    """``DELETE /v1/sessions/{id}`` cancels active turn before release."""
+    app, pm, _hc = _build_lifecycle_app()
+    async with _runner_client(app) as client:
+        await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "8e32600337d08f59ad381caf96a90659",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        pm.mark_turn_active("8e32600337d08f59ad381caf96a90659")
+        resp = await client.delete("/v1/sessions/8e32600337d08f59ad381caf96a90659")
+    assert resp.status_code == 200
+    assert "8e32600337d08f59ad381caf96a90659" in pm.cancelled
+    assert "8e32600337d08f59ad381caf96a90659" in pm.released
+
+
+@pytest.mark.asyncio
+async def test_session_stream_receives_events() -> None:
+    """``GET /v1/sessions/{id}/stream`` yields events published by proxy_stream."""
+    app, _pm, _hc = _build_lifecycle_app()
+
+    async with _runner_client(app) as client:
+        # Create the session first.
+        await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "4ee52d986b72704408b5ff36fe8421e0",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+
+        collected: list[dict[str, Any]] = []
+
+        async def _subscribe() -> None:
+            """Subscribe to SSE and collect events until [DONE]."""
+            async with client.stream(
+                "GET", "/v1/sessions/4ee52d986b72704408b5ff36fe8421e0/stream"
+            ) as stream:
+                async for line in stream.aiter_lines():
+                    if line.startswith("data: "):
+                        payload = line[6:]
+                        if payload == "[DONE]":
+                            return
+                        collected.append(json.loads(payload))
+
+        sub_task = asyncio.create_task(_subscribe())
+        await asyncio.sleep(0.05)
+
+        # Trigger a turn — proxy_stream publishes events via
+        # session_stream. The stream stays open across turns;
+        # deleting the session sends [DONE].
+        resp = await client.post(
+            "/v1/sessions/4ee52d986b72704408b5ff36fe8421e0/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+                "harness": "claude-sdk",
+            },
+        )
+        async for _ in resp.aiter_text():
+            pass
+
+        # Allow turn-end bookkeeping to run.
+        await asyncio.sleep(0.05)
+
+        # Delete the session to close the stream ([DONE]).
+        await client.delete("/v1/sessions/4ee52d986b72704408b5ff36fe8421e0")
+
+        await asyncio.wait_for(sub_task, timeout=5.0)
+
+    # session.status=running + harness frames + session.status=idle.
+    statuses = [e.get("status") for e in collected if e.get("type") == "session.status"]
+    assert "running" in statuses, f"session.status=running must appear, got statuses: {statuses}"
+    assert statuses[-1] in ("idle", "failed"), (
+        f"last session.status must be idle or failed, got statuses: {statuses}"
+    )
+    harness_events = [e for e in collected if e.get("type") != "session.status"]
+    assert len(harness_events) >= 2, (
+        f"Expected at least 2 harness events, got {len(harness_events)}: {harness_events}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_stream_emits_heartbeat_on_idle() -> None:
+    """The session stream emits an immediate and idle ``session.heartbeat``."""
+    import omnigent.runner.app as _runner_app_module
+
+    original = _runner_app_module._SESSION_STREAM_HEARTBEAT_S
+    _runner_app_module._SESSION_STREAM_HEARTBEAT_S = 0.05
+    try:
+        app, _pm, _hc = _build_lifecycle_app()
+        async with _runner_client(app) as client:
+            await client.post(
+                "/v1/sessions",
+                json={
+                    "session_id": "2fa978f2a04f84d78d2dde3c4de2a306",
+                    "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+                },
+            )
+            collected: list[dict[str, Any]] = []
+
+            async def _subscribe() -> None:
+                async with client.stream(
+                    "GET", "/v1/sessions/2fa978f2a04f84d78d2dde3c4de2a306/stream"
+                ) as stream:
+                    async for line in stream.aiter_lines():
+                        if line.startswith("data: "):
+                            payload = line[6:]
+                            if payload == "[DONE]":
+                                return
+                            collected.append(json.loads(payload))
+
+            sub_task = asyncio.create_task(_subscribe())
+            await asyncio.sleep(0.2)
+            await client.delete("/v1/sessions/2fa978f2a04f84d78d2dde3c4de2a306")
+            await asyncio.wait_for(sub_task, timeout=5.0)
+
+        heartbeats = [e for e in collected if e.get("type") == "session.heartbeat"]
+        assert len(heartbeats) >= 1, f"Expected at least 1 session.heartbeat, got {collected}"
+        assert collected[0] == {"type": "session.heartbeat"}, (
+            "The first stream frame must be the ready heartbeat. Omnigent waits "
+            "for this before forwarding fast no-replay user input."
+        )
+    finally:
+        _runner_app_module._SESSION_STREAM_HEARTBEAT_S = original
+
+
+@pytest.mark.asyncio
+async def test_create_session() -> None:
+    """``POST /v1/sessions`` spawns harness and returns SessionResponse shape."""
+    app, pm, _hc = _build_lifecycle_app()
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "8e32600337d08f59ad381caf96a90659",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["id"] == "8e32600337d08f59ad381caf96a90659"
+    assert body["agent_id"] == "880b5afda28ad55ff74cbeb9b5fc67fb"
+    assert body["status"] == "idle"
+    assert "created_at" in body
+    assert body["items"] == []
+    assert pm.has_session("8e32600337d08f59ad381caf96a90659")
+
+
+class _NativeSeedServerClient(NullServerClient):
+    """Server client with one stored item; records item listings and event posts."""
+
+    def __init__(self) -> None:
+        self.items_params: list[Any] = []
+        self.file_calls: list[str] = []
+        self.posted_events: list[dict[str, Any]] = []
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        if url.endswith("/items"):
+            self.items_params.append(kwargs.get("params"))
+
+            class _ItemsResponse(NullServerClient._Response):
+                def json(self) -> dict[str, Any]:
+                    return {"data": [{"id": "item_latest"}], "has_more": False}
+
+            return _ItemsResponse()
+        if "/resources/files/" in url:
+            self.file_calls.append(url)
+        return await super().get(url, **kwargs)
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        body = kwargs.get("json")
+        if isinstance(body, dict):
+            self.posted_events.append(body)
+        return await super().post(url, **kwargs)

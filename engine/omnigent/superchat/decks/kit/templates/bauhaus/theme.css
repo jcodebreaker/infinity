@@ -1,0 +1,17 @@
+/* Design derived from nexu-io/open-design design-templates/html-ppt/assets/themes/bauhaus.css@802708f (https://github.com/lewislulu/html-ppt-skill),
+   MIT, Copyright (c) 2026 lewis <sudolewis@gmail.com>; the license is kept in ../LICENSE. Changes: palette, type and motifs
+   kept; rewritten for Superchat's fixed 1920x1080 canvas (px units, no vw/vh or clamp()), expressed as
+   tokens (tokens.css) plus the three surface classes of the shared layouts (../../layouts.css);
+   web fonts replaced by static Latin-subset TTFs embedded at assembly (../../fonts, SIL OFL 1.1,
+   license texts alongside); gradients and shadows dropped (they cannot become PowerPoint shapes). */
+/* Bauhaus: t-a = warm paper, t-b = primary blue, t-c = primary yellow. */
+.slide.t-a { background: #f4efe3; color: #111111; }
+.slide.t-b { background: #1d4eaf; color: #f4efe3; --fg: #f4efe3; --muted: #d3dcf3; --accent: #f4c430; --surface: #2a5cc4; --line: #f4efe3; }
+.slide.t-c { background: #f4c430; color: #111111; --fg: #111111; --muted: #3a2f06; --accent: #a82312; --surface: #f8d55a; --line: #111111; }
+.title, .statement, .quote { text-transform: uppercase; }
+.l-cover .title { font-size: 124px; }
+.l-closing .title, .l-section .title { font-size: 96px; }
+.l-statement .statement { font-size: 92px; }
+.l-quote .quote { font-size: 64px; }
+.stat .value { font-size: 150px; }
+.point, .col .panel, .l-chart .panel { border-width: 3px; }

@@ -1,0 +1,10 @@
+/* Design derived from nexu-io/open-design design-templates/html-ppt/assets/themes/minimal-white.css@802708f (https://github.com/lewislulu/html-ppt-skill),
+   MIT, Copyright (c) 2026 lewis <sudolewis@gmail.com>; the license is kept in ../LICENSE. Changes: palette, type and motifs
+   kept; rewritten for Superchat's fixed 1920x1080 canvas (px units, no vw/vh or clamp()), expressed as
+   tokens (tokens.css) plus the three surface classes of the shared layouts (../../layouts.css);
+   web fonts replaced by static Latin-subset TTFs embedded at assembly (../../fonts, SIL OFL 1.1,
+   license texts alongside); gradients and shadows dropped (they cannot become PowerPoint shapes). */
+/* Minimal White: t-a = white, t-b = ink, t-c = light grey. */
+.slide.t-a { background: #ffffff; color: #0c0d10; }
+.slide.t-b { background: #111216; color: #ffffff; --fg: #ffffff; --muted: #a9adba; --accent: #ffffff; --surface: #1d1e24; --line: #35373f; }
+.slide.t-c { background: #f4f4f5; color: #0c0d10; --fg: #0c0d10; --muted: #55596a; --accent: #111216; --surface: #ffffff; --line: #dcdde2; }

@@ -1,0 +1,49 @@
+{
+  "id": "editorial-serif",
+  "name": "Editorial Serif",
+  "tagline": "Italic and literary",
+  "description": "Cream paper, italic Playfair headlines and a brick-red accent.",
+  "best_for": "brand stories, long-form narratives, text-led talks",
+  "category": "editorial",
+  "mode": "light",
+  "upstream": "https://github.com/lewislulu/html-ppt-skill",
+  "source": "nexu-io/open-design design-templates/html-ppt/assets/themes/editorial-serif.css@802708f",
+  "license": "MIT (see LICENSE); fonts SIL OFL 1.1 (see ../../fonts/OFL-*.txt)",
+  "fonts": [
+    {
+      "family": "Inter",
+      "weight": 400,
+      "style": "normal",
+      "file": "Inter-400.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Inter",
+      "weight": 600,
+      "style": "normal",
+      "file": "Inter-600.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Playfair Display",
+      "weight": 600,
+      "style": "normal",
+      "file": "PlayfairDisplay-600.ttf",
+      "license": "OFL-playfairdisplay.txt"
+    },
+    {
+      "family": "Playfair Display",
+      "weight": 800,
+      "style": "normal",
+      "file": "PlayfairDisplay-800.ttf",
+      "license": "OFL-playfairdisplay.txt"
+    },
+    {
+      "family": "Playfair Display",
+      "weight": 600,
+      "style": "italic",
+      "file": "PlayfairDisplay-600-italic.ttf",
+      "license": "OFL-playfairdisplay.txt"
+    }
+  ]
+}

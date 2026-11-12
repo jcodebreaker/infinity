@@ -1,0 +1,35 @@
+{
+  "id": "nord",
+  "name": "Nord",
+  "tagline": "Dark frost blue",
+  "description": "Arctic dark slate with frost blue accents; quiet and easy on the eyes.",
+  "best_for": "long reviews on screen, technology and operations topics, evening presentations",
+  "category": "dark",
+  "mode": "dark",
+  "upstream": "https://github.com/lewislulu/html-ppt-skill",
+  "source": "nexu-io/open-design design-templates/html-ppt/assets/themes/nord.css@802708f",
+  "license": "MIT (see LICENSE); fonts SIL OFL 1.1 (see ../../fonts/OFL-*.txt)",
+  "fonts": [
+    {
+      "family": "Inter",
+      "weight": 400,
+      "style": "normal",
+      "file": "Inter-400.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Inter",
+      "weight": 600,
+      "style": "normal",
+      "file": "Inter-600.ttf",
+      "license": "OFL-inter.txt"
+    },
+    {
+      "family": "Inter",
+      "weight": 700,
+      "style": "normal",
+      "file": "Inter-700.ttf",
+      "license": "OFL-inter.txt"
+    }
+  ]
+}

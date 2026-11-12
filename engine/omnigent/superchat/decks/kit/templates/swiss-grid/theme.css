@@ -1,0 +1,11 @@
+/* Design derived from nexu-io/open-design design-templates/html-ppt/assets/themes/swiss-grid.css@802708f (https://github.com/lewislulu/html-ppt-skill),
+   MIT, Copyright (c) 2026 lewis <sudolewis@gmail.com>; the license is kept in ../LICENSE. Changes: palette, type and motifs
+   kept; rewritten for Superchat's fixed 1920x1080 canvas (px units, no vw/vh or clamp()), expressed as
+   tokens (tokens.css) plus the three surface classes of the shared layouts (../../layouts.css);
+   web fonts replaced by static Latin-subset TTFs embedded at assembly (../../fonts, SIL OFL 1.1,
+   license texts alongside); gradients and shadows dropped (they cannot become PowerPoint shapes). */
+/* Swiss Grid: t-a = white, t-b = signal red, t-c = black. */
+.slide.t-a { background: #ffffff; color: #111111; }
+.slide.t-b { background: #d6001c; color: #ffffff; --fg: #ffffff; --muted: #ffe3e6; --accent: #ffffff; --surface: #b80018; --line: #ffffff; }
+.slide.t-c { background: #111111; color: #ffffff; --fg: #ffffff; --muted: #bdbdbd; --accent: #ff4d5e; --surface: #1c1c1c; --line: #4a4a4a; }
+.point, .col .panel, .l-chart .panel { border-width: 2px; }

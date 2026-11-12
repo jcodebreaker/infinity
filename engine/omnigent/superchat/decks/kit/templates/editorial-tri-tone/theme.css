@@ -1,0 +1,14 @@
+/* Design derived from nexu-io/open-design design-templates/html-ppt-zhangzara-editorial-tri-tone@802708f (https://github.com/zarazhangrui/beautiful-html-templates),
+   MIT, Copyright (c) 2026 Zara Zhang; the license is kept in ../LICENSE. Changes: palette, type and
+   motifs kept; rewritten for Superchat's fixed 1920x1080 canvas (px units, no vw/vh or clamp()),
+   expressed as tokens (tokens.css) plus the three surface classes of the shared layouts
+   (../../layouts.css); web fonts replaced by static Latin-subset TTFs embedded at assembly
+   (kit/fonts, SIL OFL 1.1, license texts alongside). */
+/* Editorial Tri-Tone: three flat colours, no fourth. t-a = pink, t-b = mustard, t-c = burgundy. */
+.slide.t-a { background: #f2b6c6; color: #7a1f35; --surface: #f7cdd8; }
+.slide.t-b { background: #f2d86a; color: #7a1f35; --surface: #f6e394; }
+.slide.t-c { background: #7a1f35; color: #f2b6c6; --fg: #f2b6c6; --muted: #f2b6c6; --accent: #f2d86a; --surface: #8d2f45; --line: #f2b6c6; --accent-2: #f2b6c6; --accent-3: #f6e394; }
+.slide .lead, .col p, .point p, .stat .label, .l-quote .by, .slide .foot { opacity: 1; }
+.l-quote .quote, .l-statement .statement { font-family: var(--font-serif); font-weight: 400; letter-spacing: -0.01em; }
+.l-cover .title { font-weight: 700; }
+.point, .col .panel { border-width: 3px; }

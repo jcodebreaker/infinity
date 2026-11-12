@@ -1,0 +1,12 @@
+/* Design derived from nexu-io/open-design design-templates/html-ppt/assets/themes/academic-paper.css@802708f (https://github.com/lewislulu/html-ppt-skill),
+   MIT, Copyright (c) 2026 lewis <sudolewis@gmail.com>; the license is kept in ../LICENSE. Changes: palette, type and motifs
+   kept; rewritten for Superchat's fixed 1920x1080 canvas (px units, no vw/vh or clamp()), expressed as
+   tokens (tokens.css) plus the three surface classes of the shared layouts (../../layouts.css);
+   web fonts replaced by static Latin-subset TTFs embedded at assembly (../../fonts, SIL OFL 1.1,
+   license texts alongside); gradients and shadows dropped (they cannot become PowerPoint shapes). */
+/* Academic Paper: t-a = paper, t-b = ink blue, t-c = warm paper. */
+.slide.t-a { background: #fdfcf8; color: #0a0a0a; }
+.slide.t-b { background: #1a3a7a; color: #fdfcf8; --fg: #fdfcf8; --muted: #cdd6ea; --accent: #fdfcf8; --surface: #244a92; --line: #7090c8; }
+.slide.t-c { background: #f1efe4; color: #0a0a0a; --fg: #0a0a0a; --muted: #464646; --accent: #1a3a7a; --surface: #fdfcf8; --line: #cfccc0; }
+.kicker { font-style: italic; text-transform: none; letter-spacing: 0.02em; }
+.slide .foot { letter-spacing: 0.04em; }

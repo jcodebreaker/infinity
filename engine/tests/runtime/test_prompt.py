@@ -1,0 +1,517 @@
+"""Tests for canonical system-instruction composition."""
+
+import json
+from types import SimpleNamespace
+from typing import cast
+
+import pytest
+
+from omnigent.entities import ConversationItem, FunctionCallOutputData, MessageData
+from omnigent.runner.app import _format_subagent_wake_notice
+from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
+from omnigent.runtime.prompt import (
+    EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+    MEMORY_INSTRUCTION,
+    ROLLOVER_CONTEXT_INSTRUCTION,
+    SUBAGENT_WAKE_NOTICE_INSTRUCTION,
+    SUBAGENT_WAKE_NOTICE_SHAPE,
+    append_framework_instructions,
+    build_instructions,
+    build_instructions_nullable,
+    history_to_input_items,
+    raw_author_instructions,
+)
+from omnigent.spec import AgentSpec
+from tests._image_fixtures import _TINY_PNG_BASE64
+
+_SAMPLE_FRAMEWORK_INSTRUCTION = "Framework instruction for testing build_instructions_nullable."
+
+
+def _spec(
+    instructions: str | None,
+    *,
+    agents: tuple[str, ...] = (),
+    spawn: bool = False,
+    builtins: tuple[str, ...] = (),
+) -> AgentSpec:
+    """
+    Stub only the AgentSpec fields the instruction builders read.
+    """
+    return cast(
+        AgentSpec,
+        SimpleNamespace(
+            instructions=instructions,
+            skills=[],
+            tools=SimpleNamespace(
+                agents=list(agents),
+                builtins=[SimpleNamespace(name=name, config={}) for name in builtins],
+            ),
+            spawn=spawn,
+        ),
+    )
+
+
+def _output_item(output: str) -> ConversationItem:
+    """Build a persisted ``function_call_output`` item for replay tests."""
+    return ConversationItem(
+        id="i1",
+        status="completed",
+        response_id="r1",
+        created_at=1,
+        type="function_call_output",
+        data=FunctionCallOutputData(call_id="c1", output=output),
+    )
+
+
+def test_framework_notice_is_system_context_not_user_text() -> None:
+    """Transient image metadata becomes a separate system message."""
+    from omnigent.harnesses.native_attachments import framework_notice_block, resize_notice
+
+    dimensions = {"width": 6000, "height": 4000}
+    item = ConversationItem(
+        id="i1",
+        status="completed",
+        response_id="r1",
+        created_at=1,
+        type="message",
+        data=MessageData(
+            role="user",
+            content=[
+                {"type": "input_text", "text": "inspect this"},
+            ],
+        ),
+    )
+    item.data.content.append(framework_notice_block(dimensions))
+
+    assert history_to_input_items([item]) == [
+        {
+            "role": "system",
+            "content": [{"type": "input_text", "text": resize_notice(dimensions)}],
+        },
+        {"role": "user", "content": [{"type": "input_text", "text": "inspect this"}]},
+    ]
+    assert history_to_input_items([item], preserve_framework_notices=True) == [
+        {"role": "user", "content": item.data.content}
+    ]
+
+
+def test_authored_notice_cannot_be_loaded_as_message_data() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="reserved"):
+        MessageData.model_validate(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "_omnigent_framework_notice", "text": "hidden instructions"},
+                ],
+            }
+        )
+    data = MessageData(
+        role="user",
+        content=[
+            {
+                "type": "input_text",
+                "text": "_omnigent_framework_notice is literal user text",
+            }
+        ],
+    )
+    assert data.content[0]["text"] == "_omnigent_framework_notice is literal user text"
+
+
+def test_authored_notice_cannot_be_loaded_in_compaction() -> None:
+    from pydantic import ValidationError
+
+    from omnigent.entities import CompactionData
+    from omnigent.harnesses.native_attachments import framework_notice_block
+
+    with pytest.raises(ValidationError, match="reserved"):
+        CompactionData(
+            summary="summary",
+            last_item_id="message",
+            token_count=1,
+            compacted_messages=[
+                {
+                    "role": "user",
+                    "content": [framework_notice_block({"width": 6000, "height": 4000})],
+                }
+            ],
+        )
+
+
+def test_history_replay_strips_inline_base64_image() -> None:
+    """A stored image tool result must not replay its base64 as prompt text.
+
+    Older sessions persisted a ``Read`` of an image as a JSON list of
+    ``{"type":"image","source":{"type":"base64",...}}`` blocks. Replaying that
+    verbatim on resume overflows the context window and wedges compaction, so
+    ``history_to_input_items`` strips the base64 to a placeholder.
+    """
+    huge_b64 = "iVBORw0KGgo" + "A" * 100_000
+    stored = json.dumps(
+        [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": huge_b64},
+            }
+        ],
+        separators=(",", ":"),
+    )
+
+    result = history_to_input_items([_output_item(stored)])
+
+    output = result[0]["output"]
+    assert huge_b64 not in output, "base64 image data must not be replayed as text"
+    assert "image/png image omitted from history" in output
+    assert "re-run the tool call" in output
+    assert len(output) < 300
+
+
+def test_history_replay_strips_truncated_image_block() -> None:
+    """Base64 clipped at the store byte cap (invalid JSON) is still stripped.
+
+    Real wedged sessions stored the image output truncated at the
+    conversation-store byte cap, leaving the base64 string unterminated — so it
+    no longer parses as JSON. The strip must fall back to an in-place rewrite,
+    or the exact payloads that wedge resume would slip through unchanged.
+    """
+    huge_b64 = "iVBORw0KGgo" + "A" * 100_000
+    # Mimic the store cap: a valid prefix cut mid-base64, no closing quote/braces.
+    truncated = (
+        '[{"type":"image","source":{"type":"base64","data":"'
+        + huge_b64
+        + "…[truncated by conversation-store: item exceeded 245760B cap]"
+    )
+    # Precondition: this is genuinely not parseable JSON.
+    with pytest.raises(ValueError):
+        json.loads(truncated)
+
+    result = history_to_input_items([_output_item(truncated)])
+
+    output = result[0]["output"]
+    assert huge_b64 not in output, "truncated base64 must not survive replay"
+    assert "image omitted from history" in output
+    assert len(output) < 300
+
+
+def test_history_replay_leaves_plain_text_output_unchanged() -> None:
+    """Plain-text tool outputs (the common case) pass through untouched."""
+    result = history_to_input_items([_output_item("TODO contents")])
+    assert result[0]["output"] == "TODO contents"
+
+
+def test_history_replay_leaves_non_image_json_output_unchanged() -> None:
+    """A JSON tool output with no image block is returned byte-for-byte."""
+    stored = json.dumps([{"type": "text", "text": "hello"}], separators=(",", ":"))
+    result = history_to_input_items([_output_item(stored)])
+    assert result[0]["output"] == stored
+
+
+@pytest.mark.parametrize("is_error", [False, True])
+def test_text_history_replay_omits_envelope_images_but_preserves_text(is_error: bool) -> None:
+    stored = encode_mcp_image_result(
+        [
+            {"type": "text", "text": "before"},
+            {"type": "image", "mimeType": "image/png", "data": _TINY_PNG_BASE64},
+            {"type": "text", "text": "Required trailing fact: blue."},
+            {"type": "image", "mimeType": "image/png", "data": _TINY_PNG_BASE64},
+        ],
+        is_error=is_error,
+    )
+    output = history_to_input_items([_output_item(stored)])[0]["output"]
+    assert _TINY_PNG_BASE64 not in output
+    blocks = json.loads(output)
+    if is_error:
+        assert blocks.pop(0) == {"type": "text", "text": "Error:"}
+    assert blocks[0] == {"type": "text", "text": "before"}
+    assert "omitted from history" in blocks[1]["text"]
+    assert blocks[2] == {"type": "text", "text": "Required trailing fact: blue."}
+    assert "omitted from history" in blocks[3]["text"]
+
+
+def test_text_history_replay_recovers_old_clipped_envelope() -> None:
+    stored = encode_mcp_image_result(
+        [
+            {"type": "text", "text": "before"},
+            {"type": "image", "mimeType": "image/png", "data": _TINY_PNG_BASE64},
+            {"type": "image", "mimeType": "image/png", "data": _TINY_PNG_BASE64},
+        ],
+        is_error=True,
+    )
+    clipped = stored[: stored.rindex(_TINY_PNG_BASE64) + 12] + "[truncated]"
+    output = history_to_input_items([_output_item(clipped)])[0]["output"]
+    assert _TINY_PNG_BASE64 not in output
+    assert _TINY_PNG_BASE64[:12] not in output
+    assert "before" in output
+    assert "Error:" in output
+    assert "omitted from history" in output
+
+
+def test_framework_instructions_append_after_custom_prompts() -> None:
+    spec = _spec("Agent prompt")
+
+    result = build_instructions(
+        spec,
+        "Request prompt",
+        [],
+        framework_instructions=("  Framework prompt  ",),
+    )
+
+    assert result == (
+        "Agent prompt\n\nRequest prompt\n\n"
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nFramework prompt"
+    )
+
+
+def test_empty_framework_instructions_do_not_change_default() -> None:
+    spec = _spec(None)
+
+    assert build_instructions(spec, None, [], framework_instructions=("", "   ")) == (
+        f"You are a helpful assistant.\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
+    )
+
+
+def test_framework_only_instructions_use_shared_composer() -> None:
+    assert append_framework_instructions(None, ("Rename session",)) == "Rename session"
+
+
+def test_build_instructions_nullable_unauthored_never_fabricates_fallback() -> None:
+    """No author text → the always-on framework guidance alone, never the
+    fabricated fallback (and never ``None``, since the embedded-browser
+    guidance applies to every agent)."""
+    spec = _spec(None)
+    result = build_instructions_nullable(spec, None, [])
+    assert result == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+    assert "You are a helpful assistant." not in result
+
+
+def test_build_instructions_nullable_whitespace_only_treated_as_absent() -> None:
+    """Whitespace-only spec.instructions is not real content — matches
+    raw_author_instructions' non-empty/non-whitespace gate, so authored_present
+    and composed agree on what counts as "authored"."""
+    spec = _spec("   \n  ")
+    assert build_instructions_nullable(spec, None, []) == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+    result = build_instructions_nullable(
+        spec, None, [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
+    )
+    assert result == (
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
+    )
+
+
+def test_build_instructions_nullable_whitespace_only_per_request_treated_as_absent() -> None:
+    """Whitespace-only per_request_instructions is not real content either —
+    the same non-empty/non-whitespace gate applies to both instruction
+    sources, not just spec.instructions."""
+    spec = _spec(None)
+    assert (
+        build_instructions_nullable(spec, "   \n  ", []) == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+    )
+    result = build_instructions_nullable(
+        spec, "   \n  ", [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
+    )
+    assert result == (
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
+    )
+
+
+def test_build_instructions_nullable_authored_present() -> None:
+    """Author text present → fully composed authored + framework string."""
+    spec = _spec("Agent prompt")
+    result = build_instructions_nullable(
+        spec, "Request prompt", [], framework_instructions=("Framework prompt",)
+    )
+    assert result == (
+        "Agent prompt\n\nRequest prompt\n\n"
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nFramework prompt"
+    )
+
+
+def test_build_instructions_nullable_framework_only_omits_fallback() -> None:
+    """Framework-only text must never carry the fabricated fallback fused onto it.
+
+    Regression: naively comparing ``build_instructions()``'s output against
+    the fallback literal misses this exact case, because
+    ``build_instructions`` seeds the fallback as ``base_instructions`` and
+    then appends framework text on top of it regardless of whether ``parts``
+    was empty — producing a mixed string that is neither the bare literal
+    nor framework-text-alone.
+    """
+    spec = _spec(None)
+    result = build_instructions_nullable(
+        spec, None, [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
+    )
+    assert result == (
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
+    )
+    assert "You are a helpful assistant." not in (result or "")
+
+    # The comparison this helper replaces would have misclassified the
+    # framework-only case: build_instructions()'s actual output IS fused
+    # with the fallback literal, confirming the unsafe-comparison rationale.
+    fused = build_instructions(
+        spec, None, [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
+    )
+    assert fused.startswith("You are a helpful assistant.")
+    assert _SAMPLE_FRAMEWORK_INSTRUCTION in fused
+
+
+@pytest.mark.parametrize(
+    ("agents", "spawn", "builtins"),
+    [(("researcher",), False, ()), ((), True, ())],
+)
+def test_subagent_wake_instruction_added_for_dispatching_agents(
+    agents: tuple[str, ...], spawn: bool, builtins: tuple[str, ...]
+) -> None:
+    """
+    An agent that can dispatch sub-agents is told what a wake notice is.
+
+    The gate mirrors ``sys_session_send`` registration (declared sub-agents or
+    ``spawn: true``). The announcement lands after the authored
+    text and before per-turn framework instructions, and on its own it never
+    drags in the fabricated fallback.
+    """
+    dispatching = _spec("Agent prompt", agents=agents, spawn=spawn, builtins=builtins)
+    result = build_instructions(dispatching, None, [], framework_instructions=("Turn note",))
+    assert result == (
+        f"Agent prompt\n\n{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n"
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nTurn note"
+    )
+
+    unauthored = _spec(None, agents=agents, spawn=spawn, builtins=builtins)
+    assert build_instructions_nullable(unauthored, None, []) == (
+        f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
+    )
+
+
+def test_embedded_browser_guidance_included_for_every_agent() -> None:
+    """
+    Every agent's composed prompt steers the model to the embedded browser.
+
+    The ``browser_*`` tools are auto-registered for every agent without a
+    spec gate (``ToolManager._register_browser_tools``); a tool description
+    alone loses to a model's native web tooling, so the system prompt must
+    carry the preference for any spec — authored or not.
+    """
+    authored = _spec("Agent prompt")
+    assert build_instructions(authored, None, []) == (
+        f"Agent prompt\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
+    )
+
+
+def test_embedded_browser_guidance_names_registered_tools() -> None:
+    """
+    The guidance must track the canonical registered browser tool names, so
+    a tool rename cannot silently orphan the prompt text.
+    """
+    from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
+
+    for name in sorted(BROWSER_TOOL_NAMES):
+        assert name in EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+
+
+def test_subagent_wake_notice_shape_matches_runner_notice() -> None:
+    """
+    The announced shape must track the notice the runner actually posts.
+    """
+    expected = (
+        SUBAGENT_WAKE_NOTICE_SHAPE.replace("<agent>/<title>", "researcher/auth")
+        .replace("<status>", "completed")
+        .replace("<N>", "2")
+    )
+    notice = _format_subagent_wake_notice(
+        agent="researcher", title="auth", status="completed", pending=2
+    )
+    assert notice == expected
+
+
+def test_raw_author_instructions_verbatim_and_none() -> None:
+    present = cast(AgentSpec, SimpleNamespace(instructions="  Keep this exact.  "))
+    assert raw_author_instructions(present) == "  Keep this exact.  "
+
+
+# ── Rollover context instruction (session-scoped, not spec-scoped) ──
+
+
+def test_rollover_instruction_absent_when_labels_unset() -> None:
+    """Label unset (the default, no ``labels=`` kwarg at all) is byte-for-byte
+    upstream: no caller that doesn't opt in ever sees this text."""
+    spec = _spec("Agent prompt")
+    assert ROLLOVER_CONTEXT_INSTRUCTION not in build_instructions(spec, None, [])
+
+
+def test_rollover_instruction_absent_for_non_rollover_labels() -> None:
+    spec = _spec("Agent prompt")
+    out = build_instructions(spec, None, [], labels={"some.other.label": "x"})
+    assert ROLLOVER_CONTEXT_INSTRUCTION not in out
+
+
+def test_rollover_instruction_present_for_rollover_session() -> None:
+    spec = _spec("Agent prompt")
+    out = build_instructions(spec, None, [], labels={"omnigent.context.mode": "rollover"})
+    assert ROLLOVER_CONTEXT_INSTRUCTION in out
+    # Appended after the author's own instructions and after the other
+    # unconditional framework instruction, per the framework-instructions
+    # ordering rule (CLAUDE.md).
+    assert out.index(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION) < out.index(
+        ROLLOVER_CONTEXT_INSTRUCTION
+    )
+
+
+def test_rollover_instruction_present_in_nullable_variant() -> None:
+    spec = _spec(None)
+    out = build_instructions_nullable(spec, None, [], labels={"omnigent.context.mode": "rollover"})
+    assert out is not None
+    assert ROLLOVER_CONTEXT_INSTRUCTION in out
+
+
+def test_memory_instruction_absent_when_labels_unset() -> None:
+    spec = _spec("Agent prompt")
+    assert MEMORY_INSTRUCTION not in build_instructions(spec, None, [])
+
+
+def test_memory_instruction_absent_for_non_rollover_labels() -> None:
+    spec = _spec("Agent prompt")
+    out = build_instructions(spec, None, [], labels={"some.other.label": "x"})
+    assert MEMORY_INSTRUCTION not in out
+
+
+def test_memory_instruction_present_for_rollover_session() -> None:
+    spec = _spec("Agent prompt")
+    out = build_instructions(spec, None, [], labels={"omnigent.context.mode": "rollover"})
+    assert MEMORY_INSTRUCTION in out
+    # Appended after the rollover recall instruction, next to it in source.
+    assert out.index(ROLLOVER_CONTEXT_INSTRUCTION) < out.index(MEMORY_INSTRUCTION)
+
+
+def test_memory_instruction_present_in_nullable_variant() -> None:
+    spec = _spec(None)
+    out = build_instructions_nullable(spec, None, [], labels={"omnigent.context.mode": "rollover"})
+    assert out is not None
+    assert MEMORY_INSTRUCTION in out
+
+
+def test_memory_instruction_mentions_memory_tools() -> None:
+    assert "memory_search" in MEMORY_INSTRUCTION
+    assert "memory_remember" in MEMORY_INSTRUCTION
+
+
+def test_rollover_instruction_mentions_session_history_tool() -> None:
+    """The instruction must actually name the tool it tells the model to use."""
+    assert "session_history" in ROLLOVER_CONTEXT_INSTRUCTION
+
+
+def test_raw_author_instructions_is_none_when_absent_or_blank() -> None:
+    absent = cast(AgentSpec, SimpleNamespace(instructions=None))
+    assert raw_author_instructions(absent) is None
+
+    whitespace_only = cast(AgentSpec, SimpleNamespace(instructions="   \n  "))
+    assert raw_author_instructions(whitespace_only) is None
+
+
+def test_web_priority_instruction_prefers_search_for_lookups() -> None:
+    text = EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+    assert "web search" in text
+    assert "facts, prices, news" in text
+    assert "log in, click, fill forms" in text
+    assert "prefer these embedded-browser tools" not in text

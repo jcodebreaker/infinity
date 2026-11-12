@@ -1,0 +1,20 @@
+{
+  "note": "Stands in for the values the Muse computes with pandas from the person's files.",
+  "revenue": {
+    "name": "Revenue (k)",
+    "labels": ["Q1", "Q2", "Q3", "Q4"],
+    "values": [4500, 0, 6200, 7100]
+  },
+  "trend": {
+    "name": "Active users",
+    "labels": ["Jan", "Feb", "Mar", "Apr", "May"],
+    "values": [320, 350, 420, 410, 505]
+  },
+  "share": { "name": "Share", "labels": ["Direct", "Partner", "Other"], "values": [45, 35, 20] },
+  "table": [
+    ["Region", "Revenue (k)", "Growth"],
+    ["North", "6,200", "+12%"],
+    ["South", "4,500", "+4%"],
+    ["West", "7,100", "+18%"]
+  ]
+}

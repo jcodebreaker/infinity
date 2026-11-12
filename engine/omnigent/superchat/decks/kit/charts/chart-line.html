@@ -1,0 +1,36 @@
+<!-- Portions modified from nexu-io/open-design design-templates/html-ppt/templates/single-page/chart-line.html@802708f,
+     MIT (Copyright (c) 2026 lewis, see design-templates/html-ppt/LICENSE; the repository is Apache-2.0).
+     Changes: the <section> alone (Superchat supplies the deck around it); Superchat layout classes and data-superchat-id
+     on every element; a caption that cites the data source; a unique canvas id per slide; the colors are
+     read from the canvas' own CSS tokens (--accent, --accent-2, --accent-3, --muted, --line) so a slide
+     surface can recolor them; the chart is in a fixed-height container (data-report skill rule); the
+     script carries data-superchat-chart. The Chart.js options are otherwise as in the template. -->
+<section class="slide t-a l-chart" data-screen-label="05 DAU and retention" data-superchat-id="dau-line">
+  <div class="kicker" data-superchat-id="dau-line-kicker">Chart · line</div>
+  <h2 class="title" data-superchat-id="dau-line-title">Daily actives and retention side by side</h2>
+  <div class="chart" data-superchat-id="dau-line-chart"><canvas id="dau-line-canvas" data-superchat-id="dau-line-canvas"></canvas></div>
+  <p class="source" data-superchat-id="dau-line-source">Source: analytics/weekly.csv, columns dau_k and retention_pct</p>
+  <script data-superchat-chart>
+    addEventListener('DOMContentLoaded',()=>{
+      const canvas=document.getElementById('dau-line-canvas');
+      const css=getComputedStyle(canvas);
+      const accent=css.getPropertyValue('--accent').trim();
+      const acc2=css.getPropertyValue('--accent-2').trim();
+      const text2=css.getPropertyValue('--muted').trim();
+      const border=css.getPropertyValue('--line').trim();
+      new Chart(canvas,{type:'line',
+        data:{labels:['W1','W2','W3','W4','W5','W6','W7','W8','W9','W10','W11','W12'],
+          datasets:[
+            {label:'DAU (K)',data:[12,14,15,19,24,28,33,38,45,51,58,66],
+              borderColor:accent,backgroundColor:accent+'22',fill:true,tension:.4,borderWidth:3,pointRadius:4},
+            {label:'Retention %',data:[38,40,42,45,48,50,53,55,58,60,62,64],
+              borderColor:acc2,backgroundColor:acc2+'22',fill:true,tension:.4,borderWidth:3,pointRadius:4}
+          ]},
+        options:{responsive:true,maintainAspectRatio:false,
+          plugins:{legend:{labels:{color:text2}}},
+          scales:{x:{ticks:{color:text2},grid:{color:border}},
+                  y:{ticks:{color:text2},grid:{color:border}}}}});
+    });
+  </script>
+  <div class="foot" data-superchat-id="dau-line-foot"><span data-superchat-id="dau-line-foot-left">Deck name</span><span data-superchat-id="dau-line-foot-page">04</span></div>
+</section>

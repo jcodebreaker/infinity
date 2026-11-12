@@ -1,0 +1,11 @@
+/* Design derived from nexu-io/open-design design-templates/html-ppt/assets/themes/corporate-clean.css@802708f (https://github.com/lewislulu/html-ppt-skill),
+   MIT, Copyright (c) 2026 lewis <sudolewis@gmail.com>; the license is kept in ../LICENSE. Changes: palette, type and motifs
+   kept; rewritten for Superchat's fixed 1920x1080 canvas (px units, no vw/vh or clamp()), expressed as
+   tokens (tokens.css) plus the three surface classes of the shared layouts (../../layouts.css);
+   web fonts replaced by static Latin-subset TTFs embedded at assembly (../../fonts, SIL OFL 1.1,
+   license texts alongside); gradients and shadows dropped (they cannot become PowerPoint shapes). */
+/* Corporate Clean: t-a = white, t-b = navy, t-c = pale grey. */
+.slide.t-a { background: #ffffff; color: #0a2540; }
+.slide.t-b { background: #0a2540; color: #ffffff; --fg: #ffffff; --muted: #b9c7da; --accent: #8fb0ff; --surface: #12335a; --line: #2e4f78; }
+.slide.t-c { background: #eef2f7; color: #0a2540; --fg: #0a2540; --muted: #425466; --accent: #1d4ed8; --surface: #ffffff; --line: #d3dae4; }
+.kicker { font-weight: 600; }

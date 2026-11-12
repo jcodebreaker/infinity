@@ -1,0 +1,39 @@
+# Build context for deployment/engine.Dockerfile (the repo root). Everything is excluded, then
+# only what the Dockerfile COPYs is let back in, so the context stays small and nothing local
+# (.env, data, caches, worktrees) can reach the image.
+*
+
+# web stage
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!.npmrc
+!tsconfig.base.json
+!patches/
+!web/packages/
+!web/app/
+
+# agents stage (the bundles are rendered there, so the committed engine/agents/bundles stays out)
+!engine/agents/render-agents.mjs
+!engine/agents/templates/
+
+# python stage
+!engine/pyproject.toml
+!engine/setup.py
+!engine/LICENSE
+!engine/NOTICE
+!engine/sdks/python-client/
+!engine/omnigent/
+
+# engine stage
+!deployment/entrypoint.py
+!deployment/engine/start.sh
+!deployment/engine/*.tmpl
+
+# Local build output and caches inside the folders above.
+**/node_modules
+**/dist
+**/__pycache__
+**/*.pyc
+**/.venv
+engine/omnigent/server/static/web-ui
