@@ -31,6 +31,9 @@ A restart is most cold starts (ADR 0033: 17 of 20). pi ran with `--no-session`, 
 
 ## Consequences
 
+- For pi the view start is the last item the epoch block covers (the block already holds the shown tail), so recall no longer leaves out those few shown turns.
+- Known gaps, accepted: with two or more messages buffered behind one turn a re-render may order them differently; a wake or Helper notice that opens a turn without a stored item gets no prefix, so that epoch takes the new-epoch branch; a Result reminder and image parts added in the prefix are not stored.
+
 - Restarts and idle reaps keep the exact conversation when the file is still there, and re-render it when the window is small enough. A host replacement loses the file; large windows then start from the checkpoint as before.
 - The Claude harness keeps its own history path until its SDK is shown to load the same render.
 - The Assistant's shell can read its own window file. It holds what `session_history` already returns, plus the system prompt, which is in this repository.
