@@ -178,8 +178,16 @@ class Engine:
         return json.loads(raw) if raw else None
 
     def items(self, session_id: str) -> list[dict[str, Any]]:
-        snapshot = self.call("GET", f"/v1/sessions/{session_id}?include_liveness=false")
-        return list(snapshot.get("items") or [])
+        """Every item, oldest first. The session snapshot stops at 100 items, and the turns'
+        items are found by slicing past the count before the message, so read every page."""
+        items: list[dict[str, Any]] = []
+        after = ""
+        while True:
+            page = self.call("GET", f"/v1/sessions/{session_id}/items?limit=1000{after}")
+            items.extend(page.get("data") or [])
+            if not page.get("has_more"):
+                return items
+            after = f"&after={page['last_id']}"
 
     def status(self, session_id: str) -> str:
         path = f"/v1/sessions/{session_id}?include_items=false&include_liveness=false"
