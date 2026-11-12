@@ -63,8 +63,9 @@ LOOKBACK_SECONDS = 36 * 3600
 NIGHTLY_DELAY_SECONDS = 1200
 NIGHTLY_WINDOW_SECONDS = 36 * 3600
 
-# Memory rules in step 3 (MEMORY_POLICY, shared with the upkeep) are portions modified from getnao/nao
-# apps/backend/src/components/ai/memory-system-prompt.tsx@5bde830, Apache-2.0; changes: see NOTICE.
+# Memory rules in step 3 (MEMORY_POLICY, shared with the upkeep) are portions modified from
+# getnao/nao apps/backend/src/components/ai/memory-system-prompt.tsx@5bde830, Apache-2.0;
+# changes: see NOTICE.
 QUIET_PROMPT = (
     """\
 This is a quiet moment: the person stepped away. You keep their notes; you do not act, the person \

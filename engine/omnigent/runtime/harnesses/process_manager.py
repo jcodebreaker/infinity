@@ -44,7 +44,7 @@ from omnigent.harness_plugins import missing_install_packages
 from omnigent.harnesses import _proc
 from omnigent.harnesses._subprocess_lifecycle import close_subprocess_transport
 from omnigent.harnesses.agent_env import strip_desktop_session_env
-from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent.runner.identity import HARNESS_IDLE_TIMEOUT_ENV_VAR, strip_runner_auth_secrets
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._harness_zygote_client import (
     HarnessZygoteClient,
@@ -116,7 +116,7 @@ _DEFAULT_REAPER_INTERVAL_S = 60
 # Env override for the harness idle-reap window, so operators can tune it
 # without code changes (mirrors the runner-level ``runner.idle_timeout_s``).
 # ``0`` disables harness reaping entirely.
-_HARNESS_IDLE_TIMEOUT_ENV = "OMNIGENT_HARNESS_IDLE_TIMEOUT_S"
+_HARNESS_IDLE_TIMEOUT_ENV = HARNESS_IDLE_TIMEOUT_ENV_VAR
 
 
 def _resolve_harness_idle_timeout_s() -> float:

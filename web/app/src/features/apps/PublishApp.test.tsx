@@ -86,13 +86,13 @@ const dialogButtons = () => [...document.querySelectorAll<HTMLElement>("button")
 const dialogByText = (text: string) =>
   dialogButtons().find((b) => b.textContent?.trim() === text || b.ariaLabel === text);
 
-it("the file dialog offers Edit, Publish and Download for an HTML artifact", async () => {
+it("the file dialog offers Select, Publish and Download for an HTML artifact", async () => {
   api.listVersions.mockResolvedValue([{ id: "a1", version: 3, name: "dog.html", createdAt: "" }]);
   api.getById.mockResolvedValue(libraryArtifact("text/html", "dog.html"));
   await mount(<ArtifactPreviewDialog artifactId="a1" onOpenChange={() => {}} />);
   await tick();
   expect(dialogByText("Publish…")).toBeTruthy();
-  expect(dialogByText("Edit")).toBeTruthy();
+  expect(dialogByText("Select")).toBeTruthy();
   expect(dialogByText("Download")).toBeTruthy();
 });
 

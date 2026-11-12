@@ -208,7 +208,7 @@ footer{color:var(--ink-2);font-size:12.5px;border-top:1px solid var(--line);padd
     <button type="button" class="open-btn" id="openLogic" aria-expanded="false" aria-controls="logic">How a signal is decided <span aria-hidden="true">▾</span></button>
 
     <div class="logic" id="logic" hidden>
-      <div class="chart" role="group" aria-label="Decision flow">
+      <section class="chart" aria-label="Decision flow">
         <div class="lane">
           <div class="start">📬 Something arrives</div>
           <div class="arr" aria-hidden="true"></div>
@@ -236,7 +236,7 @@ footer{color:var(--ink-2);font-size:12.5px;border-top:1px solid var(--line);padd
           <div class="finish">💬 One message with a draft</div>
         </div>
         <div class="later-note"><span class="end e-wait">Later</span> tries again at the next moment that passes. Waited too long → never sent late, the topic just shows <b>New</b> on Home.</div>
-      </div>
+      </section>
 
       <div class="detail" id="detail" aria-live="polite">
         <p class="hint">Click a step to see its exact rule.</p>

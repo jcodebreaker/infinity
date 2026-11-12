@@ -355,7 +355,8 @@ def fold(events: Sequence[Mapping[str, Any]], round_id: str | None = None) -> di
     v["live_words"] = "".join(cur_words or []) if v["settled_at"] is None else ""
     unsettled = v["status"] == "running"
     v["turn_due"] = unsettled and (
-        (assistant_running and not turned) or (not assistant_running and bool(unconsumed - steered))
+        (assistant_running and not turned)
+        or (not assistant_running and bool(unconsumed - steered))
     )
     v["read_on_idle"] = unsettled and not assistant_running and bool(steered)
     end = v["settled_at"] if v["settled_at"] is not None else (mine[-1]["t"] if mine else 0)

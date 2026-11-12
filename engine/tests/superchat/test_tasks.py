@@ -198,12 +198,13 @@ def _turn_ended(env: _Env, rid: str) -> None:
 def test_a_round_not_settled_is_open_work_until_its_view_settles(env: _Env) -> None:
     """The Round view is the only source: a Round reads as open from the asking Round's turns
     while its view is not settled, with its Helpers as the view has them, whatever their
-    sessions say, and stops the moment it settles. The asking Round is never its own open work,
-    and a Round whose last turn failed is settled."""
+    sessions say, and stops the moment it settles. The asking Round is its own open work only
+    while a Helper of it runs, and a Round whose last turn failed is settled."""
     rid = _open_round(env, "a deck about our 2026 sales")
     helper = _start_helper(env, rid, "Sales deck")
     _turn_ended(env, rid)
-    assert _view(env)["rounds"] == []  # the Round the turn is in
+    # the Round the turn is in shows while its Helper runs
+    assert [r["round_id"] for r in _view(env)["rounds"]] == [rid]
     view = _view(env, helper)
     assert (view["conversation_id"], view["is_helper"], view["round_id"]) == (env.chat, True, rid)
     assert view["message"] == "a deck about our 2026 sales" and view["by_person"] is False
@@ -472,7 +473,8 @@ async def test_the_runner_reads_a_working_round_until_its_helper_ends(env: _Env)
     later = _open_round(env, "what about the colours?")
     blocks = await runtime.message_prefix(engine, env.chat, ["what about the colours?"])
     assert blocks == [
-        'Open task: "a new Acme vs Globex deck" · helper "Acme vs Globex deck" · next: wait for the helper'
+        'Open task: "a new Acme vs Globex deck" · helper "Acme vs Globex deck" · '
+        "next: wait for the helper"
     ]
     assert runtime.current_round(env.chat) == later
     runtime.turn_ended(env.chat)

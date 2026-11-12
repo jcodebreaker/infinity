@@ -50,6 +50,7 @@ from omnigent.context.labels import (
     is_artifact_chat,
     is_superside_chat,
 )
+from omnigent.context.titles import clip, one_line_summary
 from omnigent.context.tool_digest import call_digest
 from omnigent.entities.session_project import project_slug_from_workspace
 from omnigent.harnesses.executor import CHECKLIST_TOOL
@@ -88,7 +89,6 @@ from omnigent.superchat.rounds.fold import (
 from omnigent.superchat.rounds.store import RoundEvent, SqlAlchemyRoundStore
 from omnigent.superchat.subagents import helper_folder
 from omnigent.superchat.tasks.record import CHECK_TOOLS
-from omnigent.superchat.titles import clip, one_line_summary
 
 _logger = logging.getLogger(__name__)
 
@@ -367,7 +367,7 @@ class Recorder:
                 await asyncio.sleep(_RETRY_AFTER)
                 try:
                     await asyncio.to_thread(self._store.append, batch)
-                except Exception:
+                except Exception:  # noqa: BLE001 — a second failure drops the batch, logged there
                     self._dropped(batch)
                     continue
             if self._on_written is not None:
@@ -382,7 +382,7 @@ class Recorder:
         in it ends failed, reason :data:`EVENTS_LOST`, once the store takes events again, so it
         never reads "working" over a lost end; the Sweep ends other turns it lost from the
         stored conversation."""
-        _logger.error("round events not stored (%d dropped)", len(batch), exc_info=True)
+        _logger.error("round events not stored (%d dropped)", len(batch))
         lost = {
             e.round_id: e.conversation_id
             for e in batch

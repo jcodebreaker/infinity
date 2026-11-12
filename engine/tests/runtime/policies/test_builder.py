@@ -1335,14 +1335,10 @@ def test_agent_rebind_after_spec_resolution_fails_closed(
     agent_a = "1" * 32
 
     def _switch(conv_id: str, new_agent_id: str) -> None:
-        # switch_conversation_agent inserts the target agent row, so each
-        # switch needs its own id.
+        # switch_conversation_agent rebinds the row to the target agent id in place.
         conversation_store.switch_conversation_agent(
             conv_id,
             new_agent_id=new_agent_id,
-            new_agent_name="other",
-            new_agent_bundle_location="other/bundle",
-            new_agent_description=None,
             copy_model_settings=False,
             presentation_labels={},
             previous_builtin_id=None,
@@ -1685,9 +1681,6 @@ def test_mid_build_change_fails_closed_on_every_provenance(
             conversation_store.switch_conversation_agent(
                 conv.id,
                 new_agent_id=uuid.uuid4().hex,
-                new_agent_name="other",
-                new_agent_bundle_location="other/bundle",
-                new_agent_description=None,
                 copy_model_settings=False,
                 presentation_labels={},
                 previous_builtin_id=None,
@@ -1848,9 +1841,6 @@ def test_engine_refuses_a_tree_assembled_across_a_change(
                     self._inner.switch_conversation_agent(
                         child.id,
                         new_agent_id=uuid.uuid4().hex,
-                        new_agent_name="other",
-                        new_agent_bundle_location="other/bundle",
-                        new_agent_description=None,
                         copy_model_settings=False,
                         presentation_labels={},
                         previous_builtin_id=None,

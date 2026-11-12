@@ -101,6 +101,18 @@ with `session_history` or `recall`. The harness's own compaction is switched off
 (`DISABLE_AUTO_COMPACT` on `claude-sdk`, `compaction.enabled=false` on `pi`) so two compactors never
 fight. Decisions: [ADR 0031](adr/0031-a-new-session-is-assembled-from-state.md).
 
+**A pi Conversation starts on its record ([ADR 0044](adr/0044-the-record-is-the-window.md)).** The
+record keeps what the model saw: each turn-opening message's prefix blocks (`context_prefix`), where
+pi read each steer (`delivered_after_call_id`), and the block an epoch started from (a hidden
+`epoch_block` item named by the `omnigent.context.epoch_block_item_id` label). `context/window.py`
+renders the epoch block plus every item after the view start as typed messages; the runner writes
+them as a pi session file in host scratch space and starts pi with `--session <file>`
+(`runner/app.py`, `_pi_session_file`). On each start it reuses the file when its tail matches the
+record, re-renders when every turn has its prefix and the window is at most twice the assembled
+start, and otherwise starts a new epoch from the checkpoint (only this moves the view start; for pi
+the view start is the last item the block covers). The file is disposable; Helpers and the Claude
+harness keep the path below.
+
 **A new session is assembled.** Every new session (a runner or host restart, a harness switch, a
 dropped warm client, a handoff) goes through the history load (`runner/app.py`,
 `_load_history_as_input`), which renders one block (`context/rollover.py`, `assemble_block`): the

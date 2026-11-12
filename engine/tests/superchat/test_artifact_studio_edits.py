@@ -45,6 +45,7 @@ from omnigent.superchat.artifacts.store import SqlAlchemyArtifactStore
 from omnigent.superchat.artifacts.studio import deliver_studio_notice, stale_line
 from omnigent.superchat.artifacts.studio_turn import _NOTED, studio_turn_blocks
 from omnigent.superchat.decks.outline import HEADER, MAX_CHARS, deck_outline
+from omnigent.superchat.feature import HandlerCtx
 from omnigent.superchat.live.service import STUDIO_RECHECK_SECONDS, LiveService
 from omnigent.superchat.prompt_prefix import person_words
 from omnigent.superchat.subagents import STUDIO_QUEUED_NOTE, StudioRunners
@@ -319,8 +320,9 @@ def test_the_patch_tool_mirrors_the_saved_version_in_the_workspace(
         transport = httpx.ASGITransport(app=env.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://engine") as client:
             args = {"artifact_id": v1["group_id"], "base_version": 1, "patches": patches}
-            done = await handlers._patch(client, studio, args)
-            stale = await handlers._patch(client, studio, args)
+            ctx = HandlerCtx("artifact_patch", client, studio)
+            done = await handlers._patch(client, studio, args, ctx)
+            stale = await handlers._patch(client, studio, args, ctx)
             return done, stale
 
     done, stale = asyncio.run(run())

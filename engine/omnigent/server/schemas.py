@@ -1066,6 +1066,9 @@ class CreateResponseRequest(BaseModel):
         in-turn bound.
     :param traceparent: The W3C trace context of the turn's Round,
         e.g. ``"00-<32 hex>-<16 hex>-01"``; ``None`` when untraced.
+    :param session_file: The harness session file a Conversation's process starts on, e.g.
+        ``"/tmp/omnigent_pi/<conversation>/<epoch>.jsonl"``, rendered from the record by
+        the runner; ``None`` for every other session.
     :param temperature: Ignored — agent controls this. Silently
         dropped.
     :param top_p: Ignored — agent controls this. Silently
@@ -1133,6 +1136,9 @@ class CreateResponseRequest(BaseModel):
     # W3C ``traceparent`` of the Round this turn is in (ADR 0041), forwarded by the runner when
     # the engine exports traces, so the turn's spans join the Round's trace. ``None`` otherwise.
     traceparent: str | None = None
+    # The harness session file a Conversation's process starts on (pi), written by the runner
+    # from the record. ``None`` keeps today's history replay.
+    session_file: str | None = None
     # Ignored fields — agent controls these; silently dropped.
     # Typed loosely because we only need to accept and discard them.
     temperature: float | None = None

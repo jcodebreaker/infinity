@@ -124,6 +124,10 @@ it("picks a block: an outline, its name, and the ask is about that block", async
   await act(async () => blocks()[4]?.click());
   expect(blocks()[4]?.dataset.selected).toBe("true");
   expect(blocks()[4]?.textContent).toContain("Paragraph 2");
+  // The inspector opens on "Edit style".
+  await act(async () =>
+    document.querySelector<HTMLButtonElement>('[data-testid="editor-inspector-toggle"]')?.click(),
+  );
   expect(document.querySelector('[data-testid="doc-inspector"]')?.textContent).toContain(
     "Selection · Paragraph",
   );

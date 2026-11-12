@@ -29,7 +29,7 @@ from omnigent.host.frames import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import RESERVED_USER_LOCAL
-from omnigent.server.host_registry import HostRegistry
+from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.hosts import (
     HostDeployment,
     HostLaunch,
@@ -1212,6 +1212,9 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
     """A paused resumable host wakes and signals re-address when online cross-replica."""
     from omnigent.server.routes import sessions as sessions_module
 
+    # Re-addressing to another replica only exists with several engines.
+    monkeypatch.setenv("OMNIGENT_MULTI_REPLICA", "1")
+
     host_store = HostStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
     host_store.register_managed_host(
@@ -1278,6 +1281,9 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
 ) -> None:
     """A paused resumable host wakes stale tunnels and signals re-address cross-replica."""
     from omnigent.server.routes import sessions as sessions_module
+
+    # Re-addressing to another replica only exists with several engines.
+    monkeypatch.setenv("OMNIGENT_MULTI_REPLICA", "1")
 
     host_store = HostStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
@@ -1363,6 +1369,20 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
     assert runner_deregistered == ["runner_stale_tunnel"]
 
 
+class _ConnectedHostRegistry:
+    """Host registry whose host is already connected on this replica."""
+
+    def __init__(self) -> None:
+        self.conn = Mock(spec=HostConnection)
+
+    def get(self, _host_id: str) -> HostConnection:
+        return self.conn
+
+    async def wait_for(self, _host_id: str, timeout_s: float) -> HostConnection:
+        del timeout_s
+        return self.conn
+
+
 async def test_managed_wake_fails_when_runner_never_reconnects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1389,10 +1409,6 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
     async def _launch_runner(*_args: object, **_kwargs: object) -> object:
         return sessions_module._HostLaunchAttempt(runner_id="runner_never_connects")
 
-    class _HostRegistry:
-        def get(self, _host_id: str) -> object:
-            return object()
-
     class _TunnelRegistry:
         async def wait_for_runner(self, _runner_id: str, *, timeout_s: float) -> None:
             del timeout_s
@@ -1418,7 +1434,7 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
         tracker=tracker,
         conversation_store=SimpleNamespace(get_conversation=lambda _sid: conv),
         host_store=SimpleNamespace(),
-        host_registry=_HostRegistry(),  # type: ignore[arg-type]
+        host_registry=_ConnectedHostRegistry(),  # type: ignore[arg-type]
         tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
     )
 
@@ -1455,10 +1471,6 @@ async def test_managed_launch_fails_when_runner_never_connects(
     async def _fake_terminate(host: object, *_args: object, **_kwargs: object) -> None:
         terminated.append(host)
 
-    class _HostRegistry:
-        def get(self, _host_id: str) -> object:
-            return object()
-
     class _TunnelRegistry:
         async def wait_for_runner(self, _runner_id: str, *, timeout_s: float) -> None:
             del timeout_s
@@ -1494,7 +1506,7 @@ async def test_managed_launch_fails_when_runner_never_connects(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
-        host_registry=_HostRegistry(),  # type: ignore[arg-type]
+        host_registry=_ConnectedHostRegistry(),  # type: ignore[arg-type]
         tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
     )
 
@@ -1534,10 +1546,6 @@ async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
     async def _fake_terminate(host: object, *_args: object, **_kwargs: object) -> None:
         terminated.append(host)
 
-    class _HostRegistry:
-        def get(self, _host_id: str) -> object:
-            return object()
-
     class _HostStore:
         def get_host(self, requested_id: str) -> object:
             assert requested_id == host_id
@@ -1569,7 +1577,7 @@ async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
-        host_registry=_HostRegistry(),  # type: ignore[arg-type]
+        host_registry=_ConnectedHostRegistry(),  # type: ignore[arg-type]
         tunnel_registry=None,
     )
 
@@ -1605,10 +1613,6 @@ async def test_managed_relaunch_failure_leaves_the_host_identity_alone(
     async def _fake_terminate(host: object, *_args: object, **_kwargs: object) -> None:
         terminated.append(host)
 
-    class _HostRegistry:
-        def get(self, _host_id: str) -> object:
-            return object()
-
     class _TunnelRegistry:
         async def wait_for_runner(self, _runner_id: str, *, timeout_s: float) -> None:
             del timeout_s
@@ -1638,7 +1642,7 @@ async def test_managed_relaunch_failure_leaves_the_host_identity_alone(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
-        host_registry=_HostRegistry(),  # type: ignore[arg-type]
+        host_registry=_ConnectedHostRegistry(),  # type: ignore[arg-type]
         tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
         host_to_relaunch=SimpleNamespace(sandbox_provider="docker"),  # type: ignore[arg-type]
     )

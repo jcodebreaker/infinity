@@ -592,6 +592,7 @@ class ConversationStore(ABC):
         before: str | None = None,
         order: str = "asc",
         type: str | None = None,
+        include_hidden: bool = False,
     ) -> PagedList[ConversationItem]:
         """
         Return items in a conversation with cursor-based pagination.
@@ -613,7 +614,9 @@ class ConversationStore(ABC):
         :param order: Sort direction, ``"asc"`` or ``"desc"``.
         :param type: Optional item type filter. When provided, only items
             with this type are returned, e.g. ``"compaction"``. ``None``
-            means return all types.
+            means every type except the hidden ``epoch_block``.
+        :param include_hidden: Keep ``epoch_block`` items in an untyped
+            listing (the runner's record read).
         :returns: A :class:`PagedList` of
             :class:`ConversationItem` objects.
         :raises omnigent.errors.StaleCursorError: If the ``after``/``before``
@@ -727,8 +730,7 @@ class ConversationStore(ABC):
             conversations whose
             ``root_conversation_id == root_conversation_id``
             (every conversation in the same spawn tree). Powers
-            the tree-scoped guard for ``sys_session_get_history`` /
-            ``sys_session_close`` so any agent in a tree can
+            the tree-scoped guard for ``sys_session_close`` so any agent in a tree can
             address any other by ``conversation_id``. ``None``
             disables the filter.
         :param agent_id: When set, only return conversations
@@ -1055,6 +1057,25 @@ class ConversationStore(ABC):
         :param conversation_id: The conversation to update,
             e.g. ``"conv_abc123"``.
         :param key: The label key to remove, e.g. ``"omni_project"``.
+        """
+        ...
+
+    @abstractmethod
+    def update_item_data(
+        self, conversation_id: str, item_id: str, fields: dict[str, Any]
+    ) -> ConversationItem | None:
+        """
+        Merge record-only fields into a message item's data; the one item update.
+
+        Only :data:`~omnigent.entities.conversation.RECORD_ONLY_MESSAGE_FIELDS`
+        may be set, and writing the same values again changes nothing.
+
+        :param conversation_id: The conversation holding the item, e.g. ``"conv_abc123"``.
+        :param item_id: The message item, e.g. ``"msg_abc123"``.
+        :param fields: The fields to set, e.g. ``{"context_prefix": []}``.
+        :returns: The updated item, or ``None`` when the conversation holds no such item.
+        :raises ValueError: A field outside the allow-list, a value of the wrong
+            shape, or an item that is not a message.
         """
         ...
 

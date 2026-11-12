@@ -39,7 +39,7 @@ _DESCRIPTION = (
     "`said`: the person's own sentence, short.\n"
     "A new pause, level or hours replaces the older one. 'You can message me again' -> remove "
     "kind pause. Use list to answer 'what did I tell you?'.\n"
-    "After each change confirm it back in one plain line. For a pause without the brief add: "
+    "Confirming a pause without the brief, add: "
     "'Your morning brief still comes. Say so and I'll stop it too.'"
 )
 
@@ -90,14 +90,8 @@ class ReachRulesTool(Tool):
                                 "person": {"type": "string", "description": "A name or address."},
                             },
                         },
-                        "said": {
-                            "type": "string",
-                            "description": "The person's own sentence (add only).",
-                        },
-                        "expires_at": {
-                            "type": "string",
-                            "description": "YYYY-MM-DD, the last day it holds (add only).",
-                        },
+                        "said": {"type": "string"},
+                        "expires_at": {"type": "string"},
                         "id": {
                             "type": "string",
                             "description": "The rule's id from list (remove one rule).",

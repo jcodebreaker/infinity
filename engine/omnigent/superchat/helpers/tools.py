@@ -30,8 +30,7 @@ class StartHelperTool(Tool):
         """:returns: Human-readable description of the tool."""
         return (
             "Start a Helper on one self-contained piece of work; returns its id at once. Its "
-            "result arrives later as a message, so once the brief is sent, say in one sentence "
-            "that the work started and end your turn. `task` is the whole brief (it does not see "
+            "result arrives later as a message. `task` is the whole brief (it does not see "
             "this conversation); call it once per Helper, several in one step to run them in "
             "parallel, never twice for the same task. `project` or `path` sets the folder the "
             "Helper works in; a job for a Project's folder must pass it, since a path inside the "
@@ -55,9 +54,8 @@ class StartHelperTool(Tool):
                         "title": {
                             "type": "string",
                             "description": (
-                                "A short title the person will read for this work, 3 to 6 "
-                                "words, in their terms (e.g. 'Counting words in your PDFs'). "
-                                "Not the brief."
+                                "What the person reads for this work, 3 to 6 words, e.g. "
+                                "'Counting words in your PDFs'. Not the brief."
                             ),
                         },
                         "model": {

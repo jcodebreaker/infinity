@@ -10,7 +10,6 @@ profile means "no profile".
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 from collections.abc import Awaitable, Mapping, Sequence
 from pathlib import Path
@@ -63,6 +62,9 @@ _known_timezone: dict[str, str | None] = {}
 PROFILE_UNCHANGED_LINE = "Standing memory unchanged since the last message."
 PROJECTS_UNCHANGED_LINE = "Projects unchanged since the last message."
 STUDIO_FILE_UNCHANGED_LINE = "The file is unchanged since the last message."
+#: What a changed-lines profile or Projects block opens and closes with (cut like the whole block).
+PROFILE_FENCE = (PROFILE_BLOCK_HEADER + "\n", "\n" + PROFILE_BLOCK_FOOTER)
+PROJECTS_FENCE = (PROJECTS_OPEN + "\n", "]")
 #: Sent in place of a block not read within the budget, so the model knows it is missing and
 #: how to get it, instead of acting as if there were no memory or no Projects.
 PROFILE_LATE_LINE = (
@@ -110,23 +112,43 @@ def idle_gap_line(idle_seconds: float) -> str:
     return f"{IDLE_GAP_OPEN}{span}{IDLE_GAP_CLOSE}"
 
 
+def _items(block: str) -> list[str]:
+    """The lines of *block* that carry content, without the closing ``]`` a Projects block adds."""
+    lines = block.split("\n")
+    if lines[-1].startswith("- ") and lines[-1].endswith("]"):
+        lines[-1] = lines[-1][:-1]
+    return [line for line in lines if line.strip()]
+
+
 def _delta_block(
     name: str,
     block: str,
     unchanged_line: str,
     last_sent: Mapping[str, str] | None,
     sent_now: dict[str, str] | None,
+    fence: tuple[str, str] | None = None,
 ) -> str:
-    """*block*, or *unchanged_line* when the warm client already got this exact block.
+    """*block* in full, *unchanged_line* when the warm client holds it, else its changed lines.
 
-    Records the block's hash in *sent_now* either way: the client holds it after this turn.
+    The changed lines (added, and no longer listed) go between the two halves of *fence* so a
+    reader of the transcript cuts them like the whole block; without a *fence* the block is
+    sent whole whenever it changed. What the client holds after this turn (the block's text, to
+    compare line by line next turn) is recorded in *sent_now* either way.
     """
-    digest = hashlib.sha256(block.encode("utf-8")).hexdigest()
     if sent_now is not None:
-        sent_now[name] = digest
-    if last_sent is not None and last_sent.get(name) == digest:
+        sent_now[name] = block
+    before = last_sent.get(name) if last_sent is not None else None
+    if before is None or fence is None:
+        return unchanged_line if before == block else block
+    old, new = _items(before), _items(block)
+    added = [line for line in new if line not in old]
+    removed = [line for line in old if line not in new]
+    if not added and not removed:
         return unchanged_line
-    return block
+    lines = [fence[0], "Changed since the last message:", *added]
+    if removed:
+        lines += ["No longer listed:", *removed]
+    return "\n".join(lines) + fence[1]
 
 
 def files_block(
@@ -342,11 +364,12 @@ async def turn_prefix_blocks(
         (``Feature.message_prefix``) that go first, so they end up closest to the message.
     :param idle_gap_seconds: How long the person was away, when this is the first message back
         from an idle break; adds one line next to the local time.
-    :param last_sent: Hashes (by ``profile`` / ``projects``) of the blocks the current warm
-        client last received, and the file handle lines (``files``). A block with the same hash
-        goes as one short line instead; the file handles go only as their changed lines.
+    :param last_sent: The text (by ``profile`` / ``projects``) of the blocks the current warm
+        client last received, and the file handle lines (``files``). An identical block goes as
+        one short line instead; the profile, Projects and file handles go only as their changed
+        lines.
         ``None`` (a cold start, or anything unproven) sends every block in full.
-    :param sent_now: Filled with the hashes of the profile and Projects blocks this turn
+    :param sent_now: Filled with the profile and Projects blocks this turn
         carries, for the caller to remember once the turn completes.
     :param helper: The session is a Helper: no Conversation-only message blocks (tasks) and no
         memory profile (its brief carries the preference lines that apply). A file's studio
@@ -391,7 +414,9 @@ async def turn_prefix_blocks(
         blocks: list[MessageBlock] = [*message_blocks, *_reminders(message_texts)]
         if profile:
             blocks.append(
-                _delta_block("profile", profile, PROFILE_UNCHANGED_LINE, last_sent, sent_now)
+                _delta_block(
+                    "profile", profile, PROFILE_UNCHANGED_LINE, last_sent, sent_now, PROFILE_FENCE
+                )
             )
         if file_blocks:
             # The file line and outline again only once the version changed (ADR 0031).
@@ -433,13 +458,17 @@ async def turn_prefix_blocks(
     blocks: list[MessageBlock] = [*message_blocks, *_reminders(message_texts)]
     if profile:
         blocks.append(
-            _delta_block("profile", profile, PROFILE_UNCHANGED_LINE, last_sent, sent_now)
+            _delta_block(
+                "profile", profile, PROFILE_UNCHANGED_LINE, last_sent, sent_now, PROFILE_FENCE
+            )
         )
     elif not helper and "profile" not in got:
         blocks.append(PROFILE_LATE_LINE)
     if projects is not None:
         blocks.append(
-            _delta_block("projects", projects, PROJECTS_UNCHANGED_LINE, last_sent, sent_now)
+            _delta_block(
+                "projects", projects, PROJECTS_UNCHANGED_LINE, last_sent, sent_now, PROJECTS_FENCE
+            )
         )
     elif "projects" not in got:
         blocks.append(PROJECTS_LATE_LINE)

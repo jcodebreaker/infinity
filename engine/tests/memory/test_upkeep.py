@@ -912,16 +912,16 @@ async def test_extract_candidates_reads_json_after_prose() -> None:
 
 def test_extraction_prompt_has_two_bars_and_keeps_unsignalled_instructions_as_inferred() -> None:
     prompt = upkeep.MEMORY_UPKEEP_EXTRACTION_PROMPT
-    # One gate, on the instruction kind only; every other kind (incl. working style) needs none.
-    assert 'Profile facts (every kind except "instruction"' in prompt
-    assert "need no special wording" in prompt
+    # One gate, on the instruction kind only; profile facts need none.
+    assert 'A standing instruction ("kind": "instruction"' in prompt
+    assert "Profile facts the user states directly" in prompt
+    assert '"stated" and need no special wording' in prompt
     for signal in ('"always"', '"never"', '"from now on"', '"every time"'):
         assert signal in prompt
     # Not dropped: an instruction without a signal is extracted as inferred evidence.
-    assert 'still extract it, but mark it "inferred"' in prompt
-    # Third person, never an order to the assistant.
-    assert "The user wants replies in French." in prompt
-    assert "never as an order to the assistant" in prompt
+    assert 'a repeated one without it is "inferred"' in prompt
+    # Third person, one self-contained sentence.
+    assert 'one self-contained third-person sentence ("The user ...")' in prompt
     # The old blanket default must not come back.
     assert "Default to extracting nothing" not in prompt
     for kind in ("preference", "instruction", "fact", "decision", "person", "project"):
@@ -941,7 +941,6 @@ def test_classify_prompt_matches_what_the_service_does_with_edited_claims() -> N
 def test_extraction_prompt_skips_withdrawals_and_gates_stated_instructions() -> None:
     prompt = upkeep.MEMORY_UPKEEP_EXTRACTION_PROMPT
     assert "A withdrawal is not a claim" in prompt
-    assert "Forgetting is handled in the live conversation" in prompt
+    assert "extract nothing for it and never write a negation" in prompt
     # "stated" for an instruction needs the permanence signal, as the gate says.
-    assert "for an instruction, only with the permanence signal" in prompt
-    assert "for every instruction that carries no such signal" in prompt
+    assert 'is "stated" only when the user\'s own words carry a permanence signal' in prompt

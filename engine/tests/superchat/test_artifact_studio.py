@@ -41,6 +41,7 @@ from omnigent.superchat.artifacts.studio import (
     studio_session_id,
 )
 from omnigent.superchat.artifacts.studio_turn import _NOTED, studio_turn_blocks
+from omnigent.superchat.feature import HandlerCtx
 from omnigent.superchat.subagents import count_live_children
 
 CHAT_LABELS = {CONTEXT_MODE_LABEL: SUPERSIDE_CHAT_MODE_VALUE}
@@ -171,7 +172,7 @@ def test_find_or_create_makes_one_quiet_session_per_file(env) -> None:
     assert made.json()["created"] is True
     # Any version, any number of times: the same session.
     again = client.post(f"/v1/artifacts/{v2['id']}/chat").json()
-    assert again == {"session_id": session_id, "created": False}
+    assert (again["session_id"], again["created"]) == (session_id, False)
     assert session_id == studio_session_id(None, chat, v1["id"])
     studio = conversations.get_conversation(session_id)
     assert studio is not None
@@ -295,16 +296,17 @@ def test_the_stale_tool_result_puts_the_newest_version_in_the_workspace(
     async def run() -> tuple[str, str]:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://engine") as client:
-            first = await handlers._save(client, chat, {"path": str(deck)}, None)
+            ctx = HandlerCtx("artifact_save", client, chat)
+            first = await handlers._save(client, chat, {"path": str(deck)}, None, ctx)
             group = __import__("json").loads(first)["group_id"]
             studio = studio_session_id(None, chat, group)
             await client.post(f"/v1/artifacts/{group}/chat")
             _ask(conversations, studio, "bigger")
             deck.write_text("# v2 from elsewhere")
-            await handlers._save(client, chat, {"path": str(deck)}, None)
+            await handlers._save(client, chat, {"path": str(deck)}, None, ctx)
             deck.write_text("# my edit on v1")
             refused = await handlers._save(
-                client, chat, {"path": str(deck), "base_version": 1}, studio
+                client, chat, {"path": str(deck), "base_version": 1}, studio, ctx
             )
             return refused, deck.read_text()
 

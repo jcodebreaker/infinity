@@ -136,6 +136,9 @@ async def test_save_tool_reads_workspace_only(
 
     saved = await call("artifact_save", {"path": "page.html", "title": "Page"})
     assert saved["type"] == "artifact" and saved["name"] == "page.html" and saved["version"] == 1
+    unchanged = await call("artifact_save", {"path": "page.html"})
+    assert unchanged["unchanged"] is True and unchanged["version"] == 1
+    (workspace / "page.html").write_text("<p>hi again</p>")
     again = await call("artifact_save", {"path": str(workspace / "page.html")})
     assert again["version"] == 2
     dotted = await call("artifact_save", {"path": "../secret.txt"})

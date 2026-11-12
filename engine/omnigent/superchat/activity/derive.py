@@ -29,6 +29,7 @@ from omnigent.context.labels import (
     SCHEDULED_HELPER_LABEL_KEY,
     is_artifact_chat,
 )
+from omnigent.context.titles import STRUCTURED_TEXT, one_line_summary, truncate
 from omnigent.entities import Conversation, ConversationItem, MessageData
 from omnigent.entities.conversation import is_system_notice
 from omnigent.stores.conversation_store import ConversationStore
@@ -58,7 +59,6 @@ from omnigent.superchat.family.tree import (  # noqa: F401  (re-exported: the fa
 )
 from omnigent.superchat.feature import RECORDED_RESPONSE_PREFIX
 from omnigent.superchat.rounds.record import NO_TURN, RELAY_LOST, RESET, helper_titled
-from omnigent.superchat.titles import STRUCTURED_TEXT, one_line_summary, truncate
 from omnigent.superchat.transcript.blocks import turn_activity_id
 from omnigent.superchat.work_tools import is_work_tool
 from omnigent.tools.builtins.spawn import _project_activity_item
@@ -785,7 +785,8 @@ def _round_views(
             return {}
         for r in missing:
             view = views.get(r)
-            seen[conversation_id, r] = view if view and view["ask"] and not view["hidden"] else None
+            shown = view and view["ask"] and not view["hidden"]
+            seen[conversation_id, r] = view if shown else None
         break
     return {r: v for r in wanted if (v := seen.get((conversation_id, r))) is not None}
 

@@ -13,7 +13,7 @@ from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
-from omnigent.context.labels import SUBAGENT_LABEL_KEY, uses_omnigent_context
+from omnigent.context.labels import uses_omnigent_context
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.os_env import OSEnvironment
 from omnigent.runtime import get_caps
@@ -26,6 +26,7 @@ from omnigent.tools.builtins import (
     ListCommentsTool,
     LoadSkillTool,
     ReadSkillFileTool,
+    ScheduleTool,
     SessionHistoryTool,
     SysAdviseModelsTool,
     SysAgentDownloadTool,
@@ -35,13 +36,8 @@ from omnigent.tools.builtins import (
     SysCancelAsyncTool,
     SysListModelsTool,
     SysReadInboxTool,
-    SysScheduledTaskCreateTool,
-    SysScheduledTaskDeleteTool,
-    SysScheduledTaskListTool,
-    SysScheduledTaskUpdateTool,
     SysSessionCloseTool,
     SysSessionCreateTool,
-    SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
     SysSessionListTool,
     SysSessionRenameTool,
@@ -260,25 +256,15 @@ class ToolManager:
 
     def _register_scheduled_task_tools(self) -> None:
         """
-        Auto-register the scheduled-task management builtins.
+        Auto-register the ``schedule`` builtin.
 
-        Available to every top-level session so an agent can create, list,
-        update, and delete recurring scheduled tasks at runtime without the
-        spec opting in; sub-agent (Helper) sessions, marked by
-        ``SUBAGENT_LABEL_KEY``, get only ``sys_scheduled_task_list``. The runner
-        dispatches them via the Omnigent server's ``/v1/scheduled-tasks`` REST endpoints.
+        Available to every session so an agent can create, list, update, and
+        delete recurring scheduled tasks at runtime without the spec opting in;
+        the runner refuses every action but ``list`` to sub-agent (Helper)
+        sessions. It dispatches via the Omnigent server's
+        ``/v1/scheduled-tasks`` REST endpoints.
         """
-        if self._labels and SUBAGENT_LABEL_KEY in self._labels:
-            # Helpers may only read the list (the daily Study dedupes against it).
-            self._tools[SysScheduledTaskListTool.name()] = SysScheduledTaskListTool()
-            return
-        for tool in (
-            SysScheduledTaskCreateTool(),
-            SysScheduledTaskListTool(),
-            SysScheduledTaskUpdateTool(),
-            SysScheduledTaskDeleteTool(),
-        ):
-            self._tools[tool.name()] = tool
+        self._tools[ScheduleTool.name()] = ScheduleTool()
 
     def _register_product_tools(self) -> None:
         """Register the registered products' label-gated tools (:func:`register_tool_source`)."""
@@ -403,17 +389,14 @@ class ToolManager:
         """
         Register the sub-agent tool surface.
 
-        The read-only discovery tools — ``sys_session_list``,
-        ``sys_session_get_history``, and ``sys_session_get_info`` — are
-        registered for **every** agent. Any agent can be part of a
-        multi-agent session (most importantly a user-added agent that
-        declares no sub-agents of its own but needs to read
-        ``main``/siblings for context), so listing, peeking, and
+        The read-only discovery tools — ``sys_session_list`` and
+        ``sys_session_get_info`` — are registered for **every** agent.
+        Any agent can be part of a multi-agent session, so listing and
         metadata reads are always available; access is enforced
         server-side (each proxies an auth-gated ``GET`` endpoint).
-        ``peek`` / ``get_info`` take a ``conversation_id`` (from
+        ``get_info`` takes a ``conversation_id`` (from
         ``sys_session_list`` or a prior ``sys_session_send`` handle),
-        so they need no ``sub_specs`` map.
+        so it needs no ``sub_specs`` map.
 
         ``sys_session_share`` is gated by its OWN dedicated
         ``agent_session_sharing:`` flag (:class:`SharePolicy`),
@@ -454,7 +437,6 @@ class ToolManager:
         """
         # Read-only discovery tools: always available.
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
-        self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()
         self._tools[SysSessionGetInfoTool.name()] = SysSessionGetInfoTool()
 
         # Session sharing: opt-in via the dedicated

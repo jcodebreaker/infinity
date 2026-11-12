@@ -56,10 +56,9 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "update_comment",
         # Read-only session discovery tools are registered for every
         # agent (a user-added agent that declares no sub-agents still
-        # needs to list/peek/get-info on its session-mates); the
+        # needs to list/get-info on its session-mates); the
         # mutating tools (sys_session_send/close/create/share) are
         # opt-in via tools.agents or the top-level ``spawn: true``.
-        "sys_session_get_history",
         "sys_session_list",
         "sys_session_get_info",
         "sys_session_rename",
@@ -73,14 +72,11 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # browse the registry and add policies at runtime.
         "sys_add_policy",
         "sys_policy_registry",
-        # Scheduled-task management tools are always auto-registered
-        # so agents can create, list, update, and delete recurring
-        # runs without spec opt-in. They are runner-dispatched via
-        # the Omnigent server's REST API.
-        "sys_scheduled_task_create",
-        "sys_scheduled_task_list",
-        "sys_scheduled_task_update",
-        "sys_scheduled_task_delete",
+        # The scheduled-task tool is always auto-registered so agents
+        # can create, list, update, and delete recurring runs without
+        # spec opt-in. It is runner-dispatched via the Omnigent
+        # server's REST API.
+        "schedule",
         # Embedded-browser tools are always auto-registered (framework-
         # owned) so any agent can drive the desktop app's browser without
         # the spec opting in. Schema-only; runner-dispatched.
@@ -414,8 +410,8 @@ def test_client_schemas_isolate_a_failing_tool(
 
 def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
     """
-    Read-only session discovery (``sys_session_get_history`` /
-    ``sys_session_list`` / ``sys_session_get_info``) is registered for
+    Read-only session discovery (``sys_session_list`` /
+    ``sys_session_get_info``) is registered for
     **every** agent, even one that declares no sub-agents — so a
     user-added agent can read its session-mates for context. The
     opt-in session-spawn tools (``sys_session_send`` /
@@ -428,9 +424,8 @@ def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
     """
     mgr = ToolManager(_make_spec([]))
     names = {s["function"]["name"] for s in mgr.get_tool_schemas()}
-    assert "sys_session_get_history" in names
     assert "sys_session_list" in names
-    # get_info is a read like peek/list — always available so any agent
+    # get_info is a read like list — always available so any agent
     # can inspect a session it can access. If absent, the registration
     # in _register_sub_agent_tools regressed and the orchestrator can't
     # check session status.
@@ -1579,22 +1574,23 @@ def test_memory_tools_present_for_superside_chat_session() -> None:
         assert name in names
 
 
-# ── sys_scheduled_task_*: top-level sessions only ─────────────────────────
+# ── schedule: every session; the runner limits a Helper to ``list`` ──────────
 
 
-def test_scheduled_task_tools_present_for_top_level_session() -> None:
+def test_schedule_tool_present_for_top_level_session() -> None:
     names = ToolManager(
         _make_spec(), labels={"omnigent.context.mode": "superside-chat"}
     ).get_tool_names()
-    assert "sys_scheduled_task_create" in names
-    assert "sys_scheduled_task_create" in ToolManager(_make_spec()).get_tool_names()
+    assert "schedule" in names
+    assert "schedule" in ToolManager(_make_spec()).get_tool_names()
 
 
-def test_scheduled_task_tools_absent_for_sub_agent_session() -> None:
+def test_schedule_tool_present_for_sub_agent_session() -> None:
     labels = {"omnigent.context.mode": "superside-chat", "omnigent.subagent": "1"}
     names = ToolManager(_make_spec(), labels=labels).get_tool_names()
-    # A Helper may only read the list (the daily Study dedupes against it).
-    assert [n for n in names if n.startswith("sys_scheduled_task_")] == ["sys_scheduled_task_list"]
+    # A Helper may only read the list (the daily Study dedupes against it); the runner
+    # refuses every other action (test_scheduled_task_tool_dispatch).
+    assert "schedule" in names
 
 
 def test_tools_allow_list_keeps_only_matching_tools() -> None:

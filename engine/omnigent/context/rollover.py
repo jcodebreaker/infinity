@@ -33,7 +33,7 @@ from omnigent.context.state_file import (
     split_journal,
 )
 from omnigent.context.tool_digest import FRAMING, digest_tool_items
-from omnigent.entities import CompactionData, ConversationItem, MessageData
+from omnigent.entities import CompactionData, Conversation, ConversationItem, MessageData
 from omnigent.entities.conversation import is_system_notice_text
 from omnigent.entities.session_project import open_project
 from omnigent.runtime.compaction import count_text_tokens, count_tokens, summarize_history
@@ -502,6 +502,10 @@ def select_recent(
 #: leaves out the turns after it, which the model already has (ADR 0031, "View start").
 VIEW_START_LABEL = "omnigent.context.view_start"
 
+#: The session label written with :data:`VIEW_START_LABEL`: the ``epoch_block`` item the
+#: window since that view start opens with. The item is hidden, so it is read back by this id.
+EPOCH_BLOCK_LABEL = "omnigent.context.epoch_block_item_id"
+
 #: The block's opening frame (ADR 0031, "What a new session receives").
 BLOCK_FRAME = (
     "[What came before, assembled when this session started. The person's requests in it still "
@@ -583,7 +587,7 @@ def transcript_turn_lines(items: list[dict[str, Any]]) -> list[TurnLine]:
     """The turn line of each person's turn in *items*, from the transcript alone: a Helper, the
     studio, or a Conversation whose Rounds cannot be read. The ask is the message's first line,
     the outcome the first sentence of the turn's last words, the files its refs."""
-    from omnigent.superchat.titles import one_line_summary
+    from omnigent.context.titles import one_line_summary
 
     starts = _turn_starts(items)
     out: list[TurnLine] = []
@@ -1132,60 +1136,82 @@ def _related_chat_preview(items: list[ConversationItem]) -> str | None:
     return None
 
 
+def _same_owner(conv_store: ConversationStore, a: str, b: str) -> bool:
+    """Whether two sessions belong to the same person, resolved from the store."""
+    owner_a = conv_store.get_session_owner(a)
+    owner_b = conv_store.get_session_owner(b)
+    # A session with no owner grant reads back as ``None`` regardless of who it belongs to.
+    # On a single-user server (no permission store ever writing grants) every session reads
+    # back ``None`` and they are all the one user's; otherwise two ``None``s never match.
+    if owner_a is None and owner_b is None:
+        return local_single_user_enabled()
+    return owner_a == owner_b
+
+
 def list_related_chats(
-    conv_store: ConversationStore, conversation_id: str
+    conv_store: ConversationStore, conversation_id: str, chat_id: str | None = None
 ) -> list[dict[str, Any]]:
     """
     The chats *conversation_id* may read besides itself (``session_history``'s ``list_chats``).
 
     A scheduled or ad-hoc Helper (Study, daily note) works for its parent chat and may read it;
-    every other session, an ordinary Sub-agent included, gets ``[]``. Scoped to the SAME owner
-    as *conversation_id*, resolved from the store (never an argument) exactly like
-    ``resolve_memory_user`` scopes memory.
+    every other session, an ordinary Sub-agent included, gets ``[]``. With *chat_id* naming a
+    Helper *conversation_id* started, that Helper is listed too (``session_history``'s
+    ``chat_id``, to read a capped Result). Scoped to the SAME owner as *conversation_id*,
+    resolved from the store (never an argument) exactly like ``resolve_memory_user`` scopes
+    memory.
 
     :param conv_store: Store to query.
     :param conversation_id: The calling session id.
+    :param chat_id: A chat the caller asked to read, or ``None`` to list only the parent.
     :returns: ``[{"id", "title", "created_at", "updated_at", "last_message_preview",
         "archived", "live", "project"}]``; ``[]`` when *conversation_id* does not exist.
     """
     caller = conv_store.get_conversation(conversation_id)
-    if caller is None or not caller.parent_conversation_id:
+    if caller is None:
         return []
-    if not (
+    chats: list[Conversation] = []
+    if caller.parent_conversation_id and (
         SCHEDULED_HELPER_LABEL_KEY in caller.labels or ADHOC_HELPER_LABEL_KEY in caller.labels
     ):
+        parent = conv_store.get_conversation(caller.parent_conversation_id)
+        if parent is not None and _same_owner(conv_store, conversation_id, parent.id):
+            chats.append(parent)
+    if chat_id and chat_id not in {chat.id for chat in chats}:
+        helper = conv_store.get_conversation(chat_id)
+        if (
+            helper is not None
+            and helper.parent_conversation_id == conversation_id
+            and _same_owner(conv_store, conversation_id, helper.id)
+        ):
+            chats.append(helper)
+    if not chats:
         return []
-    parent = conv_store.get_conversation(caller.parent_conversation_id)
-    if parent is None:
-        return []
-    owner_id = conv_store.get_session_owner(conversation_id)
-    parent_owner_id = conv_store.get_session_owner(parent.id)
-    # A session with no owner grant reads back as ``None`` regardless of who it belongs to.
-    # On a single-user server (no permission store ever writing grants) every session reads
-    # back ``None`` and they are all the one user's; otherwise two ``None``s never match.
-    if owner_id is None and parent_owner_id is None:
-        if not local_single_user_enabled():
-            return []
-    elif owner_id != parent_owner_id:
-        return []
-    previews = conv_store.list_latest_message_items_for_conversations([parent.id], 10)
+    previews = conv_store.list_latest_message_items_for_conversations(
+        [chat.id for chat in chats], 10
+    )
     return [
         {
-            "id": parent.id,
-            "title": parent.title,
-            "created_at": parent.created_at,
-            "updated_at": parent.updated_at,
-            "last_message_preview": _related_chat_preview(previews.get(parent.id, [])),
-            "archived": parent.archived,
-            "live": parent.live_status in _MID_TURN_LIVE_STATUSES,
-            "project": open_project(parent),
+            "id": chat.id,
+            "title": chat.title,
+            "created_at": chat.created_at,
+            "updated_at": chat.updated_at,
+            "last_message_preview": _related_chat_preview(previews.get(chat.id, [])),
+            "archived": chat.archived,
+            "live": chat.live_status in _MID_TURN_LIVE_STATUSES,
+            "project": open_project(chat),
         }
+        for chat in chats
     ]
 
 
-def related_chat_ids(conv_store: ConversationStore, conversation_id: str) -> frozenset[str]:
+def related_chat_ids(
+    conv_store: ConversationStore, conversation_id: str, chat_id: str | None = None
+) -> frozenset[str]:
     """The ids ``list_related_chats`` would return, for a cheap membership check."""
-    return frozenset(chat["id"] for chat in list_related_chats(conv_store, conversation_id))
+    return frozenset(
+        chat["id"] for chat in list_related_chats(conv_store, conversation_id, chat_id)
+    )
 
 
 # ---------------------------------------------------------------------------

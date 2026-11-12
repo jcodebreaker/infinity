@@ -149,6 +149,11 @@ const select = (frame: ReturnType<typeof editFrame>, targets: DeckEditTarget[] =
   fromFrame(frame, { type: "superchat:edit-selection", targets });
 const ready = (frame: ReturnType<typeof editFrame>) =>
   fromFrame(frame, { type: "superchat:edit-ready", theme: THEME });
+/** The inspector opens on "Edit style", never on selecting. */
+const openInspector = () =>
+  act(async () =>
+    (host.querySelector('[data-testid="editor-inspector-toggle"]') as HTMLButtonElement).click(),
+  );
 
 function typeInto(input: HTMLInputElement | HTMLTextAreaElement, value: string) {
   const proto = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement : HTMLInputElement;
@@ -167,6 +172,7 @@ it("only trusts messages from its frame that carry its nonce and fit the protoco
   await mount();
   const frame = editFrame();
   await ready(frame);
+  await openInspector();
   const panel = () => host.querySelector('[data-testid="deck-style-panel"]')?.textContent ?? "";
 
   await act(async () => {
@@ -196,6 +202,7 @@ it("select, then a style control previews at once and saves one version after a 
   const frame = editFrame();
   await ready(frame);
   await select(frame);
+  await openInspector();
 
   await act(async () => typeInto(control("Font size"), "7"));
   await act(async () => typeInto(control("Font size"), "72"));
@@ -233,6 +240,7 @@ it("picks theme colours and fonts as tokens, never raw values", async () => {
   const frame = editFrame();
   await ready(frame);
   await select(frame);
+  await openInspector();
   await act(async () => control("accent").click());
   await act(async () => {
     await vi.advanceTimersByTimeAsync(10);
@@ -394,7 +402,7 @@ it("sends the hard-scope element request and the person's words to the Muse's Co
   await ready(frame);
   await select(frame);
   const chips = [...host.querySelectorAll('[data-testid="ask-chip"]')].map((c) => c.textContent);
-  expect(chips).toEqual(["h1 · title"]);
+  expect(chips).toEqual(["Slide 1 · title"]);
   expect(askInput().placeholder).toBe("Ask superchat to change this…");
   await act(async () => typeInto(askInput(), "make it punchier"));
   await act(async () => press(askInput(), "Enter"));

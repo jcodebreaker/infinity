@@ -103,7 +103,10 @@ def org_domains(addresses: Iterable[str]) -> list[str]:
 
 
 def domain_label(domain: str) -> str:
-    """The name part of *domain*: ``northwind`` from ``northwind.com``, ``acme`` from ``mail.acme.co.uk``."""
+    """The name part of *domain*.
+
+    ``northwind`` from ``northwind.com``, ``acme`` from ``mail.acme.co.uk``.
+    """
     labels = domain.casefold().split(".")
     if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in _SECOND_LEVEL:
         return labels[-3]

@@ -382,52 +382,6 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
         return [copy.deepcopy(event) for event in ids.values()]
 
 
-def project_for_peek(event: dict[str, Any]) -> dict[str, Any]:
-    """
-    Project a stored elicitation event into a compact peek item.
-
-    ``sys_session_get_history`` returns a tail of compact conversation
-    items so a parent agent can read a sub-agent's recent activity. A
-    parked elicitation never lands in the conversation store (it lives
-    only in this index — see the module docstring), so get_history must
-    synthesize an item from the stored ``response.elicitation_request``
-    payload. This projector produces that item, shaped to match the
-    other compact items: a ``type`` discriminator plus the human-facing
-    prompt and (form mode only) the fields being requested.
-
-    Used by both read paths — the in-process
-    :class:`omnigent.tools.builtins.spawn.SysSessionGetHistoryTool`
-    (reads :func:`snapshot_for` directly) and the runner's REST
-    get_history (reads the same payloads off the
-    ``GET /v1/sessions/{id}`` snapshot). Both receive the identical
-    event dict, so a single projector keeps the two outputs consistent.
-
-    :param event: A stored ``response.elicitation_request`` event dict,
-        as returned by :func:`snapshot_for`. Reads ``elicitation_id``
-        and the nested ``params`` block (``message`` and, for form
-        mode, ``requestedSchema.properties``).
-    :returns: A compact dict, e.g.
-        ``{"type": "pending_elicitation", "elicitation_id":
-        "elicit_abc123", "prompt": "Approve running 'rm -rf'?",
-        "fields": ["approve"]}``. ``prompt`` is ``None`` when the
-        payload carried no message; ``fields`` is omitted when the
-        elicitation is not a form (or has no declared properties).
-    """
-    params = event.get("params")
-    params = params if isinstance(params, dict) else {}
-    item: dict[str, Any] = {
-        "type": "pending_elicitation",
-        "elicitation_id": event.get("elicitation_id"),
-        "prompt": params.get("message"),
-    }
-    schema = params.get("requestedSchema")
-    if isinstance(schema, dict):
-        properties = schema.get("properties")
-        if isinstance(properties, dict) and properties:
-            item["fields"] = list(properties.keys())
-    return item
-
-
 def lookup(elicitation_id: str) -> tuple[str, dict[str, Any]] | None:
     """
     Look up a single outstanding elicitation by its correlation id.

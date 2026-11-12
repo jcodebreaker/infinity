@@ -155,8 +155,15 @@ async def test_turn_prefix_sends_a_block_in_full_only_when_it_changed(
 
     server.profile = _BLOCK.replace("CAD", "EUR")
     changed, _ = await build(sent)
-    assert server.profile in changed and projects not in changed
+    delta = next(b for b in changed if b.startswith(prompt_prefix.PROFILE_BLOCK_HEADER))
+    assert "EUR" in delta and "No longer listed:" in delta and "CAD" in delta
+    assert len(delta) < len(server.profile) + 80 and projects not in changed
     assert prompt_prefix.PROJECTS_UNCHANGED_LINE in changed
+    assert prompt_prefix.split_prefix(delta + "\n\nhi")[1] == "hi"
+
+    # After a reset (nothing held) the whole block goes again.
+    reset, _ = await build(None)
+    assert server.profile in reset
 
     # The local-time line is never replaced; a gap line sits next to it.
     gap = await prompt_prefix.turn_prefix_blocks(

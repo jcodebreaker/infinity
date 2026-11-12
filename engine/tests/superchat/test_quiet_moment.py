@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from omnigent.entities.scheduled_task import OwnerPreferences
+from omnigent.memory.upkeep import MEMORY_POLICY, MEMORY_UPKEEP_EXTRACTION_PROMPT
 from omnigent.server import work_queue
 from omnigent.superchat.daily_notes import quiet_moment
 from omnigent.superchat.daily_notes.quiet_moment import MAX_PASSES_PER_DAY, QuietMoment
@@ -361,7 +362,7 @@ def test_min_gap_seconds_env() -> None:
 
 def test_quiet_prompt_uses_the_same_gate_as_the_other_memory_prompts() -> None:
     prompt = quiet_moment.QUIET_PROMPT
-    assert "Profile facts need no special wording" in prompt
+    assert MEMORY_POLICY in prompt and MEMORY_POLICY in MEMORY_UPKEEP_EXTRACTION_PROMPT
     assert "permanence signal" in prompt and '`explicitness: "inferred"`' in prompt
     assert 'third person ("The user ...")' in prompt
     assert "`replaces_claim_id`" in prompt and "never store a negation" in prompt

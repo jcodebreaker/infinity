@@ -73,21 +73,12 @@ class DeckNewTool(Tool):
     @classmethod
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
-        from omnigent.superchat.decks import kit
-
-        names = ", ".join(kit.templates())
         return (
             "Create a deck: an HTML `.deck.html` file of 1920x1080 slides, never a PowerPoint "
             "(that is a separate export, deck_export). The layouts are the decks skill. With "
             "all the slides it adds the framework, theme and fonts, writes the file and returns "
             "the layout problems to fix before artifact_save. Without slides it writes nothing: "
-            "with `layout` it returns one example slide of that layout or one chart recipe. "
-            "Slides are refused, nothing written, when anything in them loads from the web (an "
-            "http(s) or // URL in src, url() or an href other than a link's <a href>, a web "
-            "font, @import) or they carry a "
-            "<script> other than a chart's <script data-superchat-chart>: draw a logo or icon "
-            "with HTML, CSS or inline SVG, or leave it out, and use only the theme's fonts. "
-            f"Themes (deck_themes says what each is for): {names}."
+            "with `layout` it returns one example slide of that layout or one chart recipe."
         )
 
     def get_schema(self) -> dict[str, Any]:

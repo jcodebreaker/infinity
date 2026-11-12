@@ -104,7 +104,8 @@ def test_a_pending_entry_lands_in_the_working_list() -> None:
     adds = pending_entries(labels)
     assert adds == {"d-acme-vs-globex": "Acme vs Globex (deck): checked"}
     previous = (
-        "Working list\n- [t-budget · 2026-10-01] Spring budget\n- [d-acme-vs-globex · 2026-10-01] old"
+        "Working list\n- [t-budget · 2026-10-01] Spring budget\n"
+        "- [d-acme-vs-globex · 2026-10-01] old"
     )
     out = reconcile(previous, previous, adds=adds, today=TODAY, count=len)
     entry = entries(parse(out.text))["d-acme-vs-globex"]

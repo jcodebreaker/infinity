@@ -164,7 +164,12 @@ async def test_a_refused_move_deletes_the_child_and_posts_no_brief(workspace: Pa
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "folder",
-    [{"project": "nope"}, {"path": "missing"}, {"path": "../.."}, {"path": "/etc"}],
+    [
+        {"project": "nope"},
+        {"path": "projects/q3-deck/PROJECT.md"},
+        {"path": "../.."},
+        {"path": "/etc"},
+    ],
 )
 async def test_a_bad_folder_creates_no_helper(workspace: Path, folder: dict[str, str]) -> None:
     output, calls = await _start({"task": "Draft the deck", **folder})

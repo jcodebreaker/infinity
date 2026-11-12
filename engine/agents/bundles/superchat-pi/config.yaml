@@ -64,17 +64,13 @@ tools:
     - open_project
     - start_helper
     - message_helper
-    # A capped Helper result says to read the rest here.
-    - sys_session_get_history
-    - "sys_scheduled_task_*"
+    - schedule
     - artifact_save
     - artifact_list
     - artifact_delete
     - artifact_outline
     - artifact_publish
-    - artifact_keep_updated
-    - artifact_stop_updating
-    - artifact_live_settings
+    - live
     - files_search
     - files_query
     - files_get

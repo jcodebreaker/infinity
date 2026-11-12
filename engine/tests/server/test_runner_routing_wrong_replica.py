@@ -84,8 +84,9 @@ def test_runner_absent_code_host_on_this_replica_returns_runner_unavailable():
     assert code == ErrorCode.RUNNER_UNAVAILABLE
 
 
-def test_runner_absent_code_host_absent_locally_but_online_returns_wrong_replica():
+def test_runner_absent_code_host_absent_locally_but_online_returns_wrong_replica(monkeypatch):
     """When host is absent locally but online elsewhere → WRONG_REPLICA."""
+    monkeypatch.setenv("OMNIGENT_MULTI_REPLICA", "1")
     host_registry = MockHostRegistry({})  # Empty: not on this replica
     host_store = MockHostStore({"host_456": True})  # Online somewhere
 
@@ -114,8 +115,9 @@ def test_runner_absent_code_host_absent_everywhere_returns_runner_unavailable():
     assert code == ErrorCode.RUNNER_UNAVAILABLE
 
 
-def test_runner_absent_code_no_store_registry_only_returns_wrong_replica():
+def test_runner_absent_code_no_store_registry_only_returns_wrong_replica(monkeypatch):
     """When store is absent but registry says host not here → treat as wrong_replica."""
+    monkeypatch.setenv("OMNIGENT_MULTI_REPLICA", "1")
     host_registry = MockHostRegistry({})  # Empty: not on this replica
     # No host_store: should fall back to registry-only check
 

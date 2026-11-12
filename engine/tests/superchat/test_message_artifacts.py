@@ -326,11 +326,12 @@ def test_the_open_artifact_links_the_message_and_leads_the_hint(env) -> None:
         "how": "open",
     }
     hint = client.get(f"/v1/artifacts/hint?session_id={chat}").json()["hint"]
-    assert hint.splitlines() == [
-        HEADER,
-        f"- memo.md (document, v1, {memo['id']})",
-        f"- q3.deck.html (deck, v1, {deck['id']}) — open beside the chat",
-    ]
+    # The open file is named first; each line ends on the day of its last change.
+    header, open_line, memo_line = hint.splitlines()
+    assert header == HEADER
+    assert open_line.startswith(f"- q3.deck.html · deck · v1 · {deck['id']} · last change ")
+    assert open_line.endswith(" — open beside the chat")
+    assert memo_line.startswith(f"- memo.md · document · v1 · {memo['id']} · last change ")
     # Another Conversation's artifact is never recorded as open.
     other = conversations.create_conversation().id
     _ask(conversations, other, "hello")

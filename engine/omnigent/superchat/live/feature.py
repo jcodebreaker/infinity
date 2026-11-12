@@ -13,7 +13,7 @@ from omnigent.superchat.feature import (
     is_super_chat,
 )
 from omnigent.superchat.live.handlers import handle_live_tool
-from omnigent.superchat.live.tools import HELPER_TOOL_NAMES, SUPER_CHAT_TOOL_NAMES
+from omnigent.superchat.live.tools import HELPER_TOOL_NAMES, LIVE_TOOL_NAME
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -25,7 +25,7 @@ def _tools(labels: Mapping[str, str] | None, _ctx: ToolManagerCtx) -> list[Tool]
     from omnigent.superchat.live import tools
 
     if is_super_chat(labels):
-        return [tools.KeepUpdatedTool(), tools.StopUpdatingTool(), tools.LiveSettingsTool()]
+        return [tools.LiveTool()]
     if is_helper(labels):
         return [tools.UpdateContextTool(), tools.UpdateSaveTool()]
     return []
@@ -67,6 +67,6 @@ def _install(app: FastAPI, deps: InstallDeps) -> None:
 LIVE_FEATURE = Feature(
     name="live",
     tools=_tools,
-    handlers=dict.fromkeys((*SUPER_CHAT_TOOL_NAMES, *HELPER_TOOL_NAMES), handle_live_tool),
+    handlers=dict.fromkeys((LIVE_TOOL_NAME, *HELPER_TOOL_NAMES), handle_live_tool),
     install=_install,
 )

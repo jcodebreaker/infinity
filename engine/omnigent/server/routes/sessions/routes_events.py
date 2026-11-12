@@ -89,7 +89,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
     schedule_background_child_task_summary,
 )
-from omnigent.server.host_registry import HostRegistry, RunnerExitReports, multi_replica
+from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
@@ -163,6 +163,7 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _get_runner_client_for_resource_access,
+    _has_runner_authority,
     _launch_runner_on_host,
     _parse_background_tasks,
     _persist_external_assistant_message,
@@ -270,6 +271,7 @@ from omnigent.telemetry.request_headers import (
     parse_installation_id_header as _tel_parse_installation_id,
 )
 from omnigent.tools.client_specified import parse_client_side_tool_specs
+from omnigent.util.replicas import multi_replica
 from omnigent.util.session_lifecycle import (
     is_session_closed,
 )
@@ -566,13 +568,7 @@ def register_events_routes(
     ) -> bool:
         if isinstance(request, _RunnerEventContext):
             return conv.runner_id == request.runner_id
-        token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
-        if not token:
-            return False
-        if runner_tunnel_tokens is not None and token in runner_tunnel_tokens:
-            return True
-        runner_id = getattr(conv, "runner_id", None)
-        return isinstance(runner_id, str) and token_bound_runner_id(token) == runner_id
+        return _has_runner_authority(request, conv, runner_tunnel_tokens)
 
     async def _require_helper_writer(
         request: Request | _RunnerEventContext, user_id: str | None, conv: Any
@@ -1634,6 +1630,25 @@ def register_events_routes(
                 "/compact is not available for this session type.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        if body.type == "epoch_block":
+            # Hidden from the items list, SSE and search: stored, never broadcast.
+            if not _has_runner_created_by_authority(request, conv):
+                raise OmnigentError(
+                    "epoch_block items are written by the session's runner",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            [stored] = await asyncio.to_thread(
+                conversation_store.append,
+                session_id,
+                [
+                    NewConversationItem(
+                        type="epoch_block",
+                        response_id=f"epoch_{secrets.token_hex(16)}",
+                        data=parse_item_data("epoch_block", body.data),
+                    )
+                ],
+            )
+            return {"queued": False, "item_id": stored.id}
         if body.type == "compaction":
             import uuid as _uuid
 

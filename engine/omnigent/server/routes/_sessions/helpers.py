@@ -73,6 +73,7 @@ from omnigent.inference_config import snapshot_runtime_config
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
+    RUNNER_TUNNEL_TOKEN_HEADER,
     token_bound_runner_id,
 )
 from omnigent.runner.launch_failure import classify_native_turn_error
@@ -236,6 +237,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.superchat.feature import is_super_chat
 from omnigent.util.cost_plan import (
     COST_CONTROL_LABEL_NAMESPACE,
     reserved_cost_control_keys,
@@ -2583,7 +2585,12 @@ def _parse_external_conversation_item(
         malformed.
     """
     item_type = body.data.get("item_type")
-    if not isinstance(item_type, str) or item_type not in ITEM_TYPE_TO_DATA_CLS:
+    # An epoch block is hidden, so it never rides this broadcast path.
+    if (
+        not isinstance(item_type, str)
+        or item_type not in ITEM_TYPE_TO_DATA_CLS
+        or item_type == "epoch_block"
+    ):
         raise OmnigentError(
             "external_conversation_item requires known data.item_type",
             code=ErrorCode.INVALID_INPUT,
@@ -3988,6 +3995,11 @@ def _spawn_superseded_runner_stop(
     task.add_done_callback(_detached_supersede_stops.discard)
 
 
+#: How long an Assistant Conversation's runner and harness stay up while idle;
+#: Helpers keep the host's default (1 h).
+_CONVERSATION_HOLD_S = 12 * 60 * 60
+
+
 async def _launch_runner_on_host_impl(
     conv: Conversation,
     conversation_store: ConversationStore,
@@ -4129,6 +4141,7 @@ async def _launch_runner_on_host_locked(
                 # (agent not resolvable) skips the host-side check — fail open.
                 harness=_resolve_harness(conv),
                 inference_config=snapshot_runtime_config(conv.inference_snapshot),
+                hold_s=_CONVERSATION_HOLD_S if is_super_chat(conv.labels) else None,
             )
         )
         try:
@@ -7592,6 +7605,32 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"{MANAGED_SANDBOX_LABEL_NAMESPACE}* namespace and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
+
+
+def _has_runner_authority(
+    request: Request, conv: Any, runner_tunnel_tokens: frozenset[str] | None
+) -> bool:
+    """
+    Whether *request* comes from *conv*'s bound runner.
+
+    The runner proves itself with its tunnel binding token
+    (``X-Omnigent-Runner-Tunnel-Token``): one on the server's allow-list, or
+    one whose token-bound runner id is the session's ``runner_id``. The
+    bearer alone never does, since the runner presents its owner's.
+
+    :param request: The incoming request.
+    :param conv: The session's conversation.
+    :param runner_tunnel_tokens: The server's tunnel-token allow-list, or
+        ``None`` when not configured.
+    :returns: ``True`` for the session's runner.
+    """
+    token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+    if not token:
+        return False
+    if runner_tunnel_tokens is not None and token in runner_tunnel_tokens:
+        return True
+    runner_id = getattr(conv, "runner_id", None)
+    return isinstance(runner_id, str) and token_bound_runner_id(token) == runner_id
 
 
 def _require_cost_control_label_authority(

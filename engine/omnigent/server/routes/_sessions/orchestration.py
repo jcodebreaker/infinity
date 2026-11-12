@@ -46,6 +46,7 @@ from omnigent.entities.conversation import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
+from omnigent.evals.identity import is_eval_identity
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
@@ -122,7 +123,6 @@ from omnigent.server.host_registry import (
     HostConnection,
     HostRegistry,
     RunnerExitReports,
-    multi_replica,
 )
 from omnigent.server.hosts import (
     MANAGED_REPO_LABEL_KEY,
@@ -137,6 +137,9 @@ from omnigent.server.hosts import (
 )
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
+)
+from omnigent.server.routes._auth_helpers import (
+    get_session_owner_id,
 )
 from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
@@ -343,6 +346,7 @@ from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedE
 from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.telemetry.surface import classify_surface as _classify_surface
+from omnigent.util.replicas import multi_replica
 from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
     title_without_closed_marker,
@@ -3791,6 +3795,7 @@ async def ensure_runner_connected(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     raise_host_refusal: bool = False,
+    allow_relaunch: bool = True,
 ) -> tuple[httpx.AsyncClient | None, Conversation]:
     """
     Bring a wakeable session's runner online for out-of-band resource access.
@@ -3829,6 +3834,9 @@ async def ensure_runner_connected(
         host rejects launch because the harness is unavailable or the
         workspace is gone. Resource callers keep the legacy ``False``
         behavior; retry recovery opts in because it has no message to persist.
+    :param allow_relaunch: ``False`` skips the managed-sandbox wake and
+        relaunch (they provision), leaving only a runner launch on an online
+        host; the intent wake passes it.
     :returns: ``(runner_client, conv)`` — the client is ``None`` when no
         runner is reachable and none is wakeable; ``conv`` is re-read after
         any wake/relaunch so the caller sees the rebound row.
@@ -3857,11 +3865,15 @@ async def ensure_runner_connected(
     # A resumable managed host whose persisted liveness has gone stale wakes
     # in place; re-read the row and re-resolve, since the wake may have
     # relaunched the runner and rebound the session.
-    if conv.host_id is not None and await _maybe_wake_stale_resumable_managed_sandbox(
-        session_id=session_id,
-        conv=conv,
-        app_state=app_state,
-        conversation_store=conversation_store,
+    if (
+        allow_relaunch
+        and conv.host_id is not None
+        and await _maybe_wake_stale_resumable_managed_sandbox(
+            session_id=session_id,
+            conv=conv,
+            app_state=app_state,
+            conversation_store=conversation_store,
+        )
     ):
         conv = await _reread()
         runner_client = await _get_runner_client(
@@ -3951,7 +3963,7 @@ async def ensure_runner_connected(
                     )
             if _refusal_code is None:
                 relaunched_runner_id = launch_attempt.runner_id
-        elif await _maybe_relaunch_managed_sandbox(
+        elif allow_relaunch and await _maybe_relaunch_managed_sandbox(
             session_id=session_id,
             conv=conv,
             app_state=app_state,
@@ -3964,7 +3976,7 @@ async def ensure_runner_connected(
                 conversation=conv,
             )
 
-        if runner_client is None:
+        if runner_client is None and (host_conn is not None or allow_relaunch):
             runner_client = await _wait_for_runner_client(
                 session_id,
                 runner_router,
@@ -3976,6 +3988,67 @@ async def ensure_runner_connected(
             conv = await _reread()
 
     return runner_client, conv
+
+
+_WAKE_INTERVAL_S = 60.0
+_last_wake_at: dict[tuple[str, str], float] = {}
+
+
+def wake_conversation_runner(
+    *,
+    conv: Conversation,
+    user_id: str | None,
+    app_state: Any,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    permission_store: PermissionStore | None,
+) -> None:
+    """
+    Start the person's Assistant Conversation runner in the background.
+
+    Called when the owner opens or focuses the app so the first word does not
+    wait on a cold launch. Does nothing for a Helper, a non-owner, an eval
+    person, or a Conversation woken in the last minute. Never relaunches a
+    managed sandbox, and never raises into the caller.
+
+    :param conv: The session the owner marked read.
+    :param user_id: The caller.
+    :param app_state: ``request.app.state``.
+    :param conversation_store: Store holding the session row.
+    :param runner_router: The ``RunnerRouter``, or ``None`` for in-process.
+    :param permission_store: Store that names the session's owner.
+    :returns: None.
+    """
+    if user_id is None or not is_super_chat(conv.labels) or is_eval_identity(user_id):
+        return
+    key = (conv.id, user_id)
+    now = time.monotonic()
+    if now - _last_wake_at.get(key, -_WAKE_INTERVAL_S) < _WAKE_INTERVAL_S:
+        return
+    _last_wake_at[key] = now
+
+    async def _wake() -> None:
+        try:
+            owner = await asyncio.to_thread(get_session_owner_id, conv.id, permission_store)
+            if owner != user_id:
+                return
+            await ensure_runner_connected(
+                session_id=conv.id,
+                conv=conv,
+                app_state=app_state,
+                conversation_store=conversation_store,
+                runner_router=runner_router,
+                allow_relaunch=False,
+            )
+        except Exception:  # noqa: BLE001 - a wake never fails the read
+            _logger.warning("Intent wake failed for session %s", conv.id, exc_info=True)
+
+    task = asyncio.create_task(_wake())
+    _wake_tasks.add(task)
+    task.add_done_callback(_wake_tasks.discard)
+
+
+_wake_tasks: set[asyncio.Task[None]] = set()
 
 
 def _recorded_repo_workspaces(

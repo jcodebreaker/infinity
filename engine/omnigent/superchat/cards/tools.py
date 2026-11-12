@@ -254,19 +254,14 @@ class RenderCardTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Show the person a card instead of prose, only when it reads better than text: "
-            "numbers to compare (compare), a market quote (quote), "
-            "sources you read (sources), a contact "
-            "(person), a file (file), long-running work (progress). For a chart or a "
-            "dashboard build a page with `superchat-dashboard` from the data files, never a card "
-            "with typed numbers. "
-            "Otherwise write normally. `data` is an object whose shape depends on `card` "
+            "Show the person a card: numbers to compare (compare), a market quote (quote), "
+            "sources you read (sources), a contact (person), a file (file), long-running work "
+            "(progress). `data` is an object whose shape depends on `card` "
             f"(`?` = optional): {_kind_hints()}. "
             "`fallback` is a complete markdown summary of the card, used where it cannot be "
             "drawn and kept in your history. Every card but progress needs `message`: one or two "
             "plain sentences for the person (what was made, anything still open), shown above "
-            "the card; write no other text around it and never repeat the card's content "
-            "(only `suggest_follow_ups` may follow)."
+            "the card."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -285,18 +280,8 @@ class RenderCardTool(Tool):
                             "description": "Stable id; reuse it to update the card in place.",
                         },
                         "title": {"type": "string", "description": "Optional short heading."},
-                        "message": {
-                            "type": "string",
-                            "maxLength": MESSAGE_MAX_CHARS,
-                            "description": (
-                                "Required except for progress: one or two plain sentences for "
-                                "the person, shown above the card."
-                            ),
-                        },
-                        "data": {
-                            "type": "object",
-                            "description": "Card payload; shapes are in the tool description.",
-                        },
+                        "message": {"type": "string", "maxLength": MESSAGE_MAX_CHARS},
+                        "data": {"type": "object"},
                         "fallback": {
                             "type": "string",
                             "description": "Markdown summary of the whole card.",
@@ -572,12 +557,9 @@ class AskClarificationTool(_CardSiblingTool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Ask the person one clarifying question as a card with 2-5 one-click options. Use "
-            "it only when the request is genuinely ambiguous, a wrong guess would waste real "
-            "work, and you can name the options clearly. If a sensible default exists, or the "
-            "answer is cheap to correct afterwards, do not ask: just proceed and say what you "
-            "assumed. One question per call, options short, distinct and mutually exclusive. "
-            "Their pick comes back as their next message; the card ends your reply."
+            "Ask the person one clarifying question as a card with 2-5 one-click options, "
+            "short, distinct and mutually exclusive. Their pick comes back as their next "
+            "message; the card ends your reply."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -602,10 +584,7 @@ class AskClarificationTool(_CardSiblingTool):
                                     {
                                         "type": "object",
                                         "properties": {
-                                            "id": {
-                                                "type": "string",
-                                                "description": "Stable option id (optional).",
-                                            },
+                                            "id": {"type": "string"},
                                             "label": {"type": "string"},
                                             "preview": {
                                                 "type": "object",

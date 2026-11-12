@@ -818,6 +818,7 @@ def create_sessions_router(
         auth_provider=auth_provider,
         permission_store=permission_store,
         background_title_coordinator=background_title_coordinator,
+        runner_tunnel_tokens=runner_tunnel_tokens,
     )
 
     register_resources_routes(

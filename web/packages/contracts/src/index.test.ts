@@ -27,6 +27,8 @@ describe("contracts", () => {
       roundId: "r1",
       status: "running",
       startedAt: null,
+      settledAt: null,
+      deliveredAt: null,
       live: null,
       helpers: 0,
       files: 0,

@@ -73,10 +73,7 @@ class MemoryRememberTool(Tool):
     def description(cls) -> str:
         return (
             "Save a durable fact, preference, instruction, or decision about "
-            "the user so it is recalled in future sessions. Call this when "
-            "the user states something that should persist (a preference, a "
-            "standing instruction, a decision) or asks you to remember it. "
-            'Say "I\'ll remember that" only after this call succeeds. Never '
+            "the user so it is recalled in future sessions. Never "
             "store secrets or credentials. A near-duplicate of an existing "
             "claim is reinforced (not duplicated). Nothing is replaced "
             "automatically: when a claim corrects or updates an existing one, "
@@ -99,7 +96,7 @@ class MemoryRememberTool(Tool):
                         "kind": {
                             "type": "string",
                             "enum": list(_KIND_ENUM),
-                            "description": "What kind of claim this is. Defaults to 'fact'.",
+                            "description": "Defaults to 'fact'.",
                         },
                         "quote": {
                             "type": "string",

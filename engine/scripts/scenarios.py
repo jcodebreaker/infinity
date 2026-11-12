@@ -178,8 +178,16 @@ class Engine:
         return json.loads(raw) if raw else None
 
     def items(self, session_id: str) -> list[dict[str, Any]]:
-        snapshot = self.call("GET", f"/v1/sessions/{session_id}?include_liveness=false")
-        return list(snapshot.get("items") or [])
+        """Every item, oldest first. The session snapshot stops at 100 items, and the turns'
+        items are found by slicing past the count before the message, so read every page."""
+        items: list[dict[str, Any]] = []
+        after = ""
+        while True:
+            page = self.call("GET", f"/v1/sessions/{session_id}/items?limit=1000{after}")
+            items.extend(page.get("data") or [])
+            if not page.get("has_more"):
+                return items
+            after = f"&after={page['last_id']}"
 
     def status(self, session_id: str) -> str:
         path = f"/v1/sessions/{session_id}?include_items=false&include_liveness=false"
@@ -656,8 +664,9 @@ def _table(rows: list[dict[str, Any]], with_round: bool = False) -> str:
 # ── studio check (ADR 0031 step 2) ─────────────────────────────────────────────
 
 #: The throwaway host and title a studio check uses: ``handoff_probe.py``'s prefixes, so its
-#: ``cleanup`` on the state file the check writes deletes the Conversation and the host. A studio runs on its Conversation's runner (``find_or_create_studio``), so
-#: the check copies the deck into a new Conversation on that host and never edits the original.
+#: ``cleanup`` on the state file the check writes deletes the Conversation and the host. A
+#: studio runs on its Conversation's runner (``find_or_create_studio``), so the check copies
+#: the deck into a new Conversation on that host and never edits the original.
 STUDIO_HOST_PREFIX = "probe-studio-"
 #: Slide 2's title element, the first heading with an id after slide 2 opens.
 _SLIDE_OPEN = re.compile(r'<section\b[^>]*\bclass="[^"]*\bslide\b')

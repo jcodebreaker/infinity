@@ -256,9 +256,11 @@ def test_launch_runner_frame_round_trip() -> None:
         binding_token="secret_token_xyz",
         workspace="/Users/corey/projects/frontend",
         session_id="conv_abc123",
+        hold_s=43200,
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostLaunchRunnerFrame)
+    assert decoded.hold_s == 43200
     assert decoded.request_id == "req_001"
     assert decoded.binding_token == "secret_token_xyz"
     assert decoded.workspace == "/Users/corey/projects/frontend"

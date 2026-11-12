@@ -155,7 +155,7 @@ async def test_background_with_no_topic_and_no_template_is_the_one_refusal_left(
 
 
 async def test_no_template_builds_in_a_chosen_look(workspace: Path) -> None:
-    """The ADR 0025 failure: "Create some presentation about Acme vs Globex" got a card and nothing."""
+    """The ADR 0025 failure: "Create some presentation about Acme vs Globex" got a card only."""
     call = ctx(view("Create some presentation about Acme vs Globex bank results"))
     theme = _chosen(await _new(None, None, call, title="Acme vs Globex"), workspace)
     assert theme in ("corporate-clean", "blue-professional")

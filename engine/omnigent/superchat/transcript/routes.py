@@ -146,6 +146,7 @@ def read_transcript(
             messages,
             newer_round_id=newer_round[0] if newer_round else None,
             artifacts=artifacts,
+            conv_store=conv_store,
         )
     return _page(
         messages,

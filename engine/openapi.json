@@ -1279,6 +1279,9 @@
               },
               {
                 "$ref": "#/components/schemas/TerminalCommandData"
+              },
+              {
+                "$ref": "#/components/schemas/EpochBlockData"
               }
             ],
             "title": "Data"
@@ -1930,6 +1933,20 @@
         "title": "ElicitationResolvedEvent",
         "type": "object"
       },
+      "EpochBlockData": {
+        "description": "The rendered block an epoch's window starts with, stored when the view start moves.\n\nHidden: never in the items list, SSE or search; the runner reads it back by id\nfrom the ``epoch_block_item_id`` session label.\n\n:param text: The block exactly as sent, e.g. ``\"[What came before, ...]\"``.",
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "EpochBlockData",
+        "type": "object"
+      },
       "ErrorData": {
         "description": "Data for a persisted error banner item.\n\nThese items mirror ``response.error`` events so clients can render\nthe same error banner after reconnect / refresh. They are listed in\n:data:`NON_CONTENT_ITEM_TYPES` because they are operator-visible\ntranscript metadata, not content the next agent turn should receive.\n\n:param source: Error source, e.g. ``\"execution\"``.\n:param code: Stable error classifier, e.g.\n    ``\"native_terminal_start_failed\"``.\n:param message: Human-readable error message, e.g.\n    ``\"Native Codex requires the 'codex' CLI on PATH.\"``.\n:param level: Rendering level. ``\"info\"`` renders the banner as a neutral\n    notice (e.g. codex started a fresh thread) rather than a failure;\n    ``None`` / ``\"error\"`` is the destructive default and is omitted from\n    the wire so existing error items are unchanged.\n:param title: Optional short headline naming the failure, e.g. ``\"Codex can't\n    start until you sign in to Databricks\"``. Kept so the card reads the\n    same after a reload as it did live.\n:param cause: Optional one or two sentences explaining why it failed.\n:param remediation: Optional concrete next step, e.g. the sign-in link\n    and code; the card offers it as an action.",
         "properties": {
@@ -2137,6 +2154,33 @@
           "error"
         ],
         "title": "ErrorResponse",
+        "type": "object"
+      },
+      "EventBody": {
+        "additionalProperties": false,
+        "description": "Body of ``POST /v1/me/rhythm/events``.",
+        "properties": {
+          "event": {
+            "enum": [
+              "shown",
+              "opened",
+              "acted_on"
+            ],
+            "title": "Event",
+            "type": "string"
+          },
+          "item_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_id",
+          "event"
+        ],
+        "title": "EventBody",
         "type": "object"
       },
       "ExtensionAssetErrorResponse": {
@@ -3396,7 +3440,7 @@
         "type": "object"
       },
       "MessageData": {
-        "description": "Data for a message item (user or assistant).\n\n:param role: ``\"user\"`` or ``\"assistant\"``.\n:param content: Heterogeneous content blocks, e.g.\n    ``[{\"type\": \"input_text\", \"text\": \"Hello\"}]``.\n:param agent: Agent name (required for assistant messages,\n    absent for user). Serialized as ``\"model\"`` in JSON.\n:param is_meta: ``True`` for durable context that must be\n    replayed to agents but hidden from user-facing transcripts,\n    e.g. injected skill instructions. Defaults to ``False``\n    and is omitted from serialized payloads in that case.\n:param is_system_notice: ``True`` for a user-role message the runtime wrote\n    itself, e.g. a sub-agent wake notice or a timer firing, as opposed to\n    words a person typed. Defaults to ``False`` and is omitted from\n    serialized payloads in that case. Read it through :func:`is_system_notice`.\n:param interrupted: ``True`` when an assistant message is a\n    durable partial response from an interrupted external-native\n    turn, e.g. Codex ``turn/completed`` with status\n    ``\"interrupted\"``. Defaults to ``False`` and is omitted from\n    serialized payloads in that case.\n:param stream_message_id: Native live-preview stream finalized by\n    this assistant message. Persisted so reconnect snapshots can\n    suppress delayed preview chunks after the authoritative item.",
+        "description": "Data for a message item (user or assistant).\n\n:param role: ``\"user\"`` or ``\"assistant\"``.\n:param content: Heterogeneous content blocks, e.g.\n    ``[{\"type\": \"input_text\", \"text\": \"Hello\"}]``.\n:param agent: Agent name (required for assistant messages,\n    absent for user). Serialized as ``\"model\"`` in JSON.\n:param is_meta: ``True`` for durable context that must be\n    replayed to agents but hidden from user-facing transcripts,\n    e.g. injected skill instructions. Defaults to ``False``\n    and is omitted from serialized payloads in that case.\n:param is_system_notice: ``True`` for a user-role message the runtime wrote\n    itself, e.g. a sub-agent wake notice or a timer firing, as opposed to\n    words a person typed. Defaults to ``False`` and is omitted from\n    serialized payloads in that case. Read it through :func:`is_system_notice`.\n:param interrupted: ``True`` when an assistant message is a\n    durable partial response from an interrupted external-native\n    turn, e.g. Codex ``turn/completed`` with status\n    ``\"interrupted\"``. Defaults to ``False`` and is omitted from\n    serialized payloads in that case.\n:param stream_message_id: Native live-preview stream finalized by\n    this assistant message. Persisted so reconnect snapshots can\n    suppress delayed preview chunks after the authoritative item.\n:param context_prefix: On the user-role item that opens a turn, the\n    context blocks sent in front of its words, e.g. ``[\"[Profile] ...\"]``.\n    ``None`` when never written, ``[]`` when written and nothing was\n    sent. Record-only (see :data:`RECORD_ONLY_MESSAGE_FIELDS`).\n:param delivered_after_call_id: On a steer, the ``call_id`` of the last\n    tool result the harness had before taking it, or ``\"turn_start\"``.\n    Record-only (see :data:`RECORD_ONLY_MESSAGE_FIELDS`).",
         "properties": {
           "content": {
             "items": {
@@ -3405,6 +3449,31 @@
             },
             "title": "Content",
             "type": "array"
+          },
+          "context_prefix": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Prefix"
+          },
+          "delivered_after_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivered After Call Id"
           },
           "interrupted": {
             "default": false,
@@ -3733,6 +3802,26 @@
         "title": "NativeToolData",
         "type": "object"
       },
+      "NotUsefulBody": {
+        "additionalProperties": false,
+        "description": "Body of ``POST /v1/me/outbox/{item_id}/not-useful``.",
+        "properties": {
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 1000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "title": "NotUsefulBody",
+        "type": "object"
+      },
       "OpenRequest": {
         "additionalProperties": false,
         "description": "Body of ``POST /v1/me/vault/requests``.",
@@ -3991,6 +4080,33 @@
           "level"
         ],
         "title": "PermissionObject",
+        "type": "object"
+      },
+      "PickBody": {
+        "additionalProperties": false,
+        "description": "Body of ``POST /v1/me/topics/{key}/pick``.",
+        "properties": {
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "item_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Id"
+          }
+        },
+        "required": [
+          "conversation_id"
+        ],
+        "title": "PickBody",
         "type": "object"
       },
       "PolicyDeniedEvent": {
@@ -5345,7 +5461,7 @@
         "type": "object"
       },
       "RoundView": {
-        "description": "Response for ``GET /v1/sessions/{session_id}/rounds/{round_id}``: the Round's events folded\n(``omnigent.superchat.rounds.fold``).\n\n:param round_id: The Round: the id of the person's message that opened it.\n:param status: ``idle``, ``running``, ``done``, ``failed`` or ``stopped``.\n:param hidden: A run no person started.\n:param started_at: Epoch seconds, or ``None`` before it opened.\n:param settled_at: Epoch seconds, or ``None`` while it runs.\n:param elapsed: Seconds from start to settlement, or to its last event.\n:param ask: The person's message.\n:param reason: Why a failed Round failed, when its last turn's end said.\n:param stop_line: What Stop stopped, once stopped.\n:param now: The tool running now, or ``None``.\n:param trail: Finished tool calls, in order.\n:param helpers: Helpers by session id.\n:param files: Files saved.\n:param chips: The follow-up suggestions.\n:param checklist: The model's checklist.\n:param words: The Assistant's text, one entry per finished turn.\n:param live_words: The running turn's text so far.\n:param failed_helper: A Helper failed.\n:param delivered_at: Epoch seconds the Round delivered its answer (a terminal card, the\n    chips or a question, with no Helper of it running), or ``None``; the Round may still\n    run until its turn ends.",
+        "description": "Response for ``GET /v1/sessions/{session_id}/rounds/{round_id}``: the Round's events folded\n(``omnigent.superchat.rounds.fold``).\n\n:param round_id: The Round: the id of the person's message that opened it.\n:param status: ``idle``, ``running``, ``done``, ``failed`` or ``stopped``.\n:param hidden: A run no person started.\n:param started_at: Epoch seconds, or ``None`` before it opened.\n:param settled_at: Epoch seconds, or ``None`` while it runs.\n:param elapsed: Seconds from start to settlement, or to its last event.\n:param ask: The person's message.\n:param reason: Why a failed Round failed, when its last turn's end said.\n:param stop_line: What Stop stopped, once stopped.\n:param now: The tool running now, or ``None``.\n:param trail: Finished tool calls, in order.\n:param helpers: Helpers by session id.\n:param files: Files saved.\n:param chips: The follow-up suggestions.\n:param checklist: The model's checklist.\n:param words: The Assistant's text, one entry per finished turn.\n:param live_words: The running turn's text so far.\n:param failed_helper: A Helper failed.\n:param delivered_at: Epoch seconds the Round delivered its answer (a terminal card, the\n    chips or a question, with no Helper of it running), or ``None``; the Round may still\n    run until its turn ends.\n:param trace_id: The Round's OpenTelemetry trace id (32 hex), or ``None`` when it was not\n    traced (ADR 0041).",
         "properties": {
           "ask": {
             "anyOf": [
@@ -5478,6 +5594,17 @@
               }
             ],
             "title": "Stop Line"
+          },
+          "trace_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trace Id"
           },
           "trail": {
             "items": {
@@ -5621,57 +5748,6 @@
           "rationale"
         ],
         "title": "RoutingDecisionData",
-        "type": "object"
-      },
-      "RuleBody": {
-        "additionalProperties": false,
-        "description": "Body of ``POST /v1/me/approval-rules``.",
-        "properties": {
-          "category": {
-            "enum": [
-              "send",
-              "post",
-              "delete",
-              "spend",
-              "upload",
-              "share"
-            ],
-            "title": "Category",
-            "type": "string"
-          },
-          "decision": {
-            "default": "allow",
-            "enum": [
-              "allow",
-              "deny"
-            ],
-            "title": "Decision",
-            "type": "string"
-          },
-          "label": {
-            "anyOf": [
-              {
-                "maxLength": 256,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Label"
-          },
-          "target": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Target",
-            "type": "string"
-          }
-        },
-        "required": [
-          "category",
-          "target"
-        ],
-        "title": "RuleBody",
         "type": "object"
       },
       "SandboxStatus": {
@@ -5847,6 +5923,23 @@
           }
         },
         "title": "SectionsBody",
+        "type": "object"
+      },
+      "SeenBody": {
+        "additionalProperties": false,
+        "description": "Body of ``POST /v1/me/outbox/seen``.",
+        "properties": {
+          "item_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Item Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_id"
+        ],
+        "title": "SeenBody",
         "type": "object"
       },
       "SendCommentsRequest": {
@@ -10410,6 +10503,161 @@
         ],
         "title": "WriteNoteBody",
         "type": "object"
+      },
+      "WriteTopicsBody": {
+        "additionalProperties": false,
+        "description": "Body of ``POST /v1/topics/write``.",
+        "properties": {
+          "parent_session_id": {
+            "title": "Parent Session Id",
+            "type": "string"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "topics": {
+            "items": {},
+            "title": "Topics",
+            "type": "array"
+          }
+        },
+        "required": [
+          "parent_session_id"
+        ],
+        "title": "WriteTopicsBody",
+        "type": "object"
+      },
+      "omnigent__superchat__approvals__routes__RuleBody": {
+        "additionalProperties": false,
+        "description": "Body of ``POST /v1/me/approval-rules``.",
+        "properties": {
+          "category": {
+            "enum": [
+              "send",
+              "post",
+              "delete",
+              "spend",
+              "upload",
+              "share"
+            ],
+            "title": "Category",
+            "type": "string"
+          },
+          "decision": {
+            "default": "allow",
+            "enum": [
+              "allow",
+              "deny"
+            ],
+            "title": "Decision",
+            "type": "string"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "target": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Target",
+            "type": "string"
+          }
+        },
+        "required": [
+          "category",
+          "target"
+        ],
+        "title": "RuleBody",
+        "type": "object"
+      },
+      "omnigent__superchat__rhythm__routes__RuleBody": {
+        "additionalProperties": false,
+        "description": "Body of ``POST /v1/me/reach-rules``.",
+        "properties": {
+          "action": {
+            "enum": [
+              "add",
+              "remove"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "maxLength": 16,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          },
+          "params": {
+            "additionalProperties": true,
+            "title": "Params",
+            "type": "object"
+          },
+          "said": {
+            "default": "",
+            "maxLength": 400,
+            "title": "Said",
+            "type": "string"
+          },
+          "session_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "action"
+        ],
+        "title": "RuleBody",
+        "type": "object"
       }
     }
   },
@@ -12986,7 +13234,7 @@
     },
     "/v1/eval-persons/{email}/release": {
       "post": {
-        "description": "End an eval person's run: stop their turns, remove their host (home kept) and mark\nthem released. Refuses anyone who is not a run's eval person.",
+        "description": "End an eval person's run: stop their turns, remove their host (home kept) and mark\nthem released. An admin or the eval person themself may ask; refuses anyone who is not\na run's eval person.",
         "operationId": "release_eval_person_v1_eval_persons__email__release_post",
         "parameters": [
           {
@@ -14098,6 +14346,60 @@
         ]
       }
     },
+    "/v1/mail/threads/{thread_id}": {
+      "get": {
+        "description": "One thread, for the calling run ``chat_id`` (a Lookout or brief run).",
+        "operationId": "read_thread_v1_mail_threads__thread_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thread_id",
+            "required": true,
+            "schema": {
+              "title": "Thread Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "chat_id",
+            "required": true,
+            "schema": {
+              "title": "Chat Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Read Thread V1 Mail Threads  Thread Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Thread",
+        "tags": [
+          "mail"
+        ]
+      }
+    },
     "/v1/me": {
       "get": {
         "description": "Return the current user's identity.\n\nReads the user from the auth provider (same logic that\nsession routes use). The frontend calls this on load to\ndiscover who it is.\n\nAlso returns ``is_admin`` \u2014 the mode-agnostic admin signal\n(the shared ``users.is_admin`` column, set by the admin-list\npromotion at login). The SPA gates admin chrome on it in\nEVERY mode, including OIDC/SSO where the accounts-only\n``/auth/me`` endpoint does not exist.\n\nAn identity the admin list names but the database doesn't yet\nflag is promoted here, as login does for OIDC and accounts.\nHeader auth has no login step, so without this a listed admin\nwould see admin chrome that every admin-gated route refuses.\n\nWhen OIDC is active and the user is unauthenticated,\nreturns 401 with a ``login_url`` so the frontend knows\nwhere to redirect.\n\n:param request: The incoming FastAPI request.\n:returns: ``{\"user_id\": \"alice@example.com\", \"is_admin\": true}``,\n    ``{\"user_id\": null, \"is_admin\": false}`` if unauthenticated\n    in header mode, or 401 with ``login_url`` in OIDC mode.",
@@ -14145,7 +14447,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/RuleBody"
+                "$ref": "#/components/schemas/omnigent__superchat__approvals__routes__RuleBody"
               }
             }
           },
@@ -14392,6 +14694,30 @@
         ]
       }
     },
+    "/v1/me/asks/history": {
+      "get": {
+        "description": "The caller's answered asks of the last :data:`HISTORY_DAYS` days, newest first.",
+        "operationId": "ask_history_v1_me_asks_history_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Ask History V1 Me Asks History Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Ask History",
+        "tags": [
+          "asks"
+        ]
+      }
+    },
     "/v1/me/asks/{ask_id}/answer": {
       "post": {
         "description": "Answer one ask with one of its choice ids.",
@@ -14451,7 +14777,7 @@
     },
     "/v1/me/brief/latest": {
       "get": {
-        "description": "The newest brief page and the task that makes it.\n\n:returns: ``{\"task_id\", \"enabled\", \"next_run_at\", \"brief\"}``; ``brief`` is ``None``\n    before the first run (``{artifact_id, group_id, title, version, created_at, line}``\n    otherwise), and every field is empty for a person without a Conversation yet.",
+        "description": "The newest brief page and the task that makes it.\n\n:returns: ``{\"task_id\", \"enabled\", \"next_run_at\", \"brief\"}``; ``brief`` is ``None``\n    before the first run (``{artifact_id, group_id, title, version, created_at, line,\n    home}`` otherwise, ``home`` the Home lines), and every field is empty for a person\n    without a Conversation yet.",
         "operationId": "latest_brief_v1_me_brief_latest_get",
         "responses": {
           "200": {
@@ -15107,6 +15433,196 @@
         ]
       }
     },
+    "/v1/me/outbox": {
+      "get": {
+        "description": "The caller's proactive messages after *after*, oldest first.",
+        "operationId": "list_outbox_v1_me_outbox_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Outbox V1 Me Outbox Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Outbox",
+        "tags": [
+          "outbox"
+        ]
+      }
+    },
+    "/v1/me/outbox/seen": {
+      "post": {
+        "description": "The caller saw the Conversation up to the proactive message *item_id*.",
+        "operationId": "seen_v1_me_outbox_seen_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SeenBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Seen V1 Me Outbox Seen Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Seen",
+        "tags": [
+          "outbox"
+        ]
+      }
+    },
+    "/v1/me/outbox/unread": {
+      "get": {
+        "description": "How many proactive messages the caller has not seen, and the first of them.",
+        "operationId": "unread_v1_me_outbox_unread_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Unread V1 Me Outbox Unread Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Unread",
+        "tags": [
+          "outbox"
+        ]
+      }
+    },
+    "/v1/me/outbox/{item_id}/not-useful": {
+      "post": {
+        "description": "The caller marks a proactive message *Not useful*.",
+        "operationId": "not_useful_v1_me_outbox__item_id__not_useful_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "title": "Item Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NotUsefulBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Not Useful V1 Me Outbox  Item Id  Not Useful Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Not Useful",
+        "tags": [
+          "outbox"
+        ]
+      }
+    },
     "/v1/me/proactivity": {
       "get": {
         "description": "The caller's proactivity level and quiet hours (defaults when unset).",
@@ -15170,6 +15686,117 @@
         "summary": "Put Proactivity",
         "tags": [
           "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/me/reach-rules": {
+      "get": {
+        "description": "The caller's reach rules in force.",
+        "operationId": "list_rules_v1_me_reach_rules_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Rules V1 Me Reach Rules Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Rules",
+        "tags": [
+          "rhythm"
+        ]
+      },
+      "post": {
+        "description": "Add or lift a rule the person said in their Conversation.",
+        "operationId": "write_rule_v1_me_reach_rules_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/omnigent__superchat__rhythm__routes__RuleBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Write Rule V1 Me Reach Rules Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Write Rule",
+        "tags": [
+          "rhythm"
+        ]
+      }
+    },
+    "/v1/me/reach-rules/{rule_id}": {
+      "delete": {
+        "description": "Settings' remove.",
+        "operationId": "delete_rule_v1_me_reach_rules__rule_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "title": "Rule Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Rule V1 Me Reach Rules  Rule Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Rule",
+        "tags": [
+          "rhythm"
         ]
       }
     },
@@ -15243,6 +15870,98 @@
         ]
       }
     },
+    "/v1/me/rhythm": {
+      "get": {
+        "description": "What the assistant learned about when the caller likes to hear from it.",
+        "operationId": "read_v1_me_rhythm_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Read V1 Me Rhythm Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read",
+        "tags": [
+          "rhythm"
+        ]
+      }
+    },
+    "/v1/me/rhythm/events": {
+      "post": {
+        "description": "A client saw, opened or acted on one of the caller's proactive messages.",
+        "operationId": "report_v1_me_rhythm_events_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EventBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Report V1 Me Rhythm Events Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Report",
+        "tags": [
+          "rhythm"
+        ]
+      }
+    },
+    "/v1/me/rhythm/reset": {
+      "post": {
+        "description": "*Start over*: forget what was learned.",
+        "operationId": "reset_v1_me_rhythm_reset_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Reset V1 Me Rhythm Reset Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Reset",
+        "tags": [
+          "rhythm"
+        ]
+      }
+    },
     "/v1/me/system-jobs": {
       "get": {
         "description": "The engine's recurring background jobs, with this person's last and next run.",
@@ -15264,6 +15983,109 @@
         "summary": "List System Jobs",
         "tags": [
           "system_jobs"
+        ]
+      }
+    },
+    "/v1/me/topics": {
+      "get": {
+        "description": "The owner's open topics touched within ``days``, newest first.",
+        "operationId": "list_topics_v1_me_topics_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "days",
+            "required": false,
+            "schema": {
+              "default": 7,
+              "maximum": 7,
+              "minimum": 1,
+              "title": "Days",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Topics V1 Me Topics Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Topics",
+        "tags": [
+          "topics"
+        ]
+      }
+    },
+    "/v1/me/topics/{key}/pick": {
+      "post": {
+        "description": "Append the topic's card to the Conversation (no turn starts) and return it.",
+        "operationId": "pick_topic_v1_me_topics__key__pick_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "title": "Key",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PickBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Pick Topic V1 Me Topics  Key  Pick Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pick Topic",
+        "tags": [
+          "topics"
         ]
       }
     },
@@ -18544,7 +19366,7 @@
     },
     "/v1/sessions/{session_id}/items": {
       "get": {
-        "description": "List items in a session with cursor-based pagination.\n\nDelegates to the conversation items store \u2014 session_id is\nthe conversation_id. Same pagination contract as\n``GET /v1/conversations/{id}/items``.\n\n:param session_id: Session/conversation identifier,\n    e.g. ``\"conv_abc123\"``.\n:param limit: Maximum number of items to return\n    (1-1000, default 100).\n:param after: Cursor \u2014 return items after this item ID,\n    e.g. ``\"msg_abc123\"``.\n:param before: Cursor \u2014 return items before this item ID.\n:param order: Sort order, ``\"asc\"`` (chronological,\n    default) or ``\"desc\"``.\n:param type: Only items of this type. ``\"compaction\"`` with\n    ``order=desc&limit=1`` is the session's latest checkpoint.\n:returns: A :class:`PaginatedList` of conversation items.\n:raises OmnigentError: 404 if no session exists.",
+        "description": "List items in a session with cursor-based pagination.\n\nDelegates to the conversation items store \u2014 session_id is\nthe conversation_id. Same pagination contract as\n``GET /v1/conversations/{id}/items``.\n\n:param session_id: Session/conversation identifier,\n    e.g. ``\"conv_abc123\"``.\n:param limit: Maximum number of items to return\n    (1-1000, default 100).\n:param after: Cursor \u2014 return items after this item ID,\n    e.g. ``\"msg_abc123\"``.\n:param before: Cursor \u2014 return items before this item ID.\n:param order: Sort order, ``\"asc\"`` (chronological,\n    default) or ``\"desc\"``.\n:param type: Only items of this type. ``\"compaction\"`` with\n    ``order=desc&limit=1`` is the session's latest checkpoint.\n:param record: The runner's read of the record: items carry their\n    record-only fields and ``epoch_block`` items are listed too.\n:returns: A :class:`PaginatedList` of conversation items.\n:raises OmnigentError: 404 if no session exists; 403 for ``record``\n    from any caller but the session's runner.",
         "operationId": "list_session_items_v1_sessions__session_id__items_get",
         "parameters": [
           {
@@ -18626,6 +19448,16 @@
                 }
               ],
               "title": "Type"
+            }
+          },
+          {
+            "in": "query",
+            "name": "record",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Record",
+              "type": "boolean"
             }
           }
         ],
@@ -19838,7 +20670,7 @@
     },
     "/v1/sessions/{session_id}/related_chats": {
       "get": {
-        "description": "List the chats one session may read besides itself.\n\n:param session_id: Session/conversation identifier,\n    e.g. ``\"conv_abc123\"``.\n:returns: A :class:`PaginatedList` of chat summary dicts\n    (``id``, ``title``, ``created_at``, ``updated_at``,\n    ``last_message_preview``, ``archived``, ``live``, ``project``);\n    not cursor-paginated.\n:raises OmnigentError: 404 if no session exists.",
+        "description": "List the chats one session may read besides itself.\n\n:param session_id: Session/conversation identifier,\n    e.g. ``\"conv_abc123\"``.\n:param chat_id: A chat the session asks to read; listed too when it is a Helper the\n    session started, owned by the same person.\n:returns: A :class:`PaginatedList` of chat summary dicts\n    (``id``, ``title``, ``created_at``, ``updated_at``,\n    ``last_message_preview``, ``archived``, ``live``, ``project``);\n    not cursor-paginated.\n:raises OmnigentError: 404 if no session exists.",
         "operationId": "list_related_chats_route_v1_sessions__session_id__related_chats_get",
         "parameters": [
           {
@@ -19848,6 +20680,22 @@
             "schema": {
               "title": "Session Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "chat_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Chat Id"
             }
           }
         ],
@@ -20227,7 +21075,7 @@
     },
     "/v1/sessions/{session_id}/resources/environments/{environment_id}/filesystem/{relative_path}": {
       "delete": {
-        "description": "Delete a file or directory in an environment.\n\n:param request: The incoming FastAPI request (for auth).\n:param session_id: Session/conversation identifier.\n:param environment_id: Environment resource id.\n:param relative_path: Path relative to environment root.\n:returns: Delete result.",
+        "description": "Delete a file or directory in an environment.\n\n:param request: The incoming FastAPI request (for auth).\n:param session_id: Session/conversation identifier.\n:param environment_id: Environment resource id.\n:param relative_path: Path relative to environment root.\n:param recursive: Delete a non-empty directory with everything in it.\n:returns: Delete result.",
         "operationId": "delete_environment_path_v1_sessions__session_id__resources_environments__environment_id__filesystem__relative_path__delete",
         "parameters": [
           {
@@ -20255,6 +21103,16 @@
             "schema": {
               "title": "Relative Path",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "recursive",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Recursive",
+              "type": "boolean"
             }
           }
         ],
@@ -21866,7 +22724,7 @@
     },
     "/v1/sessions/{session_id}/transcript": {
       "get": {
-        "description": "A session's transcript as typed blocks (``text``, ``card``, ``helper``, ``file``,\n``secure_entry``, ``error``).\n\n:param session_id: Any session the caller can READ (same gate as ``.../items``).\n:param limit: Items per page, newest page first.\n:param before: Cursor: the ``older_cursor`` of the page after this one.\n:param before_reset: Page the history before the latest reset instead (empty when the\n    session was never reset).\n:returns: ``{\"data\": [message], \"has_more\", \"older_cursor\", \"lineage\", \"reset\", \"live\"}``:\n    ``reset`` is ``{\"item_id\", \"created_at\"}`` of the latest reset or ``None``; ``live``\n    is whether a turn is in flight. A user message still waiting behind the running\n    turn has ``delivered: \"queued\"`` (from the runner's live queue). A person's message\n    linked to an artifact has ``artifact`` (``{artifact_id, name, version, how}``, or\n    ``None`` when the person said it is about none). Every message has ``round_id``: the\n    Round it is in (the id of the person's message that opened it), ``None`` outside\n    any Round.\n:raises OmnigentError: 403 without READ; 404 if no session exists.",
+        "description": "A session's transcript as typed blocks (``text``, ``card``, ``helper``, ``file``,\n``secure_entry``, ``error``).\n\n:param session_id: Any session the caller can READ (same gate as ``.../items``).\n:param limit: Items per page, newest page first.\n:param before: Cursor: the ``older_cursor`` of the page after this one.\n:param before_reset: Page the history before the latest reset instead (empty when the\n    session was never reset).\n:returns: ``{\"data\": [message], \"has_more\", \"older_cursor\", \"lineage\", \"reset\", \"live\"}``:\n    ``reset`` is ``{\"item_id\", \"created_at\"}`` of the latest reset or ``None``; ``live``\n    is whether a turn is in flight. A user message still waiting behind the running\n    turn has ``delivered: \"queued\"`` (from the runner's live queue). A person's message\n    linked to an artifact has ``artifact`` (``{artifact_id, name, version, how}``, or\n    ``None`` when the person said it is about none). Every message has ``round_id``: the\n    Round it is in (the id of the person's message that opened it), ``None`` outside\n    any Round. A proactive message (a scheduled run's turn wrote it, ADR 0036) has\n    ``proactive``: ``{kind, topic_key?, urgency}``.\n:raises OmnigentError: 403 without READ; 404 if no session exists.",
         "operationId": "get_session_transcript_v1_sessions__session_id__transcript_get",
         "parameters": [
           {
@@ -22231,6 +23089,50 @@
         "summary": "Get Skills",
         "tags": [
           "skills"
+        ]
+      }
+    },
+    "/v1/topics/write": {
+      "post": {
+        "description": "The notes Helper's upsert (cleaned, trimmed, by key), or the Conversation's own\nupdate of the topic the person picked up.",
+        "operationId": "write_topics_v1_topics_write_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WriteTopicsBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Write Topics V1 Topics Write Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Write Topics",
+        "tags": [
+          "topics"
         ]
       }
     },

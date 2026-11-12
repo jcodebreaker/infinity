@@ -32,8 +32,11 @@ from omnigent.server.routes._sessions.common import (
 _HUGE_TOKENS = 1_000_000
 
 # A reply the fold accepts: tagged entries plus a journal.
-_STATE = "- [t-a · 2026-10-12] Alpha"
-_REPLY = f"{_STATE}\n<journal>\n2026-10-12 · did it\n</journal>"
+# Dated today: an entry untouched for 30 days renders ``stale?``, which would make these
+# expectations depend on the wall clock.
+_TODAY = f"{datetime.now(UTC):%Y-%m-%d}"
+_STATE = f"- [t-a · {_TODAY}] Alpha"
+_REPLY = f"{_STATE}\n<journal>\n{_TODAY} · did it\n</journal>"
 
 
 def _msg(item_id: str, role: str, text: str, response_id: str | None = None) -> dict[str, Any]:
@@ -711,15 +714,17 @@ def test_fold_input_stamps_time_and_zone_on_the_now_line() -> None:
 
 
 @pytest.mark.asyncio
-async def test_build_rollover_item_rejects_an_empty_summary() -> None:
-    """An empty/blank summarizer reply must raise so the caller keeps the previous checkpoint."""
-    with pytest.raises(ValueError, match="no tagged entries or no journal"):
-        await build_rollover_item(
-            _turn(1) + _turn(2),
-            previous_summary=None,
-            model="gpt-4o",
-            llm_client=_ReturnsTextClient("   "),
-        )
+async def test_build_rollover_item_keeps_the_previous_state_on_an_empty_summary() -> None:
+    """A blank reply changes nothing: the working list stays and the anchor still moves."""
+    data = await build_rollover_item(
+        _turn(1) + _turn(2),
+        previous_summary=f"{CHECKPOINT_HEADER}\n\n{_STATE}",
+        model="gpt-4o",
+        llm_client=_ReturnsTextClient("   "),
+    )
+    assert data.summary == f"{CHECKPOINT_HEADER}\n\n{_STATE}"
+    assert data.last_item_id == "a2"
+    assert data.journal_lines == []
 
 
 def test_summarizer_instruction_forbids_recording_tool_errors_as_facts() -> None:
@@ -764,7 +769,12 @@ def test_each_checkpoint_cause_has_its_own_header_with_the_shared_marker() -> No
     assert "came back after a long break" in back
     assert "asked to compact" in manual
     assert "grew past its context limit" not in back + manual
-    assert (size, back, manual) == CHECKPOINT_HEADERS
+    assert (size, back, manual) == (
+        CHECKPOINT_HEADERS[0],
+        CHECKPOINT_HEADERS[2],
+        CHECKPOINT_HEADERS[3],
+    )
+    assert "was reloaded" in checkpoint_header("restart") == CHECKPOINT_HEADERS[1]
     for header in CHECKPOINT_HEADERS:
         assert is_checkpoint_text(header) and header.startswith(CHECKPOINT_MARKER)
         assert "session_history" in header  # the rest of the framing is shared
@@ -946,8 +956,8 @@ def test_is_placeholder_summary_only_matches_the_stand_in() -> None:
 
 _TAGGED_PREVIOUS = (
     f"{CHECKPOINT_HEADER}\n\n## Topics\n"
-    "- [t-launch-budget · 2026-10-09] Spring launch budget: confirm the venue line\n"
-    "- [o-venue · 2026-10-09] Venue still open\n"
+    f"- [t-launch-budget · {_TODAY}] Spring launch budget: confirm the venue line\n"
+    f"- [o-venue · {_TODAY}] Venue still open\n"
     "Current position: waiting."
 )
 
@@ -1030,14 +1040,15 @@ async def test_a_window_without_tool_calls_has_no_refs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_reply_without_a_journal_is_refused() -> None:
-    with pytest.raises(ValueError, match="no tagged entries or no journal"):
-        await build_rollover_item(
-            _turn(1),
-            previous_summary=None,
-            model="gpt-4o",
-            llm_client=_ReturnsTextClient("## State\n- [t-a] Alpha"),
-        )
+async def test_a_reply_without_a_journal_is_accepted_with_no_journal_lines() -> None:
+    data = await build_rollover_item(
+        _turn(1),
+        previous_summary=None,
+        model="gpt-4o",
+        llm_client=_ReturnsTextClient("## State\n- [t-a] Alpha"),
+    )
+    assert "- [t-a" in data.summary
+    assert data.journal_lines == []
 
 
 @pytest.mark.asyncio
@@ -1053,10 +1064,10 @@ async def test_a_rewrite_that_loses_a_tag_is_repaired_and_counted() -> None:
         llm_client=_ReturnsTextClient(reply),
     )
     assert data.repairs == 1
-    assert "- [o-venue · 2026-10-09] Venue still open" in data.summary
+    assert f"- [o-venue · {_TODAY}] Venue still open" in data.summary
     assert "Budget moved on" in data.summary
     restored = data.compacted_messages[1]["content"][0]["text"]
-    assert "- [o-venue · 2026-10-09] Venue still open" in restored
+    assert f"- [o-venue · {_TODAY}] Venue still open" in restored
 
 
 @pytest.mark.asyncio
@@ -1082,7 +1093,7 @@ async def test_pending_closes_close_the_entry_and_reach_the_journal_lines() -> N
         previous_summary=_TAGGED_PREVIOUS,
         model="gpt-4o",
         llm_client=_ReturnsTextClient(
-            "- [t-launch-budget · 2026-10-09] Spring launch budget\n"
+            f"- [t-launch-budget · {_TODAY}] Spring launch budget\n"
             "<journal>\n2026-10-12 · talked\n</journal>"
         ),
         pending_closes={"o-venue": "the person said it is wrong"},

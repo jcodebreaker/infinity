@@ -68,10 +68,6 @@ tools:
     - report_progress
     - raise_flag
     - start_helper
-    - sys_session_close
-    - sys_session_list
-    - sys_session_get_history
-    - sys_session_get_info
     - sys_read_inbox
     - sys_cancel_task
   # One level of coordination: the parts it starts are `subworker` leaves (agents/subworker/);

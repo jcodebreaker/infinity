@@ -185,7 +185,9 @@ class TopicsUpdateTool(Tool):
         return (
             "Create or update the person's topics, by key. Pass only the fields that changed; a "
             "field passed replaces the stored one, except `events`, which are added to the "
-            "stored ones. A new topic needs `title`. Set `status: closed` when it is done."
+            "stored ones. A new topic needs `title`. Set `status: closed` when it is done. "
+            "From the Conversation it writes only the topic the person picked up, by its key; "
+            "any other write is refused, and the background pass keeps new subjects."
         )
 
     def get_schema(self) -> dict[str, Any]:

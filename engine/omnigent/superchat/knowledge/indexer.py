@@ -92,8 +92,8 @@ RERANK_CANDIDATES = 20
 #: A file whose Markdown is at most this long (about 8k tokens) travels whole with the message.
 INLINE_MAX_CHARS = 32_000
 #: Default and ceiling of what ``files_get`` / ``files_multi_get`` return, in characters.
-GET_DEFAULT_CHARS = 24_000
-GET_MAX_CHARS = 60_000
+GET_DEFAULT_CHARS = 16_000
+GET_MAX_CHARS = 16_000
 #: Said with a table file's manifest, in place of its rows.
 TABULAR_NOTE = (
     "This is the table's schema, not its rows. Compute numbers with code (pandas, duckdb) in "

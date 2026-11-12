@@ -92,9 +92,6 @@ class _ConversationStore:
         conversation_id: str,
         *,
         new_agent_id: str,
-        new_agent_name: str,
-        new_agent_bundle_location: str,
-        new_agent_description: str | None,
         copy_model_settings: bool,
         presentation_labels: dict[str, str],
         previous_builtin_id: str | None,
@@ -102,10 +99,7 @@ class _ConversationStore:
         """Record the call and return the updated conversation.
 
         :param conversation_id: Session being switched.
-        :param new_agent_id: Cloned agent id the route generated.
-        :param new_agent_name: Cloned agent name.
-        :param new_agent_bundle_location: Target bundle to clone.
-        :param new_agent_description: Target description.
+        :param new_agent_id: Built-in agent id the session binds to.
         :param copy_model_settings: Same-family flag from the route.
         :param presentation_labels: Target-harness ui/wrapper labels.
         :param previous_builtin_id: Built-in switched away from.
@@ -116,9 +110,6 @@ class _ConversationStore:
             {
                 "conversation_id": conversation_id,
                 "new_agent_id": new_agent_id,
-                "new_agent_name": new_agent_name,
-                "new_agent_bundle_location": new_agent_bundle_location,
-                "new_agent_description": new_agent_description,
                 "copy_model_settings": copy_model_settings,
                 "presentation_labels": presentation_labels,
                 "previous_builtin_id": previous_builtin_id,

@@ -55,7 +55,8 @@ def test_chart_is_not_a_card_kind_any_more() -> None:
             "enum"
         ]
     )
-    assert "superchat-dashboard" in RenderCardTool.description()
+    # The prompt sends charts to superchat-dashboard; the card offers none.
+    assert "chart" not in RenderCardTool.description()
 
 
 def test_every_kind_has_a_valid_fixture() -> None:

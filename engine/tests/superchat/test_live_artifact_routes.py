@@ -235,14 +235,12 @@ def test_tools_are_offered_by_role() -> None:
         return [t.name() for t in LIVE_FEATURE.tools(labels, ToolManagerCtx())]
 
     chat = {CONTEXT_MODE_LABEL: SUPERSIDE_CHAT_MODE_VALUE}
-    assert names(chat) == [
-        "artifact_keep_updated", "artifact_stop_updating", "artifact_live_settings",
-    ]  # fmt: skip
+    assert names(chat) == ["live"]
     assert names({**chat, SUBAGENT_LABEL_KEY: "worker"}) == [
         "live_update_context", "live_update_save",
     ]  # fmt: skip
     assert names({}) == []
-    assert set(LIVE_FEATURE.handlers) >= {"artifact_keep_updated", "live_update_save"}
+    assert set(LIVE_FEATURE.handlers) >= {"live", "live_update_save"}
 
 
 def test_deleting_the_page_drops_its_live_row_and_task(env, monkeypatch) -> None:

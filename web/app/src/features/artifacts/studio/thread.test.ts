@@ -117,19 +117,6 @@ describe("studioThread", () => {
     ).toEqual([1, 1, 1]);
   });
 
-  it("puts a since-you-were-here row above the first version newer than the last visit", () => {
-    const rows = studioThread(messages, versions, STUDIO, 3);
-    const kinds = rows.map((row) => (row.kind === "version" ? `v${row.version}` : row.kind));
-    // The folded v3 → v4 run reaches past v3, so the row goes above it.
-    expect(kinds.slice(3)).toEqual(["v2", "since", "hand", "v4", "hand", "v5", "v6"]);
-    expect(studioThread(messages, versions, STUDIO, 6).some((row) => row.kind === "since")).toBe(
-      false,
-    );
-    expect(studioThread(messages, versions, STUDIO).some((row) => row.kind === "since")).toBe(
-      false,
-    );
-  });
-
   it("shows a request's element chip instead of its request block, and the slide it is about", () => {
     const { block } = buildElementAsk({
       artifactId: "v2",

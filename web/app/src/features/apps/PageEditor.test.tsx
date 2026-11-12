@@ -108,9 +108,6 @@ async function mount() {
     ),
   );
 }
-const button = (text: string) =>
-  [...host.querySelectorAll<HTMLElement>("button")].find((b) => b.textContent?.trim() === text);
-
 function editFrame() {
   const el = host.querySelector('[data-testid="deck-edit-frame"] iframe') as HTMLIFrameElement;
   const srcdoc = el.getAttribute("srcdoc") ?? "";
@@ -146,29 +143,32 @@ it("reads layers and tells an app from a page", () => {
   expect(isAppHtml("<h1>Hi</h1>")).toBe(false);
 });
 
-it("runs the app live, and Edit puts the page-mode bridge on it", async () => {
+it("runs the app live, and Select puts the page-mode bridge on it", async () => {
   await mount();
   expect(host.querySelector('[data-testid="version-label"]')?.textContent).toBe("App · version 1");
-  const run = host.querySelector('[data-testid="page-run"]') as HTMLElement;
-  expect(run.getAttribute("aria-pressed")).toBe("true");
+  const run = () => host.querySelector('[data-testid="page-run"]') as HTMLElement;
+  expect(host.querySelectorAll('[data-testid="page-layer"]')).toHaveLength(4);
+  // The canvas opens selectable: the page-mode bridge is on it.
+  expect(editFrame().srcdoc).toContain("superchat-edit-bridge");
+  expect(editFrame().srcdoc).toContain('var PAGE = \\"page\\" === \\"page\\"');
+  expect(run().getAttribute("aria-pressed")).toBe("false");
+
+  // Run leaves edit mode for the live app.
+  await act(async () => run().click());
+  expect(host.querySelector('[data-testid="deck-edit-frame"]')).toBeNull();
+  expect(run().getAttribute("aria-pressed")).toBe("true");
   expect(host.querySelector("iframe")?.getAttribute("srcdoc")).not.toContain(
     "superchat-edit-bridge",
   );
-  expect(host.querySelectorAll('[data-testid="page-layer"]')).toHaveLength(4);
 
-  await act(async () => button("Edit")?.click());
-  const frame = editFrame();
-  expect(frame.srcdoc).toContain("superchat-edit-bridge");
-  expect(frame.srcdoc).toContain('var PAGE = \\"page\\" === \\"page\\"');
-  expect(run.getAttribute("aria-pressed")).toBe("false");
-  // Run leaves edit mode for the live app.
-  await act(async () => run.click());
-  expect(host.querySelector('[data-testid="deck-edit-frame"]')).toBeNull();
+  await act(async () =>
+    (host.querySelector('[data-testid="editor-select"]') as HTMLElement).click(),
+  );
+  expect(editFrame().srcdoc).toContain("superchat-edit-bridge");
 });
 
 it("select the Add button: a chip, no inspector; typing a new label saves a manual patch", async () => {
   await mount();
-  await act(async () => button("Edit")?.click());
   const frame = editFrame();
   await ready(frame);
   await fromFrame(frame, { type: "superchat:edit-selection", targets: [target({})] });
@@ -193,7 +193,6 @@ it("select the Add button: a chip, no inspector; typing a new label saves a manu
 
 it("an element with no id is asked about by its place, never patched by hand", async () => {
   await mount();
-  await act(async () => button("Edit")?.click());
   const frame = editFrame();
   await ready(frame);
   const item = target({
@@ -204,6 +203,9 @@ it("an element with no id is asked about by its place, never patched by hand", a
     where: 'main[data-superchat-id="main"] > section > ul > li',
   });
   await fromFrame(frame, { type: "superchat:edit-selection", targets: [item] });
+  await act(async () =>
+    (host.querySelector('[data-testid="editor-inspector-toggle"]') as HTMLElement).click(),
+  );
   expect(host.querySelector('[data-testid="style-panel-unstable"]')).not.toBeNull();
   expect([...host.querySelectorAll('[data-testid="ask-chip"]')].map((c) => c.textContent)).toEqual([
     "li · Coffee 4.50",

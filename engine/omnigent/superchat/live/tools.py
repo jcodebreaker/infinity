@@ -1,6 +1,6 @@
 """Live artifact tools (schema only; the runner calls the engine's routes).
 
-Super Chat: ``artifact_keep_updated`` / ``artifact_stop_updating`` / ``artifact_live_settings``.
+The Conversation: ``live`` (``keep`` / ``stop`` / ``settings``).
 Helper (the scheduled run): ``live_update_context`` / ``live_update_save``.
 """
 
@@ -8,12 +8,11 @@ from __future__ import annotations
 
 from omnigent.superchat.artifacts.tools import ArtifactTool
 
-KEEP_TOOL_NAME = "artifact_keep_updated"
-STOP_TOOL_NAME = "artifact_stop_updating"
+LIVE_TOOL_NAME = "live"
 CONTEXT_TOOL_NAME = "live_update_context"
 SAVE_TOOL_NAME = "live_update_save"
-SETTINGS_TOOL_NAME = "artifact_live_settings"
-SUPER_CHAT_TOOL_NAMES = (KEEP_TOOL_NAME, STOP_TOOL_NAME, SETTINGS_TOOL_NAME)
+#: The fields each ``live`` action needs; the handler names the missing one.
+LIVE_REQUIRED = {"keep": ("name", "rrule"), "stop": ("name",), "settings": ("name",)}
 HELPER_TOOL_NAMES = (CONTEXT_TOOL_NAME, SAVE_TOOL_NAME)
 
 _PAGE = {"type": "string", "description": "The file's name in this chat, e.g. 'prices.html'."}
@@ -24,15 +23,18 @@ _SOURCES = {
 }
 
 
-class KeepUpdatedTool(ArtifactTool):
-    _NAME = KEEP_TOOL_NAME
+class LiveTool(ArtifactTool):
+    _NAME = LIVE_TOOL_NAME
     _DESC = (
         "Keep a saved HTML page or a sheet (CSV, XLSX) up to date: on the schedule, a Helper "
         "re-reads its sources and changes only the parts (a page's elements, a sheet's cells) "
-        "that show source facts. Calling it again for the same file changes the schedule. "
-        "Without sources, the first run infers them."
+        "that show source facts. keep turns it on or changes its setup (needs name and rrule; "
+        "without sources, the first run infers them). stop turns it off; the file and its "
+        "versions stay. settings reads the setup, last run and failures: read it before "
+        "changing one."
     )
     _PROPERTIES = {
+        "action": {"type": "string", "enum": list(LIVE_REQUIRED)},
         "name": _PAGE,
         "rrule": {
             "type": "string",
@@ -64,25 +66,7 @@ class KeepUpdatedTool(ArtifactTool):
             ),
         },
     }
-    _REQUIRED = ("name", "rrule")
-
-
-class StopUpdatingTool(ArtifactTool):
-    _NAME = STOP_TOOL_NAME
-    _DESC = "Stop keeping a page or sheet updated. The file and its versions stay as they are."
-    _PROPERTIES = {"name": _PAGE}
-    _REQUIRED = ("name",)
-
-
-class LiveSettingsTool(ArtifactTool):
-    _NAME = SETTINGS_TOOL_NAME
-    _DESC = (
-        "Read how a page or sheet is kept updated: schedule, update-on-file-change, sources, "
-        "note, when it tells the person, last run, failures, whether it is paused and the last "
-        "update. Read it before changing the setup with artifact_keep_updated."
-    )
-    _PROPERTIES = {"name": _PAGE}
-    _REQUIRED = ("name",)
+    _REQUIRED = ("action", "name")
 
 
 class UpdateContextTool(ArtifactTool):

@@ -15,6 +15,7 @@ from omnigent.runtime.prompt import (
     ROLLOVER_CONTEXT_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_SHAPE,
+    WEB_SEARCH_INSTRUCTION,
     append_framework_instructions,
     build_instructions,
     build_instructions_nullable,
@@ -510,8 +511,9 @@ def test_raw_author_instructions_is_none_when_absent_or_blank() -> None:
 
 
 def test_web_priority_instruction_prefers_search_for_lookups() -> None:
+    # Lookups go to web search; the browser is for pages that must be used.
+    assert "web search" in WEB_SEARCH_INSTRUCTION
+    assert "facts, prices, news" in WEB_SEARCH_INSTRUCTION
     text = EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
-    assert "web search" in text
-    assert "facts, prices, news" in text
     assert "log in, click, fill forms" in text
     assert "prefer these embedded-browser tools" not in text

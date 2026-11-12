@@ -37,16 +37,18 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import uuid
 from asyncio import Queue, Task
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
 
 from omnigent.context.labels import SUPERSIDE_CHAT_MODE_VALUE
 from omnigent.harnesses import llm_trace, pi_settings
-from omnigent.harnesses.pi_credentials import pi_model_limits
 from omnigent.harnesses.agent_env import clean_agent_env, prompt_cache_1h
 from omnigent.harnesses.native_attachments import parse_data_uri
+from omnigent.harnesses.pi_credentials import pi_model_limits
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.models.model_metadata import ModelWireAPI
 from omnigent.models.pi_model_compatibility import (
@@ -71,9 +73,9 @@ from ._subprocess_lifecycle import close_subprocess_transport
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
     ENDS_TURN_TOOLS,
+    ContextFill,
     Executor,
     ExecutorConfig,
-    ContextFill,
     ExecutorError,
     ExecutorEvent,
     Message,
@@ -91,6 +93,9 @@ from .executor import (
     TurnComplete,
     result_ends_turn,
 )
+
+if TYPE_CHECKING:
+    from omnigent.context.window import WindowMessage
 
 logger = logging.getLogger(__name__)
 
@@ -1118,6 +1123,7 @@ class _PiRpcSession:
         system_prompt_mode: str = "append",
         thinking: str | None = None,
         extra_args: list[str] | None = None,
+        session_file: pathlib.Path | None = None,
     ) -> None:
         """
         Spawn the Pi subprocess in RPC mode and start the I/O readers.
@@ -1143,8 +1149,11 @@ class _PiRpcSession:
             ``None`` omits the flag so Pi's model default applies.
         :param extra_args: Extra CLI tokens (``--extension``,
             ``--tools``, ...). ``None`` appends nothing.
+        :param session_file: The Conversation's session file pi starts on and appends to
+            (``--session``); ``None`` keeps the session in memory (``--no-session``).
         """
-        args = [pi_path, "--mode", "rpc", "--no-session"]
+        session = ["--session", str(session_file)] if session_file else ["--no-session"]
+        args = [pi_path, "--mode", "rpc", *session]
         if model:
             pi_coding_agent_dir = env.get("PI_CODING_AGENT_DIR")
             args.extend(
@@ -1366,6 +1375,8 @@ class _PiSessionState:
     # Thinking level (Pi vocabulary) this process is known to be running at,
     # so an unchanged effort costs no RPC and a changed one is applied live.
     applied_thinking: str | None = None
+    # The session file this process runs on (the Conversation's), or ``None`` (in memory).
+    session_file: pathlib.Path | None = None
     _has_sent_prompt: bool = False
     # True while a turn's agent loop runs (prompt sent, ``agent_settled`` not yet read): only
     # then is a steer offered to Pi.
@@ -1576,6 +1587,189 @@ def _build_pi_prompt(messages: list[Message], *, is_first_turn: bool) -> str | l
         return "\n".join(lines)
 
     return _extract_latest_user_content(messages)
+
+
+# ---------------------------------------------------------------------------
+# The Conversation's session file (pi v3), written from the rendered window
+# ---------------------------------------------------------------------------
+
+#: Usage on a rendered assistant message: none was spent, so pi estimates the window's size.
+_ZERO_USAGE: _JsonObject = {
+    "input": 0,
+    "output": 0,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "totalTokens": 0,
+    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0},
+}
+
+
+def pi_scratch_root() -> pathlib.Path:
+    """The host scratch holding the Conversations' pi session files; it may vanish any time."""
+    return pathlib.Path(tempfile.gettempdir()) / "omnigent_pi"
+
+
+def pi_session_dir(conversation_id: str) -> pathlib.Path:
+    """Where one Conversation's pi session files live, one per epoch."""
+    if not conversation_id or "/" in conversation_id or conversation_id in (".", ".."):
+        raise ValueError(f"not a conversation id: {conversation_id!r}")
+    return pi_scratch_root() / conversation_id
+
+
+def _write_private(path: pathlib.Path, lines: Sequence[str]) -> None:
+    """Replace *path* with *lines*, readable by this user only (0600 file, 0700 dirs)."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as out:
+        out.writelines(f"{line}\n" for line in lines)
+    os.replace(tmp, path)
+
+
+def _pi_message(message: WindowMessage, at_ms: int) -> _JsonObject:
+    if message["role"] == "user":
+        text, images = _split_pi_prompt(message["content"])
+        return {
+            "role": "user",
+            "content": [{"type": "text", "text": text}, *images],
+            "timestamp": at_ms,
+        }
+    if message["role"] == "assistant":
+        content: list[_JsonObject] = (
+            [{"type": "text", "text": message["text"]}] if (message["text"]) else []
+        )
+        content.extend(
+            {"type": "toolCall", "id": c["id"], "name": c["name"], "arguments": c["arguments"]}
+            for c in message["tool_calls"]
+        )
+        return {
+            "role": "assistant",
+            "content": content,
+            "api": "omnigent",
+            "provider": "omnigent",
+            "model": "record",
+            "usage": _ZERO_USAGE,
+            "stopReason": "toolUse" if message["tool_calls"] else "stop",
+            "timestamp": at_ms,
+        }
+    return {
+        "role": "toolResult",
+        "toolCallId": message["call_id"],
+        "toolName": message["name"],
+        "content": [{"type": "text", "text": message["output"]}],
+        "isError": False,
+        "timestamp": at_ms,
+    }
+
+
+def write_pi_session(path: pathlib.Path, *, cwd: str, messages: Sequence[WindowMessage]) -> None:
+    """Write *messages* as a pi v3 session file for ``pi --session <path>``.
+
+    One header (pi runs in its ``cwd``, so the executor pins it to the spawn's own, see
+    :func:`_pin_session_cwd`), then one message entry per message with unique ids in a linear
+    ``parentId`` chain. Tool calls and results keep their paired ids. pi appends to the file
+    as it runs.
+    """
+    now = datetime.now(UTC)
+    stamp = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    at_ms = int(now.timestamp() * 1000)
+    lines = [
+        json.dumps(
+            {
+                "type": "session",
+                "version": 3,
+                "id": str(uuid.uuid4()),
+                "timestamp": stamp,
+                "cwd": cwd,
+            }
+        )
+    ]
+    used: set[str] = set()
+    parent: str | None = None
+    for message in messages:
+        entry_id = secrets.token_hex(4)
+        while entry_id in used:
+            entry_id = secrets.token_hex(4)
+        used.add(entry_id)
+        lines.append(
+            json.dumps(
+                {
+                    "type": "message",
+                    "id": entry_id,
+                    "parentId": parent,
+                    "timestamp": stamp,
+                    "message": _pi_message(message, at_ms),
+                }
+            )
+        )
+        parent = entry_id
+    _write_private(path, lines)
+
+
+def _pin_session_cwd(path: pathlib.Path, cwd: str) -> None:
+    """Make the session file's header name *cwd*: pi takes its working directory from it."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        header = json.loads(lines[0]) if lines else None
+    except (OSError, ValueError):
+        return
+    if not isinstance(header, dict) or header.get("cwd") == cwd:
+        return
+    _write_private(path, [json.dumps({**header, "cwd": cwd}), *lines[1:]])
+
+
+def _pi_text(content: object) -> str:
+    """A pi message's text blocks joined by newlines (thinking and tool calls left out)."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        str(block.get("text", ""))
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+def read_pi_session(path: pathlib.Path) -> tuple[bool, list[tuple[str, str]]] | None:
+    """What a Conversation's pi session file holds, or ``None`` when it is missing or unreadable.
+
+    :returns: ``(complete, texts)``: ``complete`` when its last message is a finished assistant
+        message whose tool calls all have results (not a prompt nobody answered, a call in
+        flight or an aborted reply); ``texts`` the ``(role, text)`` of its user and assistant
+        messages with text, oldest first, along the branch pi resumes.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8").splitlines()
+        entries = [json.loads(line) for line in raw if line.strip()]
+    except (OSError, ValueError):
+        return None
+    by_id = {e.get("id"): e for e in entries if isinstance(e, dict) and e.get("type") != "session"}
+    leaf = next((e for e in reversed(by_id.values()) if e.get("id")), None)
+    branch: list[dict[str, Any]] = []
+    while leaf is not None and len(branch) <= len(by_id):
+        branch.append(leaf)
+        leaf = by_id.get(leaf.get("parentId"))
+    messages = [
+        e["message"]
+        for e in reversed(branch)
+        if e.get("type") == "message" and isinstance(e.get("message"), dict)
+    ]
+    texts = [
+        (str(m["role"]), _pi_text(m.get("content")))
+        for m in messages
+        if m.get("role") in ("user", "assistant") and _pi_text(m.get("content")).strip()
+    ]
+    last = next((m for m in reversed(messages) if m.get("role") != "system"), None)
+    complete = (
+        last is not None
+        and last.get("role") == "assistant"
+        and last.get("stopReason") not in ("error", "aborted")
+        and not any(
+            isinstance(b, dict) and b.get("type") == "toolCall" for b in last.get("content") or []
+        )
+    )
+    return complete, texts
 
 
 @dataclass(frozen=True)
@@ -2156,8 +2350,9 @@ class PiExecutor(Executor):
         except Exception as exc:  # noqa: BLE001 — abort is best-effort
             logger.debug("PiExecutor: interrupt abort failed: %s", exc)
         # Always drop the session so the next turn starts fresh and replays
-        # full history. A resumed subprocess sends only the latest user
-        # message, which would bypass the runner's "[System: interrupted]"
+        # full history (a Conversation's: the session file the runner chooses
+        # again from the record). A resumed subprocess sends only the latest
+        # user message, which would bypass the runner's "[System: interrupted]"
         # marker and silently continue the abandoned request. See
         # claude_sdk_executor.interrupt_session for the rationale.
         try:
@@ -2463,6 +2658,7 @@ class PiExecutor(Executor):
         tools: list[ToolSpec],
         thinking: str | None = None,
         disable_auto_compaction: bool = False,
+        session_file: pathlib.Path | None = None,
     ) -> _PiRpcSession:
         """Get or create a Pi RPC subprocess for the given session.
 
@@ -2473,6 +2669,8 @@ class PiExecutor(Executor):
         :param disable_auto_compaction: Write ``compaction.enabled=false`` into
             Pi's settings for this spawn (superside-chat: Omnigent rollover owns
             context). See :func:`_pi_owned_context_settings`.
+        :param session_file: The Conversation's session file (see :meth:`_PiRpcSession.start`).
+            A different file than the running process's is a new start: it respawns.
         """
         state = self._session_states.setdefault(session_key, _PiSessionState())
 
@@ -2484,6 +2682,7 @@ class PiExecutor(Executor):
             and state.rpc.process.returncode is None
             and state.system_prompt == system_prompt
             and state.model == effective_model
+            and state.session_file == session_file
         ):
             return state.rpc
 
@@ -2520,6 +2719,8 @@ class PiExecutor(Executor):
         else:
             pi_model = effective_model
 
+        if session_file is not None:
+            _pin_session_cwd(session_file, self._cwd or os.getcwd())
         await rpc.start(
             self._pi_launch_path,
             env=env,
@@ -2529,10 +2730,12 @@ class PiExecutor(Executor):
             system_prompt_mode=self._system_prompt_mode,
             thinking=thinking,
             extra_args=extra_args or None,
+            session_file=session_file,
         )
         state.rpc = rpc
         state.system_prompt = system_prompt
         state.model = effective_model
+        state.session_file = session_file
         state.applied_thinking = thinking
         state._has_sent_prompt = False
         return rpc
@@ -2578,6 +2781,9 @@ class PiExecutor(Executor):
             yield ExecutorError(message=str(exc), retryable=False)
             return
 
+        extra = config.extra if config is not None else {}
+        raw_session_file = extra.get("session_file")
+        session_file = pathlib.Path(raw_session_file) if raw_session_file else None
         prior_rpc = (self._session_states.get(session_key) or _PiSessionState()).rpc
         try:
             rpc = await self._ensure_rpc(
@@ -2586,24 +2792,25 @@ class PiExecutor(Executor):
                 model,
                 tools,
                 thinking,
-                disable_auto_compaction=(
-                    (config.extra if config is not None else {}).get("context_mode")
-                    == SUPERSIDE_CHAT_MODE_VALUE
-                ),
+                disable_auto_compaction=extra.get("context_mode") == SUPERSIDE_CHAT_MODE_VALUE,
+                session_file=session_file,
             )
         except Exception as exc:  # noqa: BLE001 — executor boundary surfaces startup errors as ExecutorError
             yield ExecutorError(message=f"Failed to start Pi: {exc}")
             return
 
-        # Build the prompt to send to Pi.  On the first turn of a new Pi
-        # process, if there are prior messages (e.g. parent history passed
-        # to a sub-agent), we serialize the full conversation so Pi has
-        # context.  On subsequent turns the Pi process already has context,
-        # so we only send the latest user message.
+        # Build the prompt to send to Pi. A Conversation's process holds its history in its
+        # session file, so it only ever gets the latest user message. Otherwise, on the first
+        # turn of a new Pi process with prior messages (e.g. parent history passed to a
+        # Helper), the conversation is serialized into the prompt.
         state = self._session_states.get(session_key)
         is_first_turn = state is not None and not state._has_sent_prompt
 
-        prompt = _build_pi_prompt(messages, is_first_turn=is_first_turn)
+        prompt = (
+            _extract_latest_user_content(messages)
+            if session_file is not None
+            else _build_pi_prompt(messages, is_first_turn=is_first_turn)
+        )
 
         if not prompt:
             # No prompt built (a resumed session with nothing new, or the runner launching

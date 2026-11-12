@@ -158,6 +158,7 @@ def create_session_memory_router(
         status = await asyncio.to_thread(upkeep_status, request.app.state, owner, runs=3)
         if status is None:
             return {"results": results}
+
         def iso(epoch: int | None) -> str | None:
             return None if not epoch else datetime.fromtimestamp(epoch, UTC).isoformat()
 

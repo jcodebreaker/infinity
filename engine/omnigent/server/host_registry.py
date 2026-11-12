@@ -22,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -47,22 +46,6 @@ from omnigent.host.frames import (
 )
 
 _logger = logging.getLogger(__name__)
-
-
-def multi_replica() -> bool:
-    """
-    Whether more than one engine replica serves this deployment.
-
-    Set ``OMNIGENT_MULTI_REPLICA=1`` when several engines share one database. Off
-    (the default, one engine), a host is connected exactly when this process's
-    :class:`HostRegistry` holds it: an ``"online"`` hosts row with no connection
-    here is left over from a connection that is gone (this engine restarted, the
-    host died), never a host held by another replica.
-
-    :returns: ``True`` when the hosts table may describe connections held by other
-        replicas.
-    """
-    return os.environ.get("OMNIGENT_MULTI_REPLICA", "").strip().lower() in {"1", "true", "yes"}
 
 
 _expected_host_owner: ContextVar[AccountAuthority | None] = ContextVar(

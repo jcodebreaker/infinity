@@ -47,18 +47,12 @@ from omnigent.tools.builtins.load_skill import (
 from omnigent.tools.builtins.read_skill_file import (
     ReadSkillFileTool,
 )
-from omnigent.tools.builtins.scheduled_tasks import (
-    SysScheduledTaskCreateTool,
-    SysScheduledTaskDeleteTool,
-    SysScheduledTaskListTool,
-    SysScheduledTaskUpdateTool,
-)
+from omnigent.tools.builtins.scheduled_tasks import ScheduleTool
 from omnigent.tools.builtins.session_history import SessionHistoryTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     SysSessionCloseTool,
     SysSessionCreateTool,
-    SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
     SysSessionListTool,
     SysSessionSendTool,
@@ -76,6 +70,7 @@ __all__ = [
     "ListCommentsTool",
     "LoadSkillTool",
     "ReadSkillFileTool",
+    "ScheduleTool",
     "SessionHistoryTool",
     "SysAdviseModelsTool",
     "SysAgentDownloadTool",
@@ -85,13 +80,8 @@ __all__ = [
     "SysCancelAsyncTool",
     "SysListModelsTool",
     "SysReadInboxTool",
-    "SysScheduledTaskCreateTool",
-    "SysScheduledTaskDeleteTool",
-    "SysScheduledTaskListTool",
-    "SysScheduledTaskUpdateTool",
     "SysSessionCloseTool",
     "SysSessionCreateTool",
-    "SysSessionGetHistoryTool",
     "SysSessionGetInfoTool",
     "SysSessionListTool",
     "SysSessionRenameTool",

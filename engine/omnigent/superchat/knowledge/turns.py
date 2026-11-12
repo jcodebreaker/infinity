@@ -46,6 +46,7 @@ class Turn:
     :param notice: Started by a runtime notice: never indexed.
     :param at: When its first message was written (epoch seconds; 0 unknown).
     :param last_item_id: The last item of it read so far.
+    :param marks: Its items a user message follows (:attr:`TurnPassage.marks`).
     """
 
     turn_item_id: str
@@ -59,6 +60,7 @@ class Turn:
     tools: list[dict[str, Any]] = field(default_factory=list)
     at: float = 0.0
     last_item_id: str = ""
+    marks: list[str] = field(default_factory=list)
 
     @property
     def answered(self) -> bool:
@@ -91,6 +93,10 @@ def split_turns(items: list[dict[str, Any]]) -> list[Turn]:
     item after it belongs to the turn it falls in (its ``last_item_id``)."""
     turns: list[Turn] = []
     for index, item in enumerate(items):
+        before = items[index - 1].get("id") if index else None
+        user = item.get("type") == "message" and item.get("role", "user") == "user"
+        if turns and user and isinstance(before, str):
+            turns[-1].marks.append(before)
         _take(turns, index, item)
         if turns and isinstance(item.get("id"), str):
             turns[-1].last_item_id = item["id"]
@@ -155,4 +161,5 @@ def passage_of(
         refs={key: values for key, values in refs.items() if key != "project"},
         last_item_id=turn.last_item_id,
         at=turn.at,
+        marks=tuple(turn.marks),
     )

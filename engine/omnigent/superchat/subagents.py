@@ -472,8 +472,8 @@ def format_subagent_wake_notice_with_result(
     text = (result_text or "").strip() or "(no output)"
     if len(text) > max_chars:
         body = (
-            f"{text[:max_chars]}... [truncated; call sys_session_get_history "
-            f"with conversation_id={child_session_id!r} to read the rest]"
+            f"{text[:max_chars]}... [truncated; call session_history with action='get' "
+            f"and chat_id={child_session_id!r} to read the rest]"
         )
     else:
         body = text

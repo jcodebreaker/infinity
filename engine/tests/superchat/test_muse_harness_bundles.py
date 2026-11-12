@@ -40,6 +40,7 @@ def test_pi_bundle_differs_from_default_only_in_harness_keys() -> None:
         "+name: superchat-pi",
         "+skills: none",
         "-    harness: claude-sdk",
+        "-    native_skills: false",
         "+    harness: pi",
         "+    context_files: false",
         "+    system_prompt_mode: replace",
@@ -165,14 +166,18 @@ def test_prompts_point_at_the_memory_folder(bundle: Path) -> None:
     # or the journal for current state, only forbids writing there.
     assert "Never edit `memory/STATE.md` or the journal" in muse
     worker = (bundle / "agents/worker/config.yaml").read_text()
-    assert "Never write in `memory/STATE.md` or" in worker and "`memory/STATE.md` holds" not in worker
+    assert (
+        "Never write in `memory/STATE.md` or" in worker and "`memory/STATE.md` holds" not in worker
+    )
 
 
 THREE_RULES = (
     "1. Your first sentence says what you will make or look at, in the person's words, before "
-    "any tool call. Never a question: when something you need is missing, say what you will "
-    "make first, then ask with `ask_clarification`.\n"
-    "2. After a Helper's result, hand back in plain words in one or two sentences.\n"
+    'any tool call (not for "Work through everything": its jobs show first). Never a question: '
+    "when something you need is missing, say what you will make first, then ask with "
+    "`ask_clarification`.\n"
+    "2. After a Helper's result, judge it (below), then hand back: show the file with "
+    "`render_card` and put your one or two sentences in its `message`.\n"
     "3. Never name a tool or a mechanism to the person: no tool names, no file paths, no "
     "Helpers, no steps.\n"
 )
@@ -205,7 +210,6 @@ LEFT_OUT = {
     "vault_fill",
     "memory_get",
     "memory_explain",
-    "artifact_list",
     "files_vsearch",
     "files_multi_get",
 }
@@ -215,7 +219,7 @@ LEFT_OUT = {
 def test_the_conversation_prompt_states_three_rules_once_and_stays_small(bundle: Path) -> None:
     prompt = (bundle / "AGENTS.md").read_text()
     assert prompt.count(THREE_RULES) == 1
-    assert len(prompt) <= 15_000
+    assert len(prompt) <= 18_000
     for term in RETIRED:
         assert term not in prompt, term
     # Context is pulled; delegation is judgement, stated once where the work is (ADR 0029).
@@ -263,7 +267,7 @@ def test_the_conversation_has_the_same_tools_on_either_harness() -> None:
 @pytest.mark.parametrize("bundle", [CLAUDE, PI], ids=["claude", "pi"])
 def test_the_conversation_gets_its_tools_from_the_allow_list_only(bundle: Path) -> None:
     names = _conversation_tools(bundle)
-    assert len(names) == 41
+    assert len(names) == 39
     assert not names & LEFT_OUT
     assert {"start_helper", "context_brief", "recall", "files_query", "files_status"} <= names
     for helper in HELPERS:
@@ -272,6 +276,10 @@ def test_the_conversation_gets_its_tools_from_the_allow_list_only(bundle: Path) 
         ]
         assert "context_brief" not in allow, helper
         assert "vault_fill" not in allow, helper
+        # No Helper carries the session-admin tools (ADR 0032).
+        assert not {"sys_session_list", "sys_session_get_info", "sys_session_close"} & set(
+            allow
+        ), helper
         if helper.startswith("worker"):
             assert {"recall", "recall_get"} <= set(allow), helper
 
