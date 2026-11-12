@@ -1,6 +1,6 @@
 # 0032: Fewer, shorter tools
 
-> **Status:** Accepted 2026-10-19; split out of [0031](0031-a-new-session-is-assembled-from-state.md) after review. Requires the fx13 context hotfix (`session_history` already has `order: oldest|newest` and a 12k read cap). **Built 2026-11-12**, see [As built](#as-built).
+> **Status:** Accepted 2026-10-19; split out of [0031](0031-a-new-session-is-assembled-from-state.md) after review. Requires the fx13 context hotfix (`session_history` already has `order: oldest|newest` and a 12k read cap). **Built 2026-11-12**, see [As built](#as-built). The plan that built it, and the gate for tool groups: [tool-groups-plan.md](../tool-groups-plan.md).
 
 The tools block is 14.3k tokens of every Conversation call and the largest fixed part of a cold start. Several tools are one capability split in three or four, Helpers carry session-admin tools they never need, and some descriptions hold behavioural prose that belongs in the prompt or a skill.
 
