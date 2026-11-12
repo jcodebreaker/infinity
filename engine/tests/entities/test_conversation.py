@@ -37,6 +37,21 @@ def test_to_api_dict_omits_created_by_when_none() -> None:
     assert "created_by" not in api
 
 
+def test_record_only_fields_round_trip_but_stay_out_of_the_api_shape() -> None:
+    """``None`` is not written, ``[]`` is (written, nothing sent); neither reaches clients."""
+    content = [{"type": "input_text", "text": "hi"}]
+    assert "context_prefix" not in MessageData(role="user", content=content).model_dump()
+    data = MessageData(
+        role="user", content=content, context_prefix=[], delivered_after_call_id="call_1"
+    )
+    stored = data.model_dump(exclude_none=True)
+    assert stored["context_prefix"] == []
+    assert MessageData.model_validate(stored) == data
+    api = _message_item(None).model_copy(update={"data": data}).to_api_dict()
+    assert "context_prefix" not in api
+    assert "delivered_after_call_id" not in api
+
+
 def test_synthesize_conversation_title_respects_custom_limit() -> None:
     """Custom ``limit`` is honored."""
     content = [{"type": "input_text", "text": "a" * 50}]

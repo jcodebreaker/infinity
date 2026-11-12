@@ -879,6 +879,7 @@ _ITEM_TYPES: frozenset[str] = frozenset(
         "slash_command",
         "terminal_command",
         "routing_decision",
+        "epoch_block",
     }
 )
 
@@ -1139,8 +1140,8 @@ def extract_search_text(item: NewConversationItem) -> str:
         ``type`` is one of ``"message"``, ``"function_call"``,
         ``"function_call_output"``, ``"reasoning"``,
         ``"compaction"``, ``"native_tool"``, ``"resource_event"``,
-        ``"slash_command"``, ``"terminal_command"``, or
-        ``"routing_decision"``.
+        ``"slash_command"``, ``"terminal_command"``,
+        ``"routing_decision"``, or ``"epoch_block"``.
     :returns: A single plain-text string suitable for FTS indexing.
     :raises ValueError: If *item.type* is not a recognised type.
     """
@@ -1168,9 +1169,9 @@ def extract_search_text(item: NewConversationItem) -> str:
     if item.type == "compaction":
         assert isinstance(item.data, CompactionData)
         return item.data.summary
-    if item.type == "native_tool":
-        # Native tool items are opaque provider dicts — no
-        # meaningful text to index for search.
+    if item.type in ("native_tool", "epoch_block"):
+        # Native tool items are opaque provider dicts, and an epoch
+        # block is hidden: nothing to index for search.
         return ""
     if item.type == "resource_event":
         # Resource lifecycle records are metadata. Index only the stable

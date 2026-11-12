@@ -1,4 +1,8 @@
-"""Cross-user tests for the advisor-owned ``cost_control.*`` label namespace.
+"""Cross-user tests for runner-owned session writes.
+
+Most cover the advisor-owned ``cost_control.*`` label namespace; the last
+cover the record-only item writes (``epoch_block`` items and
+``PATCH .../items/{id}/data``), which only the bound runner may make.
 
 The cost advisor writes the ``cost_control.plan`` conversation label (its
 per-turn brain-model verdict, surfaced in the UI), so client-supplied
@@ -457,3 +461,89 @@ def test_create_session_with_ordinary_labels_succeeds(
     conv = conversation_store.get_conversation(resp.json()["id"])
     assert conv is not None
     assert conv.labels["team"] == "ml"
+
+
+# ── Record-only item writes: the bound runner only ───────────────────────────
+
+
+def _runner_headers() -> dict[str, str]:
+    """The session's runner: Alice's bearer plus its tunnel binding token."""
+    return {"X-Forwarded-Email": ALICE, RUNNER_TUNNEL_TOKEN_HEADER: _RUNNER_TOKEN}
+
+
+def test_epoch_block_is_runner_only_and_hidden_from_items_and_search(
+    stores: tuple[SqlAlchemyConversationStore, SqlAlchemyAgentStore, SqlAlchemyPermissionStore],
+) -> None:
+    """Only the runner stores an epoch block; it reads it back by id, and no list shows it."""
+    client = TestClient(_multi_user_app(stores))
+    conv_id = _seed_session(stores, runner_id=token_bound_runner_id(_RUNNER_TOKEN))
+    event = {"type": "epoch_block", "data": {"text": "zebra epoch"}}
+    owner = {"X-Forwarded-Email": ALICE}
+
+    assert (
+        client.post(f"/v1/sessions/{conv_id}/events", json=event, headers=owner).status_code == 403
+    )
+    external = {
+        "type": "external_conversation_item",
+        "data": {"item_type": "epoch_block", "item_data": event["data"]},
+    }
+    resp = client.post(f"/v1/sessions/{conv_id}/events", json=external, headers=_runner_headers())
+    assert resp.status_code == 400
+    resp = client.post(f"/v1/sessions/{conv_id}/events", json=event, headers=_runner_headers())
+    assert resp.status_code == 202
+    item_id = resp.json()["item_id"]
+
+    assert client.get(f"/v1/sessions/{conv_id}/items", headers=owner).json()["data"] == []
+    search = client.get(
+        f"/v1/sessions/{conv_id}/items/search", params={"query": "zebra"}, headers=owner
+    )
+    assert search.json()["data"] == []
+    item_url = f"/v1/sessions/{conv_id}/items/{item_id}"
+    assert client.get(item_url, headers=owner).status_code == 403
+    assert client.get(item_url, headers=_runner_headers()).json()["text"] == "zebra epoch"
+
+
+def test_item_data_patch_is_runner_only_allow_listed_and_idempotent(
+    stores: tuple[SqlAlchemyConversationStore, SqlAlchemyAgentStore, SqlAlchemyPermissionStore],
+) -> None:
+    """The runner sets ``context_prefix`` (``[]`` stays ``[]``); nothing else, nobody else."""
+    from omnigent.entities import NewConversationItem
+    from omnigent.entities.conversation import MessageData
+
+    conversation_store = stores[0]
+    client = TestClient(_multi_user_app(stores))
+    conv_id = _seed_session(stores, runner_id=token_bound_runner_id(_RUNNER_TOKEN))
+    [item] = conversation_store.append(
+        conv_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+            )
+        ],
+    )
+    url = f"/v1/sessions/{conv_id}/items/{item.id}/data"
+
+    owner = {"X-Forwarded-Email": ALICE}
+    assert client.patch(url, json={"context_prefix": []}, headers=owner).status_code == 403
+    for _ in range(2):
+        resp = client.patch(url, json={"context_prefix": []}, headers=_runner_headers())
+        assert resp.status_code == 204
+    resp = client.patch(url, json={"content": []}, headers=_runner_headers())
+    assert resp.status_code == 400
+    missing = f"/v1/sessions/{conv_id}/items/{'0' * 32}/data"
+    assert (
+        client.patch(missing, json={"context_prefix": []}, headers=_runner_headers()).status_code
+        == 404
+    )
+
+    stored = conversation_store.get_item(conv_id, item.id)
+    assert stored is not None
+    assert isinstance(stored.data, MessageData)
+    assert stored.data.context_prefix == []
+    assert stored.data.content == [{"type": "input_text", "text": "hi"}]
+    listed = client.get(f"/v1/sessions/{conv_id}/items", headers=owner).json()["data"]
+    assert "context_prefix" not in listed[0]
+    record = client.get(f"/v1/sessions/{conv_id}/items/{item.id}", headers=_runner_headers())
+    assert record.json()["context_prefix"] == []

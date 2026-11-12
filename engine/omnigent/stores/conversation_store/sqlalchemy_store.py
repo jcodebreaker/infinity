@@ -86,6 +86,7 @@ from omnigent.entities import (
     PagedList,
     parse_item_data,
 )
+from omnigent.entities.conversation import RECORD_ONLY_MESSAGE_FIELDS, MessageData
 from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
@@ -2183,7 +2184,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``"asc"`` or ``"desc"``.
         :param type: Optional item type filter. When provided, only items
             with this type are returned, e.g. ``"compaction"``. ``None``
-            means return all types.
+            means every type except the hidden ``epoch_block``.
         :returns: A :class:`PagedList` of
             :class:`ConversationItem` objects.
         """
@@ -2218,6 +2219,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             if type is not None:
                 stmt = stmt.where(SqlConversationItem.type == encode_item_type(type))
+            else:
+                stmt = stmt.where(SqlConversationItem.type != encode_item_type("epoch_block"))
             if after:
                 after_pos = self._resolve_item_cursor_position(session, conversation_id, after)
                 # "after" = further in sort direction
@@ -2738,6 +2741,44 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
         run_write_transaction(self._conv_session_immediate, "delete_label", write)
+
+    def update_item_data(
+        self, conversation_id: str, item_id: str, fields: dict[str, Any]
+    ) -> ConversationItem | None:
+        """
+        Merge record-only fields into a message item's stored data.
+
+        :param conversation_id: The conversation holding the item.
+        :param item_id: The message item.
+        :param fields: Fields from ``RECORD_ONLY_MESSAGE_FIELDS``, e.g. ``{"context_prefix": []}``.
+        :returns: The updated item, or ``None`` when the conversation holds no such item.
+        :raises ValueError: A field outside the allow-list, a bad value, or a non-message item.
+        """
+        unknown = sorted(set(fields) - RECORD_ONLY_MESSAGE_FIELDS)
+        if unknown:
+            raise ValueError(f"fields not writable on an item: {unknown}")
+
+        def write(session: Session) -> ConversationItem | None:
+            row = session.execute(
+                select(SqlConversationItem).where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.id == item_id,
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            [data_json] = self._decode_item_data_batch([row.data])
+            item = _to_item(row, data_json)
+            if not isinstance(item.data, MessageData):
+                raise ValueError(f"item {item_id!r} is a {item.type}, not a message")
+            merged = MessageData.model_validate({**item.data.model_dump(), **fields})
+            if merged != item.data:
+                raw = strip_nul_bytes(json.dumps(merged.model_dump(exclude_none=True)))
+                [row.data] = self._encode_item_data_batch([raw])
+            return item.model_copy(update={"data": merged})
+
+        return run_write_transaction(self._conv_session_immediate, "update_item_data", write)
 
     def delete_item(self, conversation_id: str, item_id: str) -> bool:
         """

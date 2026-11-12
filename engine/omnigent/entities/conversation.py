@@ -303,6 +303,13 @@ class MessageData(BaseModel):
     :param stream_message_id: Native live-preview stream finalized by
         this assistant message. Persisted so reconnect snapshots can
         suppress delayed preview chunks after the authoritative item.
+    :param context_prefix: On the user-role item that opens a turn, the
+        context blocks sent in front of its words, e.g. ``["[Profile] ..."]``.
+        ``None`` when never written, ``[]`` when written and nothing was
+        sent. Record-only (see :data:`RECORD_ONLY_MESSAGE_FIELDS`).
+    :param delivered_after_call_id: On a steer, the ``call_id`` of the last
+        tool result the harness had before taking it, or ``"turn_start"``.
+        Record-only (see :data:`RECORD_ONLY_MESSAGE_FIELDS`).
     """
 
     role: Literal["user", "assistant"]
@@ -313,6 +320,10 @@ class MessageData(BaseModel):
     is_system_notice: bool = Field(default=False, exclude_if=lambda value: value is False)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
+    context_prefix: list[str] | None = Field(default=None, exclude_if=lambda value: value is None)
+    delivered_after_call_id: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @field_validator("content")
     @classmethod
@@ -793,6 +804,19 @@ class SlashCommandData(BaseModel):
     output: str | None = None
 
 
+class EpochBlockData(BaseModel):
+    """
+    The rendered block an epoch's window starts with, stored when the view start moves.
+
+    Hidden: never in the items list, SSE or search; the runner reads it back by id
+    from the ``epoch_block_item_id`` session label.
+
+    :param text: The block exactly as sent, e.g. ``"[What came before, ...]"``.
+    """
+
+    text: str
+
+
 ItemData = (
     MessageData
     | FunctionCallData
@@ -805,6 +829,7 @@ ItemData = (
     | RoutingDecisionData
     | SlashCommandData
     | TerminalCommandData
+    | EpochBlockData
 )
 
 ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
@@ -819,7 +844,14 @@ ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
     "routing_decision": RoutingDecisionData,
     "slash_command": SlashCommandData,
     "terminal_command": TerminalCommandData,
+    "epoch_block": EpochBlockData,
 }
+
+#: Message fields only the record keeps: written by the runner through
+#: ``PATCH .../items/{id}/data`` (the allow-list) and never in the API shape.
+RECORD_ONLY_MESSAGE_FIELDS: frozenset[str] = frozenset(
+    {"context_prefix", "delivered_after_call_id"}
+)
 
 # Item types that are metadata / lifecycle events — not content
 # the agent loop should include in the LLM's message context.
@@ -827,6 +859,7 @@ ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
 NON_CONTENT_ITEM_TYPES: frozenset[str] = frozenset(
     {
         "compaction",
+        "epoch_block",
         "error",
         "resource_event",
         "routing_decision",
@@ -964,7 +997,8 @@ class ConversationItem(BaseModel):
         from ``self.data`` and are spread onto the top level.
         ``exclude_none=True`` drops absent optional fields (e.g.
         ``model`` on user messages) so they don't show up in the
-        output. The return value contains only JSON-serializable
+        output, and :data:`RECORD_ONLY_MESSAGE_FIELDS` never appear.
+        The return value contains only JSON-serializable
         primitives, so callers can pass it straight to
         :func:`json.dumps` without a custom encoder.
 
@@ -988,7 +1022,9 @@ class ConversationItem(BaseModel):
             "type": self.type,
             "status": self.status,
             "created_at": self.created_at,
-            **self.data.model_dump(exclude_none=True, by_alias=True),
+            **self.data.model_dump(
+                exclude_none=True, by_alias=True, exclude=set(RECORD_ONLY_MESSAGE_FIELDS)
+            ),
             # created_by is present only for human-authored items;
             # omitted (not null) for agent/tool/system messages so the
             # two stay distinguishable, matching exclude_none above.

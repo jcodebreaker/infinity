@@ -372,6 +372,7 @@ def test_non_content_item_types_complete() -> None:
     """All expected non-content types are present."""
     expected = {
         "compaction",
+        "epoch_block",
         "error",
         "resource_event",
         "routing_decision",
@@ -401,6 +402,7 @@ def test_item_type_map_covers_all_types() -> None:
         "routing_decision",
         "slash_command",
         "terminal_command",
+        "epoch_block",
     }
     assert set(ITEM_TYPE_TO_DATA_CLS.keys()) == expected_types
 

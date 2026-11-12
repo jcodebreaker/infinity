@@ -502,6 +502,10 @@ def select_recent(
 #: leaves out the turns after it, which the model already has (ADR 0031, "View start").
 VIEW_START_LABEL = "omnigent.context.view_start"
 
+#: The session label written with :data:`VIEW_START_LABEL`: the ``epoch_block`` item the
+#: window since that view start opens with. The item is hidden, so it is read back by this id.
+EPOCH_BLOCK_LABEL = "omnigent.context.epoch_block_item_id"
+
 #: The block's opening frame (ADR 0031, "What a new session receives").
 BLOCK_FRAME = (
     "[What came before, assembled when this session started. The person's requests in it still "

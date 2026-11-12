@@ -10,11 +10,12 @@ from fastapi import (
     Query,
     Request,
 )
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from omnigent.context.labels import is_artifact_chat
 from omnigent.entities import CompactionData
+from omnigent.entities.conversation import RECORD_ONLY_MESSAGE_FIELDS
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
@@ -26,6 +27,7 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
+    LEVEL_EDIT,
     LEVEL_READ,
     AuthProvider,
 )
@@ -49,7 +51,7 @@ from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import _format_sse
+from omnigent.server.routes._sessions.helpers import _format_sse, _has_runner_authority
 from omnigent.server.routes._sessions.orchestration import (
     _child_session_summaries_from_conversations,
 )
@@ -124,8 +126,26 @@ def register_items_routes(
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    runner_tunnel_tokens: frozenset[str] | None = None,
 ) -> None:
     """Register the items routes on router."""
+
+    async def _runner_only(request: Request, session_id: str) -> str | None:
+        """Require EDIT and the session's runner credential; returns the caller."""
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
+        if not _has_runner_authority(request, conv, runner_tunnel_tokens):
+            raise OmnigentError(
+                "only the session's runner may use this route", code=ErrorCode.FORBIDDEN
+            )
+        return user_id
 
     @router.get(
         "/sessions/{session_id}/items",
@@ -253,6 +273,50 @@ def register_items_routes(
             limit=limit,
         )
         return PaginatedList(data=[redactor.deep(m.to_api_dict()) for m in items])
+
+    # Registered after ``items/search`` so that literal path wins.
+    @router.get("/sessions/{session_id}/items/{item_id}", include_in_schema=False)
+    async def get_session_item(request: Request, session_id: str, item_id: str) -> dict[str, Any]:
+        """
+        One item by id, record-only fields included: how the runner reads an ``epoch_block``.
+
+        :raises OmnigentError: 403 for any caller but the session's runner, 404 when the
+            session holds no such item.
+        """
+        user_id = await _runner_only(request, session_id)
+        item = await asyncio.to_thread(conversation_store.get_item, session_id, item_id)
+        if item is None:
+            raise OmnigentError(f"item {item_id!r} not found", code=ErrorCode.NOT_FOUND)
+        redactor = await session_redactor(request, conversation_store, session_id, user_id)
+        record = item.data.model_dump(include=set(RECORD_ONLY_MESSAGE_FIELDS), exclude_none=True)
+        return redactor.deep({**item.to_api_dict(), **record})
+
+    @router.patch(
+        "/sessions/{session_id}/items/{item_id}/data", include_in_schema=False, status_code=204
+    )
+    async def patch_session_item_data(
+        request: Request,
+        session_id: str,
+        item_id: str,
+        fields: dict[str, Any],
+    ) -> Response:
+        """
+        Merge record-only fields into a message item (``context_prefix``,
+        ``delivered_after_call_id``). Idempotent.
+
+        :raises OmnigentError: 403 for any caller but the session's runner, 404 when the
+            session holds no such item, 400 for any other field or a non-message item.
+        """
+        await _runner_only(request, session_id)
+        try:
+            item = await asyncio.to_thread(
+                conversation_store.update_item_data, session_id, item_id, fields
+            )
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        if item is None:
+            raise OmnigentError(f"item {item_id!r} not found", code=ErrorCode.NOT_FOUND)
+        return Response(status_code=204)
 
     # ── GET /sessions/{session_id}/related_chats ──────────────────
     # The chats session_id may read besides itself, for ``session_history``'s

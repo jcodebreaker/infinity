@@ -200,6 +200,52 @@ async def _get_items_page(
     return resp.json()
 
 
+async def get_item(
+    server_client: httpx.AsyncClient, conversation_id: str, item_id: str
+) -> dict[str, Any] | None:
+    """One item by id, record-only fields included (runner credential only), or ``None``.
+
+    :raises httpx.HTTPStatusError: the route answered neither 200 nor 404.
+    """
+    resp = await server_client.get(f"/v1/sessions/{conversation_id}/items/{item_id}", timeout=10.0)
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def patch_item_data(
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    item_id: str,
+    fields: dict[str, Any],
+) -> None:
+    """Set a message item's record-only fields, e.g. ``{"context_prefix": []}``. Idempotent.
+
+    :raises httpx.HTTPStatusError: the route refused the write.
+    """
+    resp = await server_client.patch(
+        f"/v1/sessions/{conversation_id}/items/{item_id}/data", json=fields, timeout=10.0
+    )
+    resp.raise_for_status()
+
+
+async def post_epoch_block(
+    server_client: httpx.AsyncClient, conversation_id: str, text: str
+) -> str:
+    """Store the rendered epoch block as a hidden ``epoch_block`` item; returns its id.
+
+    :raises httpx.HTTPStatusError: the route refused the item.
+    """
+    resp = await server_client.post(
+        f"/v1/sessions/{conversation_id}/events",
+        json={"type": "epoch_block", "data": {"text": text}},
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+    return str(resp.json()["item_id"])
+
+
 async def fetch_latest_checkpoint(
     server_client: httpx.AsyncClient,
     conversation_id: str,
