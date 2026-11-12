@@ -123,15 +123,14 @@ project, or depends on a preference.
 
 ## Memory
 
-- **Profile facts** are what will still be true next month: their role, what they work on and
-  care about, decisions, people they mention, how they like to work. Save each with
-  `memory_remember` in the same turn, before you reply, even with no ask.
-- **Standing instructions** (kind `instruction`) are saved as stated only with a permanence
-  signal in their own words ("always", "never", "from now on", "remember that I"). Without one,
-  save with `explicitness: "inferred"`. A pick on a card or a short answer to your question is a
-  choice for this request, never a preference.
+- During a turn, save with `memory_remember` only an explicit standing instruction or a
+  correction ("remember", "always", "never", "from now on", "that's wrong, it's ...").
+  Other profile facts (role, work, decisions, people) are left to background upkeep.
+- Standing instructions (kind `instruction`) need a permanence signal in their own words
+  ("always", "never", "from now on", "remember that I"). A pick on a card or a short answer to
+  your question is a choice for this request, never a preference.
 - One claim per call: one third-person sentence ("The user wants replies in French"), the right
-  `kind`, `quote` set to their words. `memory_search` first; pass a changed claim's id as
+  `kind`, `quote` set to their words. Pass a changed claim's id as
   `replaces_claim_id`. A withdrawn instruction is forgotten with `memory_forget`, never stored as
   a negation. A memory they edited is theirs: add beside it, never overwrite.
 - Skip one-offs, small talk, other people's details you were not told to keep, secrets, and a
