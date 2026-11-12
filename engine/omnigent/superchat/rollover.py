@@ -124,6 +124,12 @@ def assembled_estimate(labels: Mapping[str, str] | None) -> int:
     return _ASSEMBLED_FIXED_TOKENS + resolve_keep_tokens(labels)
 
 
+def window_fits(labels: Mapping[str, str] | None, rendered_tokens: int) -> bool:
+    """Whether a rendered window starts a process at most twice what a new session costs, both
+    counted the same way (the fixed part plus what is rendered)."""
+    return _ASSEMBLED_FIXED_TOKENS + rendered_tokens <= 2 * assembled_estimate(labels)
+
+
 def handoff_reason(
     labels: Mapping[str, str] | None,
     *,
@@ -275,6 +281,7 @@ async def iter_items_from_checkpoint(
     conversation_id: str,
     *,
     skip_placeholders: bool = False,
+    record: bool = False,
 ) -> AsyncIterator[list[dict[str, Any]]]:
     """Page the record from the latest checkpoint on, not from item 1.
 
@@ -290,7 +297,8 @@ async def iter_items_from_checkpoint(
     (a native forwarder's synthetic id) reads after the compaction item
     instead, with the item itself in front. With no checkpoint the record is
     read from the start, as before. Placeholder checkpoints (see
-    :func:`fetch_latest_checkpoint`) are left out of the yielded pages.
+    :func:`fetch_latest_checkpoint`) are left out of the yielded pages. With *record* (runner
+    credential), items carry their record-only fields and ``epoch_block`` items are listed.
 
     :raises ItemsPageFetchError: a page came back non-200.
     """
@@ -309,7 +317,7 @@ async def iter_items_from_checkpoint(
         if after is not None:
             params["after"] = after
         try:
-            page = await _get_items_page(server_client, conversation_id, params)
+            page = await _get_items_page(server_client, conversation_id, params, record=record)
         except ItemsPageFetchError as exc:
             if first and anchor and exc.status_code == 400:
                 after, anchor, prefix = checkpoint["id"], None, [checkpoint]
@@ -332,6 +340,27 @@ async def iter_items_from_checkpoint(
         first = False
         if not page.get("data") or not page.get("has_more", False):
             return
+
+
+async def read_record_after(
+    server_client: httpx.AsyncClient, conversation_id: str, after: str | None
+) -> list[dict[str, Any]]:
+    """The record after item *after* (from the start when empty), oldest first, with record-only
+    fields and ``epoch_block`` items (runner credential).
+
+    :raises ItemsPageFetchError: a page came back non-200 (400: *after* is not in the record).
+    """
+    items: list[dict[str, Any]] = []
+    while True:
+        params = {"limit": _RECORD_PAGE_LIMIT, "order": "asc"}
+        if after:
+            params["after"] = after
+        page = await _get_items_page(server_client, conversation_id, params, record=True)
+        data = page.get("data", [])
+        items.extend(data)
+        if not data or not page.get("has_more", False):
+            return items
+        after = data[-1].get("id")
 
 
 async def _fetch_items_since_last_compaction(
@@ -428,10 +457,10 @@ def summarizer_model(
     return model
 
 
-async def _current_labels(
+async def current_labels(
     server_client: httpx.AsyncClient, conversation_id: str
 ) -> dict[str, str] | None:
-    """The session's labels now, or ``None`` when they cannot be read (nothing is cleared)."""
+    """The session's labels now, or ``None`` when they cannot be read."""
     try:
         resp = await server_client.get(f"/v1/sessions/{conversation_id}/labels", timeout=10.0)
         labels = resp.json().get("labels") if resp.status_code == 200 else None
@@ -522,7 +551,7 @@ class HttpRecord:
         return True
 
     async def clear(self, closes: Mapping[str, str], adds: Mapping[str, str] | None) -> None:
-        current = await _current_labels(self._client, self._id) if adds else None
+        current = await current_labels(self._client, self._id) if adds else None
         consumed = _consumed_labels(closes, adds, current)
         if not consumed:
             return

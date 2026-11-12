@@ -21,6 +21,7 @@ import math
 import mimetypes
 import os
 import re
+import shutil
 import time
 import urllib.parse
 import uuid
@@ -142,7 +143,12 @@ from omnigent.runtime.prompt import (
 from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.superchat.artifacts.studio import STUDIO_TYPE
-from omnigent.superchat.feature import RECORDED_RESPONSE_PREFIX, is_helper, is_super_chat
+from omnigent.superchat.feature import (
+    RECORDED_RESPONSE_PREFIX,
+    MessageBlock,
+    is_helper,
+    is_super_chat,
+)
 from omnigent.superchat.features import notify_turn_end
 from omnigent.superchat.helpers.notices import take_waiting_progress
 from omnigent.superchat.helpers.saved_files import (
@@ -3114,6 +3120,16 @@ def create_runner_app(
     # conv_id -> the view start this runner last wrote (VIEW_START_LABEL): the label is written,
     # and the turns before it indexed, only when it moves (see _assembled_history).
     _view_starts: dict[str, str] = {}
+    # A pi Conversation's session file (plan §3.3): conv_id -> the file its pi process runs on,
+    # chosen once per process start (_pi_session_file); forgotten when that process goes.
+    _pi_session_files: dict[str, str] = {}
+    # conv_ids whose next pi start begins a new epoch (a size handoff, /compact, a reset).
+    _pi_new_epoch: set[str] = set()
+    _pi_window_locks: dict[str, asyncio.Lock] = {}
+    # conv_id -> (the turn's opening item, the blocks sent in front of it), written once the turn
+    # answers (_write_pi_context_prefix), off the answer path.
+    _pi_context_prefix: dict[str, tuple[str, list[str]]] = {}
+    _pi_scratch_swept: list[bool] = []
     # conv_id -> what the session's current warm client was last sent of the Memory Profile,
     # Projects and file handle blocks (hashes or lines, plus the prompt and subprocess it was
     # sent under); and what the turn in flight carries, kept once the turn completes (see
@@ -4496,6 +4512,14 @@ def create_runner_app(
         _session_histories.pop(session_id, None)
         _history_process.pop(session_id, None)
         _view_starts.pop(session_id, None)
+        _forget_pi_window(session_id)
+        _pi_new_epoch.discard(session_id)
+        _pi_window_locks.pop(session_id, None)
+        _pi_context_prefix.pop(session_id, None)
+        with contextlib.suppress(ValueError):
+            from omnigent.harnesses.pi_executor import pi_session_dir
+
+            await asyncio.to_thread(shutil.rmtree, pi_session_dir(session_id), True)
         _forget_superside_chat_prefix(session_id)
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
@@ -4593,9 +4617,12 @@ def create_runner_app(
 
         if drop_item_id is not None:
             all_items = [it for it in all_items if it.get("id") != drop_item_id]
-        if superside:
+        if superside and not await _is_pi_conversation(session_id):
             converted = await _assembled_history(session_id, all_items, cast(int, keep_tokens))
         else:
+            # A pi Conversation's history is its session file (_pi_session_file), and its view
+            # start moves only with its epoch: this copy serves the runner's own checks, and the
+            # replay when no file could be prepared.
             converted = _convert_raw_items_to_input(all_items, keep_tokens=keep_tokens)
         # Items are persisted pre-resolution, so reloaded history can still
         # carry raw file_id blocks (the runner has no file/artifact stores).
@@ -4613,15 +4640,35 @@ def create_runner_app(
     async def _assembled_history(
         session_id: str, items: list[_JsonObject], keep_tokens: int
     ) -> list[_JsonObject]:
-        """A new session's input: one assembled block, then the newest messages as they are.
+        """A new session's input: one assembled block (:func:`_assemble`), then the newest
+        messages as they are. Writes the view start.
+        """
+        block, view_start, _, raw = await _assemble(session_id, items, keep_tokens)
+        _note_view_start(session_id, view_start)
+        converted = _convert_raw_items_to_input(raw)
+        if block is None:
+            return converted
+        opening: _JsonObject = {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": block}],
+        }
+        return [opening, *converted]
 
-        The block (``assemble_block``) holds the checkpoint's working list once, a line per
-        settled turn left out of the tail (Rounds, hidden ones included, else the transcript),
-        the person's words from those turns and the tail itself in the second person. From the
-        tail's last answer on, the items stay raw, so the history still ends where the record
-        does (the message this turn answers, an interrupted call) and the recovery check and the
-        harness prompt builders read it as before. Code only: no model call, nothing awaited but
-        the Round read. Writes the view start.
+    async def _assemble(
+        session_id: str, items: list[_JsonObject], keep_tokens: int
+    ) -> tuple[str | None, str, str, list[_JsonObject]]:
+        """``(block, view start, epoch start, raw)`` for a new session from *items*.
+
+        The block (``assemble_block``, ``None`` when there is nothing to give) holds the
+        checkpoint's working list once, a line per settled turn left out of the tail (Rounds,
+        hidden ones included, else the transcript), the person's words from those turns and the
+        tail itself in the second person. From the tail's last answer on, the items stay *raw*,
+        so the history still ends where the record does (the message this turn answers, an
+        interrupted call) and the recovery check and the harness prompt builders read it as
+        before. The view start is the last item before the view (recall leaves out what follows
+        it); the epoch start is the last item the block covers (the raw items follow it). Code
+        only: no model call, nothing awaited but the Round read.
         """
         from omnigent.context.rollover import (
             assemble_block,
@@ -4650,7 +4697,9 @@ def create_runner_app(
             0,
         )
         shown, raw = clip_notices(kept)[:cut], kept[cut:]
-        _note_view_start(session_id, retired, c)
+        view_start = str(
+            (retired[-1].get("id") if retired else (c or {}).get("last_item_id")) or ""
+        )
         lines = transcript_turn_lines(retired)
         covered = {line.key for line in lines}
         rounds = await _round_turn_lines(session_id, remaining, retired)
@@ -4670,24 +4719,19 @@ def create_runner_app(
             since=since,
             model=ROLLOVER_TOKEN_COUNT_MODEL,
         )
-        converted = _convert_raw_items_to_input(raw)
-        if block is None:
-            return converted
-        _logger.info(
-            "assembled history for %s: %d chars, %d items retired, %d turn lines, %d raw items",
-            session_id,
-            len(block),
-            len(retired),
-            len(lines),
-            len(converted),
-            extra={"session_id": session_id},
-        )
-        opening: _JsonObject = {
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": block}],
-        }
-        return [opening, *converted]
+        # What the block shows in the second person ends the epoch's covered part.
+        epoch_start = str(kept[cut - 1].get("id") or "") if cut and block else view_start
+        if block is not None:
+            _logger.info(
+                "assembled history for %s: %d chars, %d items retired, %d turn lines, %d raw",
+                session_id,
+                len(block),
+                len(retired),
+                len(lines),
+                len(raw),
+                extra={"session_id": session_id},
+            )
+        return block, view_start, epoch_start, raw
 
     async def _round_turn_lines(
         session_id: str, since_anchor: list[_JsonObject], retired: list[_JsonObject]
@@ -4761,16 +4805,11 @@ def create_runner_app(
                 ids.add(round_id)
         return lines, ids
 
-    def _note_view_start(
-        session_id: str, retired: list[_JsonObject], checkpoint: _JsonObject | None
-    ) -> None:
+    def _note_view_start(session_id: str, after: str) -> None:
         """Write where this session's view starts (``VIEW_START_LABEL``: the last item before
         it) in the background, only when it moved. recall leaves out the turns after it."""
         from omnigent.context.rollover import VIEW_START_LABEL
 
-        after = str(
-            (retired[-1].get("id") if retired else (checkpoint or {}).get("last_item_id")) or ""
-        )
         if _view_starts.get(session_id) == after:
             return
         _view_starts[session_id] = after
@@ -4793,6 +4832,277 @@ def create_runner_app(
         task = asyncio.create_task(note(), name=f"view-start-{session_id}")
         task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(task)
+
+    async def _is_pi_conversation(conv_id: str, harness: str | None = None) -> bool:
+        """Whether *conv_id* is a Conversation on pi: its window is a session file the runner
+        renders from the record (Helpers, a file's studio and Claude replay history)."""
+        from omnigent.context.labels import is_superside_chat
+
+        if (harness or _session_harness_name(conv_id)) != "pi":
+            return False
+        if not is_superside_chat(await _rollover_labels_for_session(conv_id)):
+            return False
+        return not is_helper(await _tool_labels_for_session(conv_id)) and not await _is_studio(
+            conv_id
+        )
+
+    def _background(coro: Coroutine[Any, Any, None], name: str) -> None:
+        task = asyncio.create_task(coro, name=name)
+        task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(task)
+
+    def _forget_pi_window(conv_id: str) -> None:
+        """The Conversation's pi process is gone or must go: its next start chooses its file."""
+        _pi_session_files.pop(conv_id, None)
+
+    async def _pi_session_file(
+        conv_id: str, *, keep_tokens: int | None = None, drop_item_id: str | None = None
+    ) -> str | None:
+        """The session file the Conversation's pi starts on, chosen once per process start.
+
+        ``None`` when the record cannot be read: the turn then replays history as before.
+        Choosing one resets what the process was sent of the per-turn blocks, so the first turn
+        after a start carries them in full.
+        """
+        async with _pi_window_locks.setdefault(conv_id, asyncio.Lock()):
+            known = _pi_session_files.get(conv_id)
+            if known is not None:
+                return known
+            try:
+                path = await _prepare_pi_window(
+                    conv_id, keep_tokens=keep_tokens, drop_item_id=drop_item_id
+                )
+            except Exception:
+                _logger.warning(
+                    "pi window for %s not prepared; the turn replays its history",
+                    conv_id,
+                    exc_info=True,
+                    extra={"session_id": conv_id},
+                )
+                return None
+            _pi_session_files[conv_id] = str(path)
+            _forget_superside_chat_prefix(conv_id)
+            return str(path)
+
+    async def _prepare_pi_window(
+        conv_id: str, *, keep_tokens: int | None, drop_item_id: str | None
+    ) -> Path:
+        """Choose and write the file a Conversation's pi starts on (plan §3.3).
+
+        1. Reuse the file of the current epoch when it is complete and its last three texts
+           match the record's (pi's own bytes, so its prompt cache can still hit).
+        2. Else render the epoch from the record into it, when the epoch is exactly renderable
+           and its window is at most twice what a new session costs.
+        3. Else start a new epoch from today's assembled start: store its block, move the view
+           start, render. Only this branch (and a drop for size) moves the view start.
+
+        The message the turn answers (*drop_item_id*, else the record's unanswered newest one)
+        is left out: the turn sends it.
+        """
+        from omnigent.context.rollover import EPOCH_BLOCK_LABEL, VIEW_START_LABEL
+        from omnigent.context.window import (
+            exactly_renderable,
+            message_text,
+            pending_message,
+            render_window,
+            respawn_branch,
+            window_tokens,
+        )
+        from omnigent.harnesses.pi_executor import pi_session_dir, read_pi_session
+        from omnigent.models.model_fallbacks import ROLLOVER_TOKEN_COUNT_MODEL
+        from omnigent.superchat.prompt_prefix import person_words
+        from omnigent.superchat.rollover import (
+            ItemsPageFetchError,
+            current_labels,
+            read_record_after,
+            window_fits,
+        )
+
+        _sweep_pi_scratch()
+        directory = pi_session_dir(conv_id)
+        labels = await current_labels(server_client, conv_id) or {}
+        epoch = labels.get(EPOCH_BLOCK_LABEL, "")
+        new_epoch = conv_id in _pi_new_epoch
+        _pi_new_epoch.discard(conv_id)
+        items: list[_JsonObject] | None = None
+        if epoch and not new_epoch:
+            try:
+                items = await read_record_after(
+                    server_client, conv_id, labels.get(VIEW_START_LABEL)
+                )
+            except ItemsPageFetchError:
+                items = None
+        if items is not None:
+            stored = next(
+                (it for it in items if it.get("type") == "epoch_block" and it.get("id") == epoch),
+                None,
+            )
+            text = str(stored.get("text") or "") if stored is not None else None
+            drop = drop_item_id or pending_message(items)
+            items = [
+                it for it in items if it.get("type") != "epoch_block" and it.get("id") != drop
+            ]
+            window = render_window(text, items)
+            # The epoch's file as it was left (one per Conversation; any rewrite gets a new name,
+            # so a running pi is never written under: a new name starts a new process).
+            path = await asyncio.to_thread(
+                lambda: next(iter(sorted(directory.glob(f"{epoch}.*.jsonl"))), None)
+            )
+            on_disk = await asyncio.to_thread(read_pi_session, path) if path else None
+
+            def last_texts(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+                normal = [(role, " ".join(person_words(t).split())) for role, t in pairs]
+                return [pair for pair in normal if pair[1]][-3:]
+
+            matches = bool(
+                on_disk is not None
+                and on_disk[0]
+                and last_texts(on_disk[1])
+                == last_texts(
+                    [(m["role"], message_text(m)) for m in window if m["role"] != "tool"]
+                )
+            )
+            renderable = not matches and exactly_renderable(text, items)
+            fits = renderable and window_fits(
+                labels,
+                await asyncio.to_thread(window_tokens, window, ROLLOVER_TOKEN_COUNT_MODEL),
+            )
+            branch = respawn_branch(file_matches=matches, renderable=renderable, fits=fits)
+            _logger.info(
+                "pi window for %s: %s (epoch %s)",
+                conv_id,
+                branch,
+                epoch,
+                extra={"session_id": conv_id},
+            )
+            if branch == "reuse" and path is not None:
+                return path
+            if branch == "render":
+                return await _write_pi_window(conv_id, epoch, text, items)
+        return await _new_pi_epoch(conv_id, labels, keep_tokens, drop_item_id)
+
+    async def _new_pi_epoch(
+        conv_id: str,
+        labels: Mapping[str, str],
+        keep_tokens: int | None,
+        drop_item_id: str | None,
+    ) -> Path:
+        """Start a new epoch from today's assembled start: store its block as an ``epoch_block``
+        item, write the view start and the block's id in one label write, render its window."""
+        from omnigent.context.rollover import (
+            EPOCH_BLOCK_LABEL,
+            VIEW_START_LABEL,
+            resolve_keep_tokens,
+        )
+        from omnigent.context.window import pending_message
+        from omnigent.superchat.rollover import iter_items_from_checkpoint, post_epoch_block
+
+        items: list[_JsonObject] = []
+        async for page in iter_items_from_checkpoint(
+            server_client, conv_id, skip_placeholders=True, record=True
+        ):
+            items.extend(it for it in page if it.get("type") != "epoch_block")
+        drop = drop_item_id or pending_message(items)
+        items = [it for it in items if it.get("id") != drop]
+        keep = keep_tokens if keep_tokens is not None else resolve_keep_tokens(labels)
+        block, _, start, _ = await _assemble(conv_id, items, keep)
+        item_id = await post_epoch_block(server_client, conv_id, block or "")
+        resp = await server_client.patch(
+            f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}",
+            json={"labels": {VIEW_START_LABEL: start, EPOCH_BLOCK_LABEL: item_id}},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        _view_starts[conv_id] = start
+        at = next((i for i, it in enumerate(items) if start and it.get("id") == start), -1)
+        _logger.info(
+            "pi window for %s: new epoch %s", conv_id, item_id, extra={"session_id": conv_id}
+        )
+        return await _write_pi_window(conv_id, item_id, block or "", items[at + 1 :])
+
+    async def _write_pi_window(
+        conv_id: str, epoch: str, block: str | None, items: list[_JsonObject]
+    ) -> Path:
+        """Render the epoch's window into a new file (attachments of the last Rounds fetched
+        inline), remove the Conversation's other files and return the new one."""
+        from omnigent.context.window import recent_message_ids, render_window
+        from omnigent.harnesses.pi_executor import pi_session_dir, write_pi_session
+
+        recent = recent_message_ids(items)
+        resolved: list[_JsonObject] = []
+        for item in items:
+            content = item.get("content")
+            if item.get("id") in recent and isinstance(content, list):
+                item = {
+                    **item,
+                    "content": await _resolve_forwarded_message_content(
+                        content, session_id=conv_id, server_client=server_client
+                    ),
+                }
+            resolved.append(item)
+        window = render_window(block, resolved)
+        cwd = str(await _session_runtime_cwd(conv_id) or Path.cwd())
+        path = pi_session_dir(conv_id) / f"{epoch}.{uuid.uuid4().hex[:8]}.jsonl"
+
+        def write() -> None:
+            write_pi_session(path, cwd=cwd, messages=window)
+            for other in path.parent.glob("*.jsonl"):
+                if other != path:
+                    other.unlink(missing_ok=True)
+
+        await asyncio.to_thread(write)
+        return path
+
+    def _sweep_pi_scratch() -> None:
+        """Once per runner: remove the pi session files of Conversations that no longer exist."""
+        if _pi_scratch_swept:
+            return
+        _pi_scratch_swept.append(True)
+        from omnigent.harnesses.pi_executor import pi_scratch_root
+
+        async def sweep() -> None:
+            root = pi_scratch_root()
+            names = await asyncio.to_thread(
+                lambda: [d.name for d in root.iterdir() if d.is_dir()] if root.is_dir() else []
+            )
+            for name in names:
+                if name in _pi_session_files:
+                    continue
+                try:
+                    resp = await server_client.get(
+                        f"/v1/sessions/{urllib.parse.quote(name, safe='')}/labels", timeout=10.0
+                    )
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code == 404:
+                    await asyncio.to_thread(shutil.rmtree, root / name, True)
+
+        _background(sweep(), "pi-scratch-sweep")
+
+    def _write_pi_record(conv_id: str, item_id: str, fields: _JsonObject) -> None:
+        """Write a Conversation item's record-only fields in the background; a failure leaves
+        them unset (its epoch then starts over instead of rendering)."""
+        from omnigent.superchat.rollover import patch_item_data
+
+        async def write() -> None:
+            try:
+                await patch_item_data(server_client, conv_id, item_id, fields)
+            except httpx.HTTPError:
+                _logger.warning(
+                    "record fields of %s not written for %s",
+                    item_id,
+                    conv_id,
+                    exc_info=True,
+                    extra={"session_id": conv_id},
+                )
+
+        _background(write(), f"record-fields-{conv_id}")
+
+    def _write_pi_context_prefix(conv_id: str) -> None:
+        """Record the blocks the turn's opening message was sent with, once it answers."""
+        pending = _pi_context_prefix.pop(conv_id, None)
+        if pending is not None:
+            _write_pi_record(conv_id, pending[0], {"context_prefix": pending[1]})
 
     def _convert_raw_items_to_input(
         items: list[_JsonObject],
@@ -5088,6 +5398,8 @@ def create_runner_app(
         items_to_persist.append(marker)
 
         _session_histories.setdefault(conv_id, []).extend(synthetic_items)
+        # A stopped pi is gone; its next start re-reads the record, which holds the marker.
+        _forget_pi_window(conv_id)
 
         loop = asyncio.get_running_loop()
         _task = loop.create_task(
@@ -5793,6 +6105,7 @@ def create_runner_app(
             return
         # The turn is over: an ``if_running`` message it never answered was not taken.
         _answer_offers_of(conv_id)
+        _write_pi_context_prefix(conv_id)
 
         _active_turns.pop(conv_id, None)
         _release_live_turn_markers(conv_id)
@@ -6722,6 +7035,9 @@ def create_runner_app(
             return
         _forget_superside_chat_prefix(conv_id)
         _session_histories.pop(conv_id, None)
+        # A pi Conversation starts its next process on a new epoch.
+        _forget_pi_window(conv_id)
+        _pi_new_epoch.add(conv_id)
         # The next session's size is unknown until its first turn ends: never hand it off on the
         # old one (0 also keeps the label's stale reading out).
         _superside_chat_last_context_tokens[conv_id] = 0
@@ -6904,8 +7220,9 @@ def create_runner_app(
         prompt_key: str = "",
         idle_gap_seconds: float | None = None,
         setup: str | None = None,
-    ) -> _JsonObject:
-        """Prepend the Super Chat per-turn blocks (Memory Profile, Projects, local time).
+    ) -> tuple[_JsonObject, list[MessageBlock]]:
+        """Prepend the per-turn blocks (Memory Profile, Projects, local time); returns the body
+        and the blocks, in the order they were prepended.
 
         *setup* is the line naming the model and harness (``prompt_prefix.setup_line``); it goes
         only when this warm client has not received it yet, the same way as the Memory Profile.
@@ -6962,7 +7279,7 @@ def create_runner_app(
                 blocks.append(setup)
         _mark_turn(conv_id, "prefixed")
         _superside_chat_prefix_pending[conv_id] = sent_now
-        return _prepend_turn_blocks(body, blocks, conv_id)
+        return _prepend_turn_blocks(body, blocks, conv_id), blocks
 
     async def _run_turn_bg(
         msg_body: _JsonObject,
@@ -7298,6 +7615,7 @@ def create_runner_app(
             # The subprocess that held this history is gone: the new one starts cold, from the
             # record (clipped, whole Rounds), never from the runner's raw copy of the old one.
             _session_histories.pop(conv, None)
+            _forget_pi_window(conv)
         if conv not in _session_histories:
             _session_histories[conv] = await _load_history_as_input(
                 conv, keep_tokens=_trim_keep_tokens
@@ -7310,6 +7628,16 @@ def create_runner_app(
                 _history.append(
                     {"type": "message", "role": "user", "content": msg_body.get("content", [])}
                 )
+        # A pi Conversation's process starts on a session file rendered from the record.
+        _pi_file = (
+            await _pi_session_file(
+                conv,
+                keep_tokens=_trim_keep_tokens,
+                drop_item_id=cast(str | None, msg_body.get("persisted_item_id")),
+            )
+            if _superside and await _is_pi_conversation(conv, harness_name)
+            else None
+        )
         _setup_history = time.monotonic() - _history_started
         _raw_per_request_instructions = cast(str | None, msg_body.get("instructions"))
         _env_started = time.monotonic()
@@ -7532,15 +7860,15 @@ def create_runner_app(
         if _turn_context_mode == SUPERSIDE_CHAT_MODE_VALUE:
             # Placed after the tools are known: the key covers what the executor builds its
             # system prompt from, so a change to it (which rebuilds the client) is a cold start.
-            # The model too: pi respawns on a model change inside the same harness process and
-            # replays a history without the blocks (Claude keeps its client, and gets them again).
+            # The model too: pi respawns on a model change inside the same harness process, and
+            # a start gets the blocks in full (Claude keeps its client, and gets them again).
             _tool_names = sorted(
                 name for t in merged_tools if (name := _schema_tool_name(t)) is not None
             )
             _prompt_key = hashlib.sha256(
                 json.dumps([instructions, _tool_names, _turn_model]).encode()
             ).hexdigest()
-            harness_body = await _apply_turn_prefix_blocks(
+            harness_body, _sent_blocks = await _apply_turn_prefix_blocks(
                 harness_body,
                 conv,
                 msg_body,
@@ -7556,9 +7884,18 @@ def create_runner_app(
                 _setup_before = _superside_chat_setup.get(conv)
                 _superside_chat_setup[conv] = _setup_now
                 if _setup_before is not None and _setup_before != _setup_now:
-                    harness_body = _prepend_turn_blocks(
-                        harness_body, [setup_changed_line(_setup_before, _setup_now)], conv
-                    )
+                    _changed = setup_changed_line(_setup_before, _setup_now)
+                    harness_body = _prepend_turn_blocks(harness_body, [_changed], conv)
+                    _sent_blocks.append(_changed)
+            _opening_item = msg_body.get("persisted_item_id")
+            if _pi_file is not None and isinstance(_opening_item, str) and _opening_item:
+                # In front of the words in the order the model reads them (each prepended).
+                _pi_context_prefix[conv] = (
+                    _opening_item,
+                    [b for b in reversed(_sent_blocks) if isinstance(b, str) and b],
+                )
+        if _pi_file is not None:
+            harness_body["session_file"] = _pi_file
         if is_superside_chat(_turn_labels):
             # After the prefix: its reads and the sync's never compete (ADR 0026).
             _schedule_memory_sync(conv, _turn_labels)
@@ -7670,6 +8007,11 @@ def create_runner_app(
                 body["context_mode"] = context_mode
             if model_override:
                 body["model_override"] = model_override
+            if await _is_pi_conversation(conv, harness_name):
+                # The first turn starts on the same file, so it does not relaunch.
+                session_file = await _pi_session_file(conv)
+                if session_file is not None:
+                    body["session_file"] = session_file
             reasoning = _turn_reasoning(conv, {})
             if reasoning is not None:
                 from omnigent.util.reasoning_effort import efforts_for_harness
@@ -8023,6 +8365,10 @@ def create_runner_app(
                     _text_acc: list[str] = []
                     _stream_failed_error: _JsonObject | None = None
                     _tool_starts = ToolStarts()
+                    from omnigent.context.window import TURN_START
+
+                    # The newest tool result this turn (a steer taken now is placed after it).
+                    _last_result_call = TURN_START
                     async for chunk in harness_resp.aiter_text():
                         _buffer += chunk
                         while "\n\n" in _buffer:
@@ -8064,6 +8410,8 @@ def create_runner_app(
                                     )
                                 ):
                                     _log_cold_start(conv_id, time.monotonic() - _posted_at)
+                                    # Off the answer path: the reply has started.
+                                    _write_pi_context_prefix(conv_id)
                                 if (
                                     _evt_type == "response.compaction.in_progress"
                                     and conv_id in _sdk_compact_inprogress
@@ -8088,11 +8436,29 @@ def create_runner_app(
                                     # Offered for the turn's next step; its outcome follows.
                                     _answer_offer(event.get("injection_id"), taken=True)
                                     continue
+                                if _evt_type == "response.output_item.done":
+                                    _done = event.get("item")
+                                    if (
+                                        isinstance(_done, dict)
+                                        and _done.get("type") == "function_call_output"
+                                        and _done.get("call_id")
+                                    ):
+                                        _last_result_call = str(_done["call_id"])
                                 if _evt_type == "injection.consumed":
                                     _inj_id = event.get("injection_id")
                                     _answer_offer(_inj_id, taken=True)
                                     if _inj_id is not None:
                                         for _m in _remove_buffered(conv_id, _inj_id):
+                                            _steer_item = _m.get("persisted_item_id")
+                                            if conv_id in _pi_session_files and isinstance(
+                                                _steer_item, str
+                                            ):
+                                                # Where pi took the steer: after this result.
+                                                _write_pi_record(
+                                                    conv_id,
+                                                    _steer_item,
+                                                    {"delivered_after_call_id": _last_result_call},
+                                                )
                                             _session_histories.setdefault(conv_id, []).append(
                                                 {
                                                     "type": "message",
