@@ -242,6 +242,34 @@ def test_read_tool_call_rides_along_with_its_turn(session_fixture: _Fixture) -> 
     assert kinds == ["text", "tool_call", "tool_result", "text"]
 
 
+def test_get_returns_a_tool_result_unclipped_by_offset(session_fixture: _Fixture) -> None:
+    """``read`` clips a tool result; ``get`` pages the whole stored text by call id."""
+    text = "abcdefghij" * 1500
+    session_fixture.conv_store.append(
+        session_fixture.conv_id,
+        [
+            _user_msg("run it"),
+            NewConversationItem(
+                type="function_call_output",
+                response_id="resp_1",
+                data=FunctionCallOutputData(call_id="call_big", output=text),
+            ),
+        ],
+    )
+    tool = SessionHistoryTool()
+
+    def get(**args: object) -> dict:
+        payload = {"action": "get", "call_id": "call_big", **args}
+        return json.loads(tool.invoke(json.dumps(payload), session_fixture.ctx))
+
+    first = get()
+    assert first["content"] == text[:12_000]
+    assert first["total_chars"] == 15_000 and first["next_offset"] == 12_000
+    rest = get(offset=first["next_offset"])
+    assert rest["content"] == text[12_000:] and "next_offset" not in rest
+    assert "error" in get(call_id="call_missing")
+
+
 def test_read_default_and_max_limit() -> None:
     """Default limit is 5 turns; an oversized limit is clamped to 20."""
     schema = SessionHistoryTool().get_schema()
@@ -491,8 +519,19 @@ def test_schema_shape() -> None:
     func = schema["function"]
     assert func["name"] == "session_history"
     props = func["parameters"]["properties"]
-    assert set(props) == {"action", "cursor", "limit", "query", "chat_id"}
-    assert props["action"]["enum"] == ["list_chats", "read", "search", "status"]
+    assert set(props) == {
+        "action",
+        "cursor",
+        "order",
+        "limit",
+        "query",
+        "call_id",
+        "item_id",
+        "offset",
+        "length",
+        "chat_id",
+    }
+    assert props["action"]["enum"] == ["get", "list_chats", "read", "search", "status"]
     assert func["parameters"]["required"] == ["action"]
 
 

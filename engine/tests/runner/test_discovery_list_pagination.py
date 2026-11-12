@@ -159,7 +159,7 @@ async def test_size_fitter_checks_larger_page_after_smaller_cursor_does_not_fit(
             {
                 "name": "large",
                 "path": "/workspace/a.yaml",
-                "description": "d" * 96_000,
+                "description": "d" * 12_000,
             },
             {"name": "small", "path": "/workspace/z.yaml", "description": "small"},
         ],
@@ -475,7 +475,7 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
         first = json.loads(
             await execute_tool(
                 tool_name="sys_session_list",
-                arguments=json.dumps({"limit": 100}),
+                arguments=json.dumps({"limit": 50}),
                 server_client=client,
                 conversation_id="conv_caller",
             )
@@ -483,15 +483,15 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
         second = json.loads(
             await execute_tool(
                 tool_name="sys_session_list",
-                arguments=json.dumps({"limit": 100, "cursor": first["page"]["next_cursor"]}),
+                arguments=json.dumps({"limit": 50, "cursor": first["page"]["next_cursor"]}),
                 server_client=client,
                 conversation_id="conv_caller",
             )
         )
 
     assert first["sessions"][0]["session_id"] == "conv_0000"
-    assert second["sessions"][0]["session_id"] == "conv_0100"
-    assert received_afters == [None, "conv_0099"]
+    assert second["sessions"][0]["session_id"] == "conv_0050"
+    assert received_afters == [None, "conv_0049"]
     assert received_visibilities == ["all", "all"]
 
 
@@ -569,8 +569,8 @@ async def test_sys_agent_list_pages_local_configs_beyond_server_fetch_limit(
         )
 
     cursor: str | None = None
-    for _ in range(11):
-        arguments: dict[str, object] = {"limit": 100}
+    for _ in range(21):
+        arguments: dict[str, object] = {"limit": 50}
         if cursor is not None:
             arguments["cursor"] = cursor
         result = json.loads(await _agent_list_with_empty_server(tmp_path, arguments))
@@ -580,7 +580,7 @@ async def test_sys_agent_list_pages_local_configs_beyond_server_fetch_limit(
 
     assert [row["name"] for row in result["local_configs"]] == ["local-1000"]
     assert result["page"] == {
-        "limit": 100,
+        "limit": 50,
         "has_more": {"builtins": False, "session_agents": False, "local_configs": False},
     }
 

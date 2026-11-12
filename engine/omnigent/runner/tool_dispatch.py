@@ -232,7 +232,7 @@ def _string_mapping(value: object) -> dict[str, str] | None:
     }
 
 
-_INBOX_OUTPUT_MAX_CHARS = 12000
+_INBOX_OUTPUT_MAX_CHARS = 4000
 _OS_ENV_SHELL_DEFAULT_TIMEOUT_S = 120.0
 _RUNNER_EXECUTION_TIMEOUT_S = 7200.0
 _SUBAGENT_POLICY_STATUSES = frozenset({"completed", "failed"})
@@ -506,10 +506,9 @@ _AGENT_CONFIG_SUBDIR = ".omnigent/agent-configs"
 _AGENT_LIST_PAGE_LIMIT = 1000
 
 _DISCOVERY_LIST_MAX_LIMIT = 100
-# Match the existing default ceiling for ``sys_os_shell`` output. Discovery
-# tools stay below the same Omnigent-owned budget instead of guessing a
-# harness-specific limit.
-_DISCOVERY_LIST_OUTPUT_MAX_CHARS = 100_000
+# The model-facing ceiling for ``sys_os_shell`` output; a longer discovery list
+# is paged with its cursor.
+_DISCOVERY_LIST_OUTPUT_MAX_CHARS = 16_000
 _DISCOVERY_CURSOR_MAX_CHARS = 40_000
 _DISCOVERY_START = "start"
 _DISCOVERY_AT = "at"
@@ -6189,6 +6188,8 @@ async def _execute_session_history_tool(
     action = args.get("action")
     if action == "list_chats":
         return await _session_history_list_chats_via_rest(conversation_id, server_client)
+    if action == "get":
+        return await _session_history_get_via_rest(args, conversation_id, server_client)
     if action == "read":
         return await _session_history_read_via_rest(args, conversation_id, server_client)
     if action == "search":
@@ -6196,7 +6197,7 @@ async def _execute_session_history_tool(
     if action == "status":
         return await _session_history_status_via_rest(conversation_id, server_client)
     return json.dumps(
-        {"error": "action must be one of ['list_chats', 'read', 'search', 'status']"}
+        {"error": "action must be one of ['get', 'list_chats', 'read', 'search', 'status']"}
     )
 
 
@@ -6252,6 +6253,50 @@ async def _resolve_chat_target_via_rest(
             {"error": "chat_id is not a related chat of this session", "chat_id": chat_id}
         )
     return chat_id, None
+
+
+async def _session_history_get_via_rest(
+    args: _JsonObject,
+    conversation_id: str,
+    server_client: httpx.AsyncClient,
+) -> str:
+    """Return one stored item unclipped via ``GET .../items``, newest first."""
+    target_id, chat_error = await _resolve_chat_target_via_rest(
+        args, conversation_id, server_client
+    )
+    if chat_error is not None:
+        return chat_error
+    assert target_id is not None
+    window = _session_history.get_window(args)
+    if isinstance(window, str):
+        return window
+    call_id, item_id, offset, length = window
+    cursor: str | None = None
+    scanned = 0
+    try:
+        while scanned < _session_history._READ_MAX_ITEMS_SCANNED:
+            params: dict[str, str | int] = {
+                "limit": _session_history._READ_BATCH_SIZE,
+                "order": "desc",
+            }
+            if cursor is not None:
+                params["after"] = cursor
+            resp = await server_client.get(
+                f"/v1/sessions/{target_id}/items", params=params, timeout=30.0
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            data = body.get("data", [])
+            for item in data:
+                if _session_history.is_requested_item(item, call_id, item_id):
+                    return _session_history.get_response(item, offset, length)
+            scanned += len(data)
+            if not data or not body.get("has_more"):
+                break
+            cursor = data[-1].get("id")
+    except Exception as exc:  # noqa: BLE001 — a failed page read is reported to the model
+        return json.dumps({"error": f"session_history get failed: {exc}"})
+    return _session_history.get_response(None, offset, length)
 
 
 async def _session_history_read_via_rest(

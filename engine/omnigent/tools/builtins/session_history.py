@@ -44,7 +44,7 @@ _SEARCH_MAX_LIMIT = 20
 _RECALL_ITEM_KINDS = frozenset({"message", "function_call", "function_call_output"})
 _HIDDEN_TYPE = "hidden"
 
-_ACTIONS = frozenset({"list_chats", "read", "search", "status"})
+_ACTIONS = frozenset({"get", "list_chats", "read", "search", "status"})
 
 
 class SessionHistoryTool(Tool):
@@ -84,7 +84,11 @@ class SessionHistoryTool(Tool):
             f"returns about {_READ_MAX_CHARS} characters at most. Pass "
             "next_cursor as cursor (with the same order) to read the next "
             "page. Reading "
-            "never changes the chat. action='search' full-text searches "
+            "never changes the chat. action='get' returns one stored item "
+            "unclipped, by call_id (a tool call's result) or item_id, "
+            f"{_READ_MAX_CHARS} characters at a time from offset; "
+            "next_offset says where the rest starts. "
+            "action='search' full-text searches "
             "this session's own items. action='status' reports tokens "
             "used, the context window, and tokens left before the next "
             "rollover. Always scoped to the session that called this tool "
@@ -115,7 +119,8 @@ class SessionHistoryTool(Tool):
                             "enum": sorted(_ACTIONS),
                             "description": (
                                 "'read' returns full turns of this session, newest "
-                                "first; 'search' full-text searches its items; "
+                                "first; 'get' returns one item unclipped; "
+                                "'search' full-text searches its items; "
                                 "'status' reports token usage and headroom before "
                                 "the next rollover; 'list_chats' lists the other "
                                 "chats this session may read."
@@ -151,10 +156,30 @@ class SessionHistoryTool(Tool):
                             "type": "string",
                             "description": "search only. The full-text search query.",
                         },
+                        "call_id": {
+                            "type": "string",
+                            "description": "get only. The tool call id whose result to return.",
+                        },
+                        "item_id": {
+                            "type": "string",
+                            "description": "get only. The id of the item to return.",
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "get only. First character to return (default 0).",
+                        },
+                        "length": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": (
+                                f"get only. Characters to return, up to {_READ_MAX_CHARS}."
+                            ),
+                        },
                         "chat_id": {
                             "type": "string",
                             "description": (
-                                "read/search only. Look into another chat instead of "
+                                "get/read/search only. Look into another chat instead of "
                                 "this one — must be an id returned by list_chats (or "
                                 "this chat's own id). Omit to read/search this chat."
                             ),
@@ -196,11 +221,13 @@ class SessionHistoryTool(Tool):
         conv_store = get_conversation_store()
         if action == "list_chats":
             return _list_chats(conv_store, ctx.conversation_id)
-        if action in ("read", "search"):
+        if action in ("get", "read", "search"):
             target_id, error = _resolve_chat_target(conv_store, ctx.conversation_id, args)
             if error is not None:
                 return error
             assert target_id is not None
+            if action == "get":
+                return _get(conv_store, target_id, args)
             if action == "read":
                 return _read(conv_store, target_id, args)
             return _search(conv_store, target_id, args)
@@ -290,6 +317,75 @@ def _read(conv_store: Any, conversation_id: str, args: dict[str, Any]) -> str:
         return json.dumps({"error": "stale_cursor", "cursor": cursor})
 
     return read_response(turns, next_cursor, oldest_first=oldest)
+
+
+def get_window(args: dict[str, Any]) -> tuple[str | None, str | None, int, int] | str:
+    """Validate ``get`` arguments: ``(call_id, item_id, offset, length)``, or an error JSON."""
+    call_id, item_id = args.get("call_id"), args.get("item_id")
+    if not any(isinstance(v, str) and v for v in (call_id, item_id)):
+        return json.dumps({"error": "get requires a call_id or an item_id"})
+    offset = args.get("offset", 0)
+    length = args.get("length", _READ_MAX_CHARS)
+    for name, value, floor in (("offset", offset, 0), ("length", length, 1)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < floor:
+            return json.dumps({"error": f"{name} must be an integer >= {floor}"})
+    return call_id or None, item_id or None, offset, min(length, _READ_MAX_CHARS)
+
+
+def is_requested_item(item: dict[str, Any], call_id: str | None, item_id: str | None) -> bool:
+    """Whether a flat API item is the one ``get`` asked for."""
+    if item_id is not None and item.get("id") == item_id:
+        return True
+    return (
+        call_id is not None
+        and item.get("type") == "function_call_output"
+        and item.get("call_id") == call_id
+    )
+
+
+def get_response(item: dict[str, Any] | None, offset: int, length: int) -> str:
+    """The ``get`` action's JSON payload: the item's text from *offset*, unclipped."""
+    if item is None:
+        return json.dumps({"error": "no such item in the scanned part of the record"})
+    if item.get("type") == "function_call_output":
+        output = item.get("output")
+        text = output if isinstance(output, str) else json.dumps(output)
+    elif item.get("type") == "function_call":
+        text = str(item.get("arguments") or "")
+    else:
+        text = _message_text(item)
+    end = offset + length
+    body: dict[str, Any] = {
+        "id": item.get("id"),
+        "content": text[offset:end],
+        "total_chars": len(text),
+    }
+    if end < len(text):
+        body["next_offset"] = end
+    return json.dumps(body)
+
+
+def _get(conv_store: Any, conversation_id: str, args: dict[str, Any]) -> str:
+    """Return one stored item unclipped, found newest first among the latest items."""
+    window = get_window(args)
+    if isinstance(window, str):
+        return window
+    call_id, item_id, offset, length = window
+    cursor: str | None = None
+    scanned = 0
+    while scanned < _READ_MAX_ITEMS_SCANNED:
+        page = conv_store.list_items(
+            conversation_id, limit=_READ_BATCH_SIZE, after=cursor, order="desc"
+        )
+        for raw in page.data:
+            item = raw.to_api_dict()
+            if is_requested_item(item, call_id, item_id):
+                return get_response(item, offset, length)
+        scanned += len(page.data)
+        if not page.data or not page.has_more:
+            break
+        cursor = page.data[-1].id
+    return get_response(None, offset, length)
 
 
 def read_order(raw: Any) -> bool | None:
@@ -533,6 +629,16 @@ def project_api_item(item: dict[str, Any]) -> dict[str, Any]:
                 max_chars=_TOOL_MAX_CHARS,
             ),
         }
+    return {
+        **base,
+        "role": item.get("role") or "unknown",
+        "type": "text",
+        "content": _truncate(_message_text(item)),
+    }
+
+
+def _message_text(item: dict[str, Any]) -> str:
+    """A message item's text blocks, joined."""
     text_parts: list[str] = []
     for block in item.get("content") or []:
         if isinstance(block, dict):
@@ -541,12 +647,7 @@ def project_api_item(item: dict[str, Any]) -> dict[str, Any]:
                 text_parts.append(text)
         elif isinstance(block, str):
             text_parts.append(block)
-    return {
-        **base,
-        "role": item.get("role") or "unknown",
-        "type": "text",
-        "content": _truncate("\n".join(text_parts)),
-    }
+    return "\n".join(text_parts)
 
 
 def _truncate(text: str, *, max_chars: int = _CONTENT_MAX_CHARS) -> str:

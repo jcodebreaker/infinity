@@ -183,7 +183,10 @@ class FilesGetTool(ArtifactTool):
             "type": "string",
             "description": "Only these pages, e.g. '3' or '2-4' or '1,5,7-9'.",
         },
-        "max_chars": {"type": "integer", "description": "Cap on text returned (default 24000)."},
+        "max_chars": {
+            "type": "integer",
+            "description": "Cap on text returned (default and max 16000).",
+        },
     }
     _REQUIRED = ("path",)
 
@@ -199,7 +202,10 @@ class FilesMultiGetTool(ArtifactTool):
     )
     _PROPERTIES = {
         "glob": {"type": "string", "description": "Glob, or comma-separated paths or names."},
-        "max_chars": {"type": "integer", "description": "Cap on all text (default 24000)."},
+        "max_chars": {
+            "type": "integer",
+            "description": "Cap on all text (default and max 16000).",
+        },
     }
     _REQUIRED = ("glob",)
 
