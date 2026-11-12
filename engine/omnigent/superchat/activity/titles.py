@@ -20,7 +20,7 @@ import re
 import time
 from datetime import UTC, datetime
 
-from omnigent.superchat.titles import (  # noqa: F401  (tidy_request_title etc. are re-exported)
+from omnigent.context.titles import (  # noqa: F401  (tidy_request_title etc. are re-exported)
     SUMMARY_MAX_CHARS,
     SUMMARY_MAX_WORDS,
     TITLE_MAX_CHARS,

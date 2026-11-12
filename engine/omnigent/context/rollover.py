@@ -587,7 +587,7 @@ def transcript_turn_lines(items: list[dict[str, Any]]) -> list[TurnLine]:
     """The turn line of each person's turn in *items*, from the transcript alone: a Helper, the
     studio, or a Conversation whose Rounds cannot be read. The ask is the message's first line,
     the outcome the first sentence of the turn's last words, the files its refs."""
-    from omnigent.superchat.titles import one_line_summary
+    from omnigent.context.titles import one_line_summary
 
     starts = _turn_starts(items)
     out: list[TurnLine] = []

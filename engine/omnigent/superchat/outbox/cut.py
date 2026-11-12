@@ -10,7 +10,7 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from omnigent.superchat.titles import clip, plain_text
+from omnigent.context.titles import clip, plain_text
 
 TITLE_MAX = 80
 LINE_MAX = 160

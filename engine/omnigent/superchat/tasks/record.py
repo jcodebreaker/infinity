@@ -14,8 +14,8 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from omnigent.context.titles import truncate
 from omnigent.superchat.artifact_kinds import is_deck_name
-from omnigent.superchat.titles import truncate
 
 #: At most this many task lines go in front of a message.
 MAX_LINES = 5

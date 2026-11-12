@@ -89,7 +89,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
     schedule_background_child_task_summary,
 )
-from omnigent.server.host_registry import HostRegistry, RunnerExitReports, multi_replica
+from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
@@ -271,6 +271,7 @@ from omnigent.telemetry.request_headers import (
     parse_installation_id_header as _tel_parse_installation_id,
 )
 from omnigent.tools.client_specified import parse_client_side_tool_specs
+from omnigent.util.replicas import multi_replica
 from omnigent.util.session_lifecycle import (
     is_session_closed,
 )

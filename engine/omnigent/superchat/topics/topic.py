@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from omnigent.superchat.titles import plain_text
+from omnigent.context.titles import plain_text
 
 COVERED_KINDS = ("Decided", "Made", "Found", "Asked")
 OPEN_KINDS = ("Open", "Promised")

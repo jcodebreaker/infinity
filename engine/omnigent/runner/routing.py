@@ -366,7 +366,7 @@ class RunnerRouter:
             offline when its tunnel drops.
         :returns: The error code string to raise.
         """
-        from omnigent.server.host_registry import multi_replica
+        from omnigent.util.replicas import multi_replica
 
         if (
             host_id

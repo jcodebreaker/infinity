@@ -15,10 +15,10 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+from omnigent.context.titles import tidy_request_title
 from omnigent.superchat.feature import HandlerCtx, SpawnRequest, resolve_project
 from omnigent.superchat.models.tiers import CATEGORIES, category_of
 from omnigent.superchat.subagents import HELPER_DEFAULT_MODEL, HELPER_EFFORT_CHOICES
-from omnigent.superchat.titles import tidy_request_title
 
 #: A repeat of the same task from the same chat inside this window is the same hand-off.
 DEDUP_WINDOW_S = 10.0

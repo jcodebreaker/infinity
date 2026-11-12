@@ -123,7 +123,6 @@ from omnigent.server.host_registry import (
     HostConnection,
     HostRegistry,
     RunnerExitReports,
-    multi_replica,
 )
 from omnigent.server.hosts import (
     MANAGED_REPO_LABEL_KEY,
@@ -347,6 +346,7 @@ from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedE
 from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.telemetry.surface import classify_surface as _classify_surface
+from omnigent.util.replicas import multi_replica
 from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
     title_without_closed_marker,
