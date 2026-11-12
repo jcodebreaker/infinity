@@ -54,6 +54,7 @@ from omnigent.server.routes._sessions.common import (
 from omnigent.server.routes._sessions.helpers import _format_sse, _has_runner_authority
 from omnigent.server.routes._sessions.orchestration import (
     _child_session_summaries_from_conversations,
+    wake_conversation_runner,
 )
 from omnigent.server.schemas import (
     ChildSessionList,
@@ -377,7 +378,8 @@ def register_items_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        if access.conversation is None:
+        conv = access.conversation
+        if conv is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
@@ -394,6 +396,14 @@ def register_items_routes(
         if read_at is None:
             raise OmnigentError("Item not found", code=ErrorCode.NOT_FOUND)
         await notify_session_changed(conversation_store, session_id)
+        wake_conversation_runner(
+            conv=conv,
+            user_id=user_id,
+            app_state=request.app.state,
+            conversation_store=conversation_store,
+            runner_router=get_server_runner_router(),
+            permission_store=permission_store,
+        )
         return {"session_id": session_id, "unread": False, "last_read_at": read_at}
 
     # ── GET /sessions/{session_id}/context_summary ────────────────

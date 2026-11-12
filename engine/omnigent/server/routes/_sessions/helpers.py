@@ -237,6 +237,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.superchat.feature import is_super_chat
 from omnigent.util.cost_plan import (
     COST_CONTROL_LABEL_NAMESPACE,
     reserved_cost_control_keys,
@@ -3994,6 +3995,11 @@ def _spawn_superseded_runner_stop(
     task.add_done_callback(_detached_supersede_stops.discard)
 
 
+#: How long an Assistant Conversation's runner and harness stay up while idle;
+#: Helpers keep the host's default (1 h).
+_CONVERSATION_HOLD_S = 12 * 60 * 60
+
+
 async def _launch_runner_on_host_impl(
     conv: Conversation,
     conversation_store: ConversationStore,
@@ -4135,6 +4141,7 @@ async def _launch_runner_on_host_locked(
                 # (agent not resolvable) skips the host-side check — fail open.
                 harness=_resolve_harness(conv),
                 inference_config=snapshot_runtime_config(conv.inference_snapshot),
+                hold_s=_CONVERSATION_HOLD_S if is_super_chat(conv.labels) else None,
             )
         )
         try:

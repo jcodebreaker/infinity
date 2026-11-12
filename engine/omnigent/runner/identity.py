@@ -39,6 +39,10 @@ RUNNER_SLICE_KEY_ENV_VAR = "OMNIGENT_RUNNER_SLICE_KEY"
 # can start harness-specific prewarms before session init arrives. Absent
 # for CLI-local runners and hosts that predate the stamp.
 RUNNER_LAUNCH_HARNESS_ENV_VAR = "OMNIGENT_RUNNER_LAUNCH_HARNESS"
+#: Per-runner idle-exit override (seconds) a host sets for a held Conversation.
+RUNNER_IDLE_TIMEOUT_ENV_VAR = "OMNIGENT_RUNNER_IDLE_TIMEOUT_S"
+#: The same override for the runner's harness idle reap.
+HARNESS_IDLE_TIMEOUT_ENV_VAR = "OMNIGENT_HARNESS_IDLE_TIMEOUT_S"
 # JSON-encoded ordered shell inventory discovered by the host daemon. The
 # runner uses this exact snapshot for native wrapper terminal declarations.
 RUNNER_INTERACTIVE_SHELLS_ENV_VAR = "OMNIGENT_RUNNER_INTERACTIVE_SHELLS"

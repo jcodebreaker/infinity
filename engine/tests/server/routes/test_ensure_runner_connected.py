@@ -9,15 +9,20 @@ relaunch, non-wakeable → ``None``) can't silently regress.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from omnigent.context.labels import CONTEXT_MODE_LABEL
 from omnigent.entities.conversation import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE
 from omnigent.server.routes._sessions import orchestration
+
+_SUPER = {CONTEXT_MODE_LABEL: "superside-chat"}
+real_ensure = orchestration.ensure_runner_connected
 
 
 def _conv(**kwargs: Any) -> Conversation:
@@ -354,6 +359,67 @@ async def test_non_wakeable_returns_none(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert client is None
     assert out_conv is conv
+
+
+@pytest.mark.asyncio
+async def test_intent_wake_never_relaunches_and_fires_once_a_minute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Owner opening their Conversation wakes it once per minute, without a managed relaunch."""
+    from omnigent.evals import identity as eval_identity
+
+    monkeypatch.setattr(orchestration, "_last_wake_at", {})
+    monkeypatch.setattr(orchestration, "_get_runner_client", _async_return(None))
+    monkeypatch.setattr(
+        orchestration, "_maybe_wake_stale_resumable_managed_sandbox", _async_return(False)
+    )
+
+    def _boom(*_a: Any, **_k: Any) -> None:
+        raise AssertionError("an intent wake must not relaunch a managed sandbox")
+
+    monkeypatch.setattr(orchestration, "_maybe_relaunch_managed_sandbox", _boom)
+    monkeypatch.setattr(orchestration, "get_session_owner_id", lambda *_a: "alice@example.com")
+    monkeypatch.setattr(eval_identity, "is_eval_identity", lambda user: user.startswith("eval-"))
+    monkeypatch.setattr(orchestration, "is_eval_identity", eval_identity.is_eval_identity)
+    woken: list[str] = []
+
+    async def _ensure(**kwargs: Any) -> Any:
+        assert kwargs["allow_relaunch"] is False
+        woken.append(kwargs["session_id"])
+
+    monkeypatch.setattr(orchestration, "ensure_runner_connected", _ensure)
+
+    async def _wake(conv: Conversation, user_id: str) -> None:
+        orchestration.wake_conversation_runner(
+            conv=conv,
+            user_id=user_id,
+            app_state=SimpleNamespace(),
+            conversation_store=_Store(conv),
+            runner_router=None,
+            permission_store=None,
+        )
+        await asyncio.gather(*orchestration._wake_tasks)
+
+    assistant = _conv(labels=_SUPER)
+    helper = _conv(id="conv_h", labels={**_SUPER, "omnigent.subagent": "1"})
+    await _wake(assistant, "alice@example.com")
+    await _wake(assistant, "alice@example.com")  # rate limited
+    await _wake(assistant, "bob@example.com")  # not the owner
+    await _wake(helper, "alice@example.com")  # a Helper
+    await _wake(_conv(id="conv_e", labels=_SUPER), "eval-1@example.com")
+    assert woken == ["conv_1"]
+
+    # Without a managed-sandbox host the relaunch branch stays shut in the ladder itself.
+    conv = _conv(host_id="host_1", workspace="/w")
+    client, _ = await real_ensure(
+        session_id="conv_1",
+        conv=conv,
+        app_state=SimpleNamespace(host_registry=SimpleNamespace(get=lambda _h: None)),
+        conversation_store=_Store(conv),
+        runner_router=None,
+        allow_relaunch=False,
+    )
+    assert client is None
 
 
 def _async_return(value: Any):

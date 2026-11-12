@@ -141,10 +141,12 @@ from omnigent.process_logging import (
 )
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 from omnigent.runner.identity import (
+    HARNESS_IDLE_TIMEOUT_ENV_VAR,
     RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR,
     RUNNER_ID_ENV_VAR,
+    RUNNER_IDLE_TIMEOUT_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
     RUNNER_LAUNCH_HARNESS_ENV_VAR,
@@ -782,6 +784,7 @@ def _build_runner_env(
     host_owns_global_cleanup: bool = False,
     harness_tmp_parent: Path | None = None,
     inference_config: dict[str, object] | None = None,
+    hold_s: int | None = None,
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -815,6 +818,8 @@ def _build_runner_env(
         machine-global cleanup that standalone runners perform synchronously.
     :param harness_tmp_parent: Absolute harness socket root shared with the
         host janitor. ``None`` preserves the standalone runner default.
+    :param hold_s: Seconds the runner and its harness may idle, overriding the
+        host's configured timeouts. ``None`` keeps them.
     :returns: The runner subprocess environment.
     """
     extra_names = {
@@ -877,6 +882,9 @@ def _build_runner_env(
         env[RUNNER_LAUNCH_HARNESS_ENV_VAR] = harness
     if interactive_shells is not None:
         env[RUNNER_INTERACTIVE_SHELLS_ENV_VAR] = json.dumps(interactive_shells)
+    if hold_s is not None:
+        env[RUNNER_IDLE_TIMEOUT_ENV_VAR] = str(hold_s)
+        env[HARNESS_IDLE_TIMEOUT_ENV_VAR] = str(hold_s)
     return env
 
 
@@ -1782,6 +1790,7 @@ class HostProcess:
             host_owns_global_cleanup=self._maintenance_janitor is not None,
             harness_tmp_parent=self._harness_tmp_parent,
             inference_config=frame.inference_config,
+            hold_s=frame.hold_s,
         )
         if frame.inference_config is not None:
             try:

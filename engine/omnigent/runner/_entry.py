@@ -135,6 +135,12 @@ def _load_runner_idle_timeout_s_from_config() -> float:
     """
     import yaml
 
+    from omnigent.runner.identity import RUNNER_IDLE_TIMEOUT_ENV_VAR
+
+    held_s = os.environ.get(RUNNER_IDLE_TIMEOUT_ENV_VAR)
+    if held_s:
+        # The launching host holds this runner (an Assistant Conversation).
+        return float(held_s)
     path = _runner_config_path()
     if not path.exists():
         return float(_DEFAULT_RUNNER_IDLE_TIMEOUT_S)

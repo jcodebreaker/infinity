@@ -244,6 +244,9 @@ class HostLaunchRunnerFrame:
         :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` when not.
         ``None`` (older server, or no resolvable harness) skips
         the check — fail open.
+    :param hold_s: Seconds the runner and its harness may idle before
+        exiting, e.g. ``43200`` for an Assistant Conversation. ``None``
+        keeps the host's configured idle timeouts.
     """
 
     request_id: str
@@ -252,6 +255,7 @@ class HostLaunchRunnerFrame:
     session_id: str | None = None
     harness: str | None = None
     inference_config: dict[str, Any] | None = None
+    hold_s: int | None = None
 
 
 @dataclass
@@ -1139,6 +1143,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "session_id": frame.session_id,
                 "harness": frame.harness,
                 "inference_config": frame.inference_config,
+                "hold_s": frame.hold_s,
             }
         )
     if isinstance(frame, HostLaunchRunnerResultFrame):
@@ -1692,6 +1697,7 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
         inference_config=inference_config,
+        hold_s=_optional_nullable_int(msg, "hold_s"),
     )
 
 
@@ -2337,6 +2343,22 @@ def optional_str_bool_map(msg: _JsonObject, key: str) -> dict[str, bool] | None:
     if not isinstance(val, dict):
         return None
     return {k: v for k, v in val.items() if isinstance(k, str) and isinstance(v, bool)}
+
+
+def _optional_nullable_int(msg: _JsonObject, key: str) -> int | None:
+    """Return an optional nullable integer field.
+
+    :param msg: Decoded frame object.
+    :param key: Field name, e.g. ``"hold_s"``.
+    :returns: The integer value, or ``None`` when absent or null.
+    :raises ValueError: If the field is present and not an integer or null.
+    """
+    val = msg.get(key)
+    if val is None:
+        return None
+    if not isinstance(val, int) or isinstance(val, bool):
+        raise ValueError(f"frame field must be an integer or null: {key!r}")
+    return val
 
 
 def _optional_nullable_str(msg: _JsonObject, key: str) -> str | None:
