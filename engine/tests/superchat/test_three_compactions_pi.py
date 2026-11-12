@@ -80,7 +80,8 @@ class _FakeServer:
         self.items: list[dict[str, Any]] = []
         self.labels: dict[str, str] = {
             "omnigent.context.mode": "superside-chat",
-            # A small tail budget: the newest turn or two stay after each anchor, the rest is folded.
+            # A small tail budget: the newest turn or two stay after each anchor, the rest is
+            # folded.
             "omnigent.context.rollover_keep_tokens": "200",
         }
         self.reads: list[tuple[dict[str, str], list[str]]] = []
@@ -446,11 +447,13 @@ async def _cold_start_input(server: _FakeServer) -> tuple[list[dict[str, Any]], 
         )
         assert resp.status_code == 201
         for _ in range(100):
-            if harness.posted_bodies:
+            if any(body["content"] for body in harness.posted_bodies):
                 break
             await asyncio.sleep(0.02)
-    assert len(harness.posted_bodies) == 1
-    return harness.posted_bodies[0]["content"], view
+    # The harness pre-launch posts an empty first message; the turn is the one with content.
+    turns = [body for body in harness.posted_bodies if body["content"]]
+    assert len(turns) == 1
+    return turns[0]["content"], view
 
 
 @contextlib.asynccontextmanager

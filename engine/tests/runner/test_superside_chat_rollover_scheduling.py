@@ -282,6 +282,11 @@ def _long_history_items(turns: int = 30) -> list[dict[str, Any]]:
     return items
 
 
+def _foldable_items() -> list[dict[str, Any]]:
+    """A record longer than the default kept tail, so a ``/compact`` has older turns to fold."""
+    return _long_history_items()
+
+
 def _hard_limit_labels(**extra: str) -> dict[str, str]:
     return {
         **_SUPERSIDE_LABELS,
@@ -292,16 +297,21 @@ def _hard_limit_labels(**extra: str) -> dict[str, str]:
 
 
 def _assert_trimmed_to_the_budget(harness_client: _ScriptedHarnessClient, text: str) -> None:
-    """The last harness input is a few whole recent turns ending with *text*."""
+    """The last harness input is the assembled block, the newest whole turns that fit the
+    budget and *text* (ADR 0031): far less than the whole record."""
     from omnigent.runtime.compaction import count_tokens
 
     content = harness_client.posted_bodies[-1]["content"]
     messages = [m for m in content if m.get("type") == "message"]
     assert len(messages) < 20, "the whole record was sent"
-    assert messages[0]["role"] == "user", "a turn was cut in half"
+    block = " ".join(b["text"] for b in messages[0]["content"] if "text" in b)
+    assert messages[0]["role"] == "user" and block.startswith(BLOCK_FRAME)
+    assert messages[1]["role"] == "assistant", "a turn was cut in half"
     last_text = " ".join(b["text"] for b in messages[-1]["content"] if "text" in b)
     assert messages[-1]["role"] == "user" and text in last_text
-    assert count_tokens(messages[:-1], "gpt-4o") <= _KEEP_TOKENS
+    assert count_tokens(messages[1:-1], "gpt-4o") <= _KEEP_TOKENS
+    record = count_tokens(_long_history_items(), "gpt-4o")
+    assert count_tokens(messages, "gpt-4o") < record / 2
 
 
 @pytest.mark.asyncio
@@ -550,6 +560,22 @@ class _RecordServerClient(_HardLimitServerClient):
 
         return _Page()
 
+    async def post(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+        response = await super().post(url, **kwargs)
+        body = kwargs.get("json", {})
+        if isinstance(body, dict) and body.get("type") == "compaction":
+            # The record keeps a stored checkpoint, as the server does.
+            self._items.append(
+                {
+                    "id": f"cmp{len(self.posted_compactions)}",
+                    "type": "compaction",
+                    "status": "completed",
+                    "created_at": int(time.time()),
+                    **body["data"],
+                }
+            )
+        return response
+
 
 def _record_item(item_id: str, role: str, text: str) -> dict[str, Any]:
     kind = "input_text" if role == "user" else "output_text"
@@ -697,10 +723,12 @@ def _drain_events(app: Any, conv_id: str) -> list[str]:
 async def test_compact_in_superside_chat_mode_posts_a_real_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    llm_client = _GatedLLMClient(asyncio.Event(), text="REAL STATE FILE")
+    llm_client = _GatedLLMClient(
+        asyncio.Event(), text="## Working list\n- [t-state · 2026-10-09] REAL STATE FILE"
+    )
     llm_client._gate.set()
     monkeypatch.setattr("omnigent.runner.app._get_runner_llm_client", lambda: llm_client)
-    server_client = _RecordServerClient(labels=_SUPERSIDE_LABELS, items=_history_items())
+    server_client = _RecordServerClient(labels=_SUPERSIDE_LABELS, items=_foldable_items())
     harness_client = _SequencedHarnessClient([_plain_frames()])
     app, pm = _build_app(harness_client, server_client)
     conv_id = "conv_compact"
@@ -746,15 +774,15 @@ class _RejectingCompactionClient(_RecordServerClient):
     """Refuses every compaction write with a 500."""
 
     async def post(self, url: str, **kwargs: Any) -> NullServerClient._Response:
-        response = await super().post(url, **kwargs)
         body = kwargs.get("json", {})
         if isinstance(body, dict) and body.get("type") == "compaction":
+            self.posted_compactions.append(body)
 
             class _Failed(NullServerClient._Response):
                 status_code = 500
 
             return _Failed()
-        return response
+        return await super().post(url, **kwargs)
 
 
 async def _compact_once(
@@ -764,24 +792,22 @@ async def _compact_once(
     llm_client._gate.set()
     monkeypatch.setattr("omnigent.runner.app._get_runner_llm_client", lambda: llm_client)
     app, pm = _build_app(_SequencedHarnessClient([_plain_frames()]), server_client)
+    turn = {
+        "type": "message",
+        "role": "user",
+        "model": "test-agent",
+        "content": [{"type": "input_text", "text": "hello"}],
+        "harness_override": "claude-sdk",
+    }
     async with _runner_client(app) as client:
-        await asyncio.wait_for(
-            client.post(
-                f"/v1/sessions/{conv_id}/events",
-                json={
-                    "type": "message",
-                    "role": "user",
-                    "model": "test-agent",
-                    "content": [{"type": "input_text", "text": "hello"}],
-                    "harness_override": "claude-sdk",
-                },
-            ),
-            timeout=5.0,
-        )
+        await asyncio.wait_for(client.post(f"/v1/sessions/{conv_id}/events", json=turn), 5.0)
         await _wait_until(lambda: conv_id not in app.state.active_turns, timeout=2.0)
         resp = await client.post(f"/v1/sessions/{conv_id}/events", json={"type": "compact"})
         assert resp.status_code == 200, resp.text
         await _wait_until(lambda: len(server_client.posted_compactions) == 1, timeout=3.0)
+        # The next turn's memory sync writes what a stored checkpoint carries (one writer).
+        await asyncio.wait_for(client.post(f"/v1/sessions/{conv_id}/events", json=turn), 5.0)
+        await _wait_until(lambda: conv_id not in app.state.active_turns, timeout=2.0)
         await asyncio.sleep(0.2)
     return pm
 
@@ -790,7 +816,7 @@ async def _compact_once(
 async def test_a_stored_checkpoint_writes_the_journal_and_state_files(
     monkeypatch: pytest.MonkeyPatch, _isolated_knowledge_workspace: Path
 ) -> None:
-    server_client = _RecordServerClient(labels=_SUPERSIDE_LABELS, items=_history_items())
+    server_client = _RecordServerClient(labels=_SUPERSIDE_LABELS, items=_foldable_items())
 
     await _compact_once(monkeypatch, server_client, "conv_journal")
 
@@ -805,7 +831,7 @@ async def test_a_stored_checkpoint_writes_the_journal_and_state_files(
 async def test_a_failed_checkpoint_post_writes_no_memory_files(
     monkeypatch: pytest.MonkeyPatch, _isolated_knowledge_workspace: Path
 ) -> None:
-    server_client = _RejectingCompactionClient(labels=_SUPERSIDE_LABELS, items=_history_items())
+    server_client = _RejectingCompactionClient(labels=_SUPERSIDE_LABELS, items=_foldable_items())
 
     await _compact_once(monkeypatch, server_client, "conv_journal_failed")
 
@@ -1034,7 +1060,8 @@ async def test_after_a_warm_client_drop_the_next_turn_carries_the_profile_again(
     llm_client = _GatedLLMClient(asyncio.Event(), text="STATE")
     llm_client._gate.set()
     monkeypatch.setattr("omnigent.runner.app._get_runner_llm_client", lambda: llm_client)
-    app, pm, harness_client, _server = _delta_app()
+    app, pm, harness_client, server_client = _delta_app()
+    server_client._items = _foldable_items()
     conv_id = "conv_delta_drops"
 
     async with _runner_client(app) as client:
