@@ -184,33 +184,28 @@ _COMPACTION_LOOKUP_LIMIT = "20"
 
 
 async def _get_items_page(
-    server_client: httpx.AsyncClient, conversation_id: str, params: dict[str, str]
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    params: dict[str, str],
+    *,
+    record: bool = False,
 ) -> dict[str, Any]:
     """One ``GET /v1/sessions/{id}/items`` page.
+
+    With *record* (runner credential only), items carry their record-only fields and the
+    hidden ``epoch_block`` items are listed too.
 
     :raises ItemsPageFetchError: the route answered non-200.
     """
     resp = await server_client.get(
-        f"/v1/sessions/{conversation_id}/items", params=params, timeout=10.0
+        f"/v1/sessions/{conversation_id}/items",
+        params={**params, "record": "1"} if record else params,
+        timeout=10.0,
     )
     if resp.status_code != 200:
         raise ItemsPageFetchError(
             f"GET items for {conversation_id!r} returned {resp.status_code}", resp.status_code
         )
-    return resp.json()
-
-
-async def get_item(
-    server_client: httpx.AsyncClient, conversation_id: str, item_id: str
-) -> dict[str, Any] | None:
-    """One item by id, record-only fields included (runner credential only), or ``None``.
-
-    :raises httpx.HTTPStatusError: the route answered neither 200 nor 404.
-    """
-    resp = await server_client.get(f"/v1/sessions/{conversation_id}/items/{item_id}", timeout=10.0)
-    if resp.status_code == 404:
-        return None
-    resp.raise_for_status()
     return resp.json()
 
 

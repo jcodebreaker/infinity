@@ -2168,6 +2168,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         before: str | None = None,
         order: str = "asc",
         type: str | None = None,
+        include_hidden: bool = False,
     ) -> PagedList[ConversationItem]:
         """
         List items in a conversation with cursor-based pagination.
@@ -2185,6 +2186,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param type: Optional item type filter. When provided, only items
             with this type are returned, e.g. ``"compaction"``. ``None``
             means every type except the hidden ``epoch_block``.
+        :param include_hidden: Keep ``epoch_block`` items in an untyped listing.
         :returns: A :class:`PagedList` of
             :class:`ConversationItem` objects.
         """
@@ -2219,7 +2221,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             if type is not None:
                 stmt = stmt.where(SqlConversationItem.type == encode_item_type(type))
-            else:
+            elif not include_hidden:
                 stmt = stmt.where(SqlConversationItem.type != encode_item_type("epoch_block"))
             if after:
                 after_pos = self._resolve_item_cursor_position(session, conversation_id, after)

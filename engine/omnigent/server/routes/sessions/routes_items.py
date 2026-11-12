@@ -130,20 +130,22 @@ def register_items_routes(
 ) -> None:
     """Register the items routes on router."""
 
-    async def _runner_only(request: Request, session_id: str) -> str | None:
-        """Require EDIT and the session's runner credential; returns the caller."""
+    async def _authorized_conversation(
+        request: Request, session_id: str, level: int, *, runner_only: bool
+    ) -> str | None:
+        """Require *level* (and, with *runner_only*, the session's runner); returns the caller."""
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+            user_id, session_id, level, permission_store, conversation_store
         )
         conv = access.conversation
         if conv is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
-        if not _has_runner_authority(request, conv, runner_tunnel_tokens):
+        if runner_only and not _has_runner_authority(request, conv, runner_tunnel_tokens):
             raise OmnigentError(
-                "only the session's runner may use this route", code=ErrorCode.FORBIDDEN
+                "only the session's runner may read or write the record", code=ErrorCode.FORBIDDEN
             )
         return user_id
 
@@ -160,6 +162,7 @@ def register_items_routes(
         before: str | None = Query(default=None),
         order: str = Query(default="asc", pattern="^(asc|desc)$"),
         type: str | None = Query(default=None, pattern="^compaction$"),
+        record: bool = Query(default=False),
     ) -> PaginatedList:
         """
         List items in a session with cursor-based pagination.
@@ -179,17 +182,15 @@ def register_items_routes(
             default) or ``"desc"``.
         :param type: Only items of this type. ``"compaction"`` with
             ``order=desc&limit=1`` is the session's latest checkpoint.
+        :param record: The runner's read of the record: items carry their
+            record-only fields and ``epoch_block`` items are listed too.
         :returns: A :class:`PaginatedList` of conversation items.
-        :raises OmnigentError: 404 if no session exists.
+        :raises OmnigentError: 404 if no session exists; 403 for ``record``
+            from any caller but the session's runner.
         """
-        user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        user_id = await _authorized_conversation(
+            request, session_id, LEVEL_READ, runner_only=record
         )
-        if access.conversation is None:
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if conv is None:
-                raise _session_not_found()
         page = await asyncio.to_thread(
             conversation_store.list_items,
             session_id,
@@ -198,9 +199,16 @@ def register_items_routes(
             before=before,
             order=order,
             type=type,
+            **({"include_hidden": True} if record else {}),
         )
         redactor = await session_redactor(request, conversation_store, session_id, user_id)
-        data = [redactor.deep(m.to_api_dict()) for m in page.data]
+        fields = set(RECORD_ONLY_MESSAGE_FIELDS) if record else set()
+        data = [
+            redactor.deep(
+                {**m.to_api_dict(), **m.data.model_dump(include=fields, exclude_none=True)}
+            )
+            for m in page.data
+        ]
         return PaginatedList(
             data=data,
             first_id=page.first_id,
@@ -274,23 +282,6 @@ def register_items_routes(
         )
         return PaginatedList(data=[redactor.deep(m.to_api_dict()) for m in items])
 
-    # Registered after ``items/search`` so that literal path wins.
-    @router.get("/sessions/{session_id}/items/{item_id}", include_in_schema=False)
-    async def get_session_item(request: Request, session_id: str, item_id: str) -> dict[str, Any]:
-        """
-        One item by id, record-only fields included: how the runner reads an ``epoch_block``.
-
-        :raises OmnigentError: 403 for any caller but the session's runner, 404 when the
-            session holds no such item.
-        """
-        user_id = await _runner_only(request, session_id)
-        item = await asyncio.to_thread(conversation_store.get_item, session_id, item_id)
-        if item is None:
-            raise OmnigentError(f"item {item_id!r} not found", code=ErrorCode.NOT_FOUND)
-        redactor = await session_redactor(request, conversation_store, session_id, user_id)
-        record = item.data.model_dump(include=set(RECORD_ONLY_MESSAGE_FIELDS), exclude_none=True)
-        return redactor.deep({**item.to_api_dict(), **record})
-
     @router.patch(
         "/sessions/{session_id}/items/{item_id}/data", include_in_schema=False, status_code=204
     )
@@ -307,7 +298,7 @@ def register_items_routes(
         :raises OmnigentError: 403 for any caller but the session's runner, 404 when the
             session holds no such item, 400 for any other field or a non-message item.
         """
-        await _runner_only(request, session_id)
+        await _authorized_conversation(request, session_id, LEVEL_EDIT, runner_only=True)
         try:
             item = await asyncio.to_thread(
                 conversation_store.update_item_data, session_id, item_id, fields

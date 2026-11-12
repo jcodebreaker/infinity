@@ -592,6 +592,7 @@ class ConversationStore(ABC):
         before: str | None = None,
         order: str = "asc",
         type: str | None = None,
+        include_hidden: bool = False,
     ) -> PagedList[ConversationItem]:
         """
         Return items in a conversation with cursor-based pagination.
@@ -613,8 +614,9 @@ class ConversationStore(ABC):
         :param order: Sort direction, ``"asc"`` or ``"desc"``.
         :param type: Optional item type filter. When provided, only items
             with this type are returned, e.g. ``"compaction"``. ``None``
-            means every type except the hidden ``epoch_block``, which is
-            read by id (:meth:`get_item`).
+            means every type except the hidden ``epoch_block``.
+        :param include_hidden: Keep ``epoch_block`` items in an untyped
+            listing (the runner's record read).
         :returns: A :class:`PagedList` of
             :class:`ConversationItem` objects.
         :raises omnigent.errors.StaleCursorError: If the ``after``/``before``

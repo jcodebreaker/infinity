@@ -474,7 +474,7 @@ def _runner_headers() -> dict[str, str]:
 def test_epoch_block_is_runner_only_and_hidden_from_items_and_search(
     stores: tuple[SqlAlchemyConversationStore, SqlAlchemyAgentStore, SqlAlchemyPermissionStore],
 ) -> None:
-    """Only the runner stores an epoch block; it reads it back by id, and no list shows it."""
+    """Only the runner stores an epoch block; only its record read (``record=1``) lists it."""
     client = TestClient(_multi_user_app(stores))
     conv_id = _seed_session(stores, runner_id=token_bound_runner_id(_RUNNER_TOKEN))
     event = {"type": "epoch_block", "data": {"text": "zebra epoch"}}
@@ -498,9 +498,10 @@ def test_epoch_block_is_runner_only_and_hidden_from_items_and_search(
         f"/v1/sessions/{conv_id}/items/search", params={"query": "zebra"}, headers=owner
     )
     assert search.json()["data"] == []
-    item_url = f"/v1/sessions/{conv_id}/items/{item_id}"
-    assert client.get(item_url, headers=owner).status_code == 403
-    assert client.get(item_url, headers=_runner_headers()).json()["text"] == "zebra epoch"
+    items_url = f"/v1/sessions/{conv_id}/items"
+    assert client.get(items_url, params={"record": 1}, headers=owner).status_code == 403
+    record = client.get(items_url, params={"record": 1}, headers=_runner_headers()).json()
+    assert [(i["id"], i["text"]) for i in record["data"]] == [(item_id, "zebra epoch")]
 
 
 def test_item_data_patch_is_runner_only_allow_listed_and_idempotent(
@@ -545,5 +546,7 @@ def test_item_data_patch_is_runner_only_allow_listed_and_idempotent(
     assert stored.data.content == [{"type": "input_text", "text": "hi"}]
     listed = client.get(f"/v1/sessions/{conv_id}/items", headers=owner).json()["data"]
     assert "context_prefix" not in listed[0]
-    record = client.get(f"/v1/sessions/{conv_id}/items/{item.id}", headers=_runner_headers())
-    assert record.json()["context_prefix"] == []
+    record = client.get(
+        f"/v1/sessions/{conv_id}/items", params={"record": 1}, headers=_runner_headers()
+    )
+    assert record.json()["data"][0]["context_prefix"] == []
