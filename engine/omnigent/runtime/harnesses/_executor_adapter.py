@@ -250,6 +250,8 @@ class ExecutorAdapter(HarnessApp):
         # key (every inner executor but claude-sdk, today) simply ignore it.
         if request.context_mode:
             extra["context_mode"] = request.context_mode
+        if request.session_file:
+            extra["session_file"] = request.session_file
         # model_override is the per-request override; takes precedence over the spec default.
         tools = _normalize_tool_schemas(request.tools or [])
         config = ExecutorConfig(model=request.model_override, extra=extra)

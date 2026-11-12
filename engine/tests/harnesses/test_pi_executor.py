@@ -11,6 +11,7 @@ import textwrap
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import urlparse
 
@@ -4792,6 +4793,49 @@ def test_run_turn_spawns_pi_with_thinking_flag(monkeypatch) -> None:
     assert "--thinking" in argv
     assert argv[argv.index("--thinking") + 1] == "high"
     assert not [e for e in events if isinstance(e, ExecutorError)]
+
+
+def test_a_conversation_starts_pi_on_its_session_file(monkeypatch, tmp_path) -> None:
+    """With a session file pi resumes it (header cwd pinned to the spawn's) and gets only the
+    latest message: the history is the file, never a flattened prompt."""
+    from omnigent.harnesses import pi_executor as pi_mod
+
+    session_file = tmp_path / "epoch.jsonl"
+    pi_mod.write_pi_session(session_file, cwd="/elsewhere", messages=[])
+    captured: dict[str, Any] = {}
+
+    async def _fake_spawn(*args, **kwargs):
+        captured["args"] = args
+        captured["process"] = _FakeProcess(
+            stdout_lines=[
+                json.dumps({"type": "response", "command": "prompt", "success": True}),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+        return captured["process"]
+
+    monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
+
+    async def _test():
+        with patch("omnigent.harnesses.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+            executor = PiExecutor(cwd=str(tmp_path))
+        history = [
+            {"role": "user", "content": "first", "session_id": "s1"},
+            {"role": "assistant", "content": "ok", "session_id": "s1"},
+            {"role": "user", "content": "second", "session_id": "s1"},
+        ]
+        config = ExecutorConfig(extra={"session_file": str(session_file)})
+        [e async for e in executor.run_turn(history, [], "system", config)]
+        await executor.close()
+
+    _run(_test())
+
+    argv = list(captured["args"])
+    assert argv[argv.index("--session") + 1] == str(session_file)
+    assert "--no-session" not in argv
+    assert json.loads(session_file.read_text().splitlines()[0])["cwd"] == str(tmp_path)
+    sent = [json.loads(chunk) for chunk in captured["process"].stdin.data]
+    assert [c["message"] for c in sent if c.get("type") == "prompt"] == ["second"]
 
 
 def test_midsession_effort_change_sets_thinking_level_before_prompt() -> None:
